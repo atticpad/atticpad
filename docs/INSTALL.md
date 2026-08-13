@@ -31,7 +31,9 @@ chmod +x atticpad-server-linux-x86_64
 ```
 
 It prints a local web UI address (default <http://127.0.0.1:21150/>) where you
-can watch pad status and round-trip latency, and edit mapping profiles.
+can watch pad status and round-trip latency, and edit mapping profiles. **The
+Linux server does not open a browser for you** — copy that address in yourself.
+(The Windows one does; the two genuinely differ.)
 
 ### Giving it access to `/dev/uinput`
 
@@ -85,7 +87,9 @@ releases](https://github.com/nefarius/ViGEmBus/releases) and run it.
 ### 2. Run the server
 
 Download `atticpad-server-windows-x86_64.exe` and run it. It lives in the
-system tray and serves the same local web UI on <http://127.0.0.1:21150/>.
+system tray and serves the same local web UI on <http://127.0.0.1:21150/>,
+**opening it in your browser on startup** — pass `--no-browser` if you would
+rather it didn't, and reach it later from the tray icon's *Open*.
 
 Windows SmartScreen will warn that the publisher is unknown, because the
 executable is not code-signed (a certificate costs more than this project has).

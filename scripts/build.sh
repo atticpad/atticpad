@@ -172,6 +172,14 @@ build_core() {
 # host per platform and a .a would buy nothing but a step -- the split that
 # matters is the API in server/include/apadserver.h, not the link unit.
 build_server() {
+  # The shipped profiles are compiled into the binary so a downloaded server
+  # is not degraded (no touch triggers, no gyro aim on 3DS) just because it
+  # has no profiles/ folder beside it. A checkout always has those files on
+  # disk, which shadow the embedded copies -- so drift here is invisible
+  # locally and only shows up in what users get. Check it every build.
+  log "server: embedded-profiles guard (scripts/support/check_profiles_builtin.sh)"
+  "${HERE}/support/check_profiles_builtin.sh"
+
   log "server: compiling libapadserver + linux host -> atticpad-server (-std=c11 -Wall -Wextra -Werror, uinput backend)"
   mkdir -p "${BUILD_DIR}/server"
   "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
@@ -244,6 +252,9 @@ build_server() {
 # this is the exact cross-compile CI's server-windows job runs, just without
 # the artifact upload.
 build_windows() {
+  log "windows: embedded-profiles guard (scripts/support/check_profiles_builtin.sh)"
+  "${HERE}/support/check_profiles_builtin.sh"
+
   "${HERE}/windows-mingw-check.sh"
   # shellcheck source=windows.env
   source "${HERE}/windows.env"

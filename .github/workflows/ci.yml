@@ -191,16 +191,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Need history to diff against the previous commit below.
+          fetch-depth: 0
 
-      - name: fuzz codec.c (5 min on PR/push, 1h on the nightly schedule)
+      - name: fuzz codec.c (5 min when the codec could have changed, 1h nightly)
         run: |
+          set -euo pipefail
+          # The nightly run is unconditional -- that is the one that earns its
+          # keep on a frozen codec, and an hour of it costs nothing anyone is
+          # waiting on.
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            DURATION=3600
-          else
-            DURATION=300
+            echo "nightly: fuzzing for 3600s"
+            ./tools/fuzz/build.sh 3600
+            exit 0
           fi
-          echo "fuzzing for ${DURATION}s"
-          ./tools/fuzz/build.sh "${DURATION}"
+
+          # Otherwise, only fuzz when something that can affect the decoder
+          # actually changed. This workflow used to fuzz for five minutes on
+          # every push, which over one afternoon of README, screenshot and
+          # spec-comment edits made the fuzzer HALF of all Actions time spent
+          # on this repository -- for a codec whose wire format is frozen and
+          # which no commit in that window touched.
+          BEFORE="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BEFORE="${{ github.event.pull_request.base.sha }}"
+          fi
+          # A new branch or a force-push reports an all-zero or unreachable
+          # base. Fuzz rather than guess -- skipping is the risky default.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "no usable base commit — fuzzing for 300s to be safe"
+            ./tools/fuzz/build.sh 300
+            exit 0
+          fi
+
+          CHANGED="$(git diff --name-only "$BEFORE" "${{ github.sha }}" || true)"
+          echo "changed files:"; echo "$CHANGED" | sed 's/^/  /'
+          if echo "$CHANGED" | grep -qE '^(core/|shim/|tools/fuzz/)'; then
+            echo "decoder-relevant paths changed — fuzzing for 300s"
+            ./tools/fuzz/build.sh 300
+          else
+            echo "nothing under core/, shim/ or tools/fuzz/ changed — skipping."
+            echo "The nightly schedule still fuzzes this commit's code for an hour."
+          fi
 
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -403,6 +437,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: server/profiles — embedded-profiles guard (the .jsonc files and the compiled-in copies must agree)
+        # Named separately for the same reason as core's dead-vectors guard:
+        # ./scripts/build.sh server already runs it, so this is attributability,
+        # not new coverage. The failure it catches is silent -- a checkout has
+        # the profiles on disk, which shadow the embedded copies, so an
+        # unregenerated header degrades only what users download.
+        run: ./scripts/support/check_profiles_builtin.sh
 
       - name: server — build (+ smoke run if /dev/uinput is usable on this runner)
         run: ./scripts/build.sh server

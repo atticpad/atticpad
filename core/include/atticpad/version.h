@@ -27,7 +27,7 @@
 
 /* Bump to an empty string for a release build. "-dev" means built from a
  * working tree that may not match any tag. */
-#define APAD_VERSION_SUFFIX "-rc1"
+#define APAD_VERSION_SUFFIX "-rc2"
 
 #define APAD_VERSION_STR "0.4.0" APAD_VERSION_SUFFIX
 

@@ -60,6 +60,7 @@
                       * same build-script reason as webui.h; owns its own 5353
                       * socket because mDNS is not AtticPad protocol traffic and
                       * shim/ exposes no multicast API (see that file's top). */
+#include "../common/profiles_builtin.h"   /* profiles compiled into the binary */
 #include "../common/webui.h"   /* server/host/common/webui.h -- the HTTP UI, header-only */
 
 /* Bounds how late apad_session_tick() can discover a due retransmit.
@@ -113,6 +114,37 @@ static mdns_responder g_mdns;
  * where there is a clock to pass and no async-signal-safety question. */
 static volatile sig_atomic_t g_want_pair;
 static volatile sig_atomic_t g_want_unpair;
+
+/* Build "<dir containing this executable>/<leaf>" into `out`.
+ *
+ * Returns 0 on success, -1 if the executable path cannot be resolved or does
+ * not fit -- callers fall back to a relative path in that case rather than
+ * failing to start, because not finding profiles is never fatal.
+ *
+ * /proc/self/exe is Linux-specific and this is the Linux host, so that is
+ * fine here; it also resolves symlinks, which is what a user who symlinked
+ * the binary into ~/bin would expect. */
+static int exe_relative_dir(char *out, size_t cap, const char *leaf)
+{
+    char path[4096];
+    ssize_t n;
+    char *slash;
+
+    n = readlink("/proc/self/exe", path, sizeof path - 1u);
+    if (n <= 0 || (size_t)n >= sizeof path - 1u) {
+        return -1;
+    }
+    path[n] = '\0';
+    slash = strrchr(path, '/');
+    if (slash == NULL) {
+        return -1;
+    }
+    *slash = '\0';
+    if ((size_t)snprintf(out, cap, "%s/%s", path, leaf) >= cap) {
+        return -1;
+    }
+    return 0;
+}
 
 static void on_signal(int sig)
 {
@@ -314,6 +346,11 @@ int main(int argc, char **argv)
      * directory on every write, long after the startup block that first
      * reads it has gone out of scope. */
     const char *profiles_dir;
+    /* profile_store.h formats "<dir>/<name>.jsonc" into a char[512],
+     * so anything longer is a truncation waiting to happen -- keep this
+     * comfortably inside that and fall back to a relative path if the
+     * executable lives somewhere deeper. */
+    char        exe_profiles_dir[320];
 
     /* Matches server/host/windows/main.c's fix for the same class of bug,
      * checked here for the same latent problem (2026-08-10 report): glibc
@@ -384,7 +421,19 @@ int main(int argc, char **argv)
      * default (see profiles.c). */
     profiles_dir = getenv("ATTICPAD_PROFILES_DIR");
     if (profiles_dir == NULL) {
-        profiles_dir = "server/profiles";
+        /* Next to the binary, NOT relative to the cwd. This used to be
+         * "server/profiles", which is a path inside a source checkout: it
+         * made every build/test invocation from the repo root work and made
+         * a downloaded binary depend on which directory the user happened to
+         * be in. exe_relative_dir() matches what the Windows host has always
+         * done, so "drop a profiles/ folder beside the server" now means the
+         * same thing on both. */
+        if (exe_relative_dir(exe_profiles_dir, sizeof exe_profiles_dir,
+                             "profiles") == 0) {
+            profiles_dir = exe_profiles_dir;
+        } else {
+            profiles_dir = "profiles";
+        }
     }
     file_count = profile_store_scan(profiles_dir, files,
                                     (size_t)PROFILE_STORE_MAX_FILES);
@@ -392,17 +441,29 @@ int main(int argc, char **argv)
         /* Missing directory, empty directory, or nothing with a .jsonc
          * suffix -- profile_store_scan() does not distinguish these (never
          * fatal either way, see profile_store.h), so neither does this
-         * message. Never fatal: the library always keeps a compiled-in
-         * default profile (server/src/profiles.c). */
+         * message.
+         *
+         * Fall back to the profiles compiled into this binary rather than to
+         * the library's single built-in default. That difference is the
+         * whole point: the built-in default has no touch regions and no gyro
+         * aim, so a downloaded server would hand a 3DS a pad with dead
+         * triggers while the client kept drawing them. */
+        for (i = 0; i < ATTICPAD_BUILTIN_PROFILE_COUNT; i++) {
+            sources[i].label = ATTICPAD_BUILTIN_PROFILES[i].label;
+            sources[i].name  = ATTICPAD_BUILTIN_PROFILES[i].name;
+            sources[i].text  = ATTICPAD_BUILTIN_PROFILES[i].text;
+        }
+        file_count = ATTICPAD_BUILTIN_PROFILE_COUNT;
         (void)fprintf(stderr,
-                      "[atticpad] profiles: no *.jsonc files loaded from "
-                      "\"%s\" -- using the built-in default profile only\n",
-                      profiles_dir);
-    }
-    for (i = 0; i < file_count; i++) {
-        sources[i].label = files[i].label;
-        sources[i].name  = files[i].name;
-        sources[i].text  = files[i].text;
+                      "[atticpad] profiles: none on disk in \"%s\" -- using "
+                      "the %u profiles built into this binary\n",
+                      profiles_dir, (unsigned)ATTICPAD_BUILTIN_PROFILE_COUNT);
+    } else {
+        for (i = 0; i < file_count; i++) {
+            sources[i].label = files[i].label;
+            sources[i].name  = files[i].name;
+            sources[i].text  = files[i].text;
+        }
     }
 
     if (apad_net_init() != APAD_OK) {

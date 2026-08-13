@@ -62,6 +62,7 @@
  * UI and not two, and sockcompat.h's for the short list of calls that are
  * genuinely not the same on Winsock. All header-only, because
  * scripts/build.sh names an exact list of .c files per target. */
+#include "../common/profiles_builtin.h"   /* profiles compiled into the binary */
 #include "../common/webui.h"
 
 /* Loopback-only port the UI listens on. Same default and same
@@ -874,15 +875,27 @@ int main(int argc, char **argv)
     file_count = profile_store_scan(profiles_dir, files,
                                     (size_t)PROFILE_STORE_MAX_FILES);
     if (file_count == 0u) {
+        /* Same reasoning as the Linux host: fall back to the profiles
+         * compiled into this binary, not to the library's lone built-in
+         * default. A downloaded .exe has no profiles folder beside it, and
+         * without this a 3DS would get a pad whose touch triggers and gyro
+         * aim silently do nothing while the client still draws them. */
+        for (i = 0; i < ATTICPAD_BUILTIN_PROFILE_COUNT; i++) {
+            sources[i].label = ATTICPAD_BUILTIN_PROFILES[i].label;
+            sources[i].name  = ATTICPAD_BUILTIN_PROFILES[i].name;
+            sources[i].text  = ATTICPAD_BUILTIN_PROFILES[i].text;
+        }
+        file_count = ATTICPAD_BUILTIN_PROFILE_COUNT;
         (void)fprintf(stderr,
-                      "[atticpad] profiles: no *.jsonc files loaded from "
-                      "\"%s\" -- using the built-in default profile only\n",
-                      profiles_dir);
-    }
-    for (i = 0; i < file_count; i++) {
-        sources[i].label = files[i].label;
-        sources[i].name  = files[i].name;
-        sources[i].text  = files[i].text;
+                      "[atticpad] profiles: none on disk in \"%s\" -- using "
+                      "the %u profiles built into this binary\n",
+                      profiles_dir, (unsigned)ATTICPAD_BUILTIN_PROFILE_COUNT);
+    } else {
+        for (i = 0; i < file_count; i++) {
+            sources[i].label = files[i].label;
+            sources[i].name  = files[i].name;
+            sources[i].text  = files[i].text;
+        }
     }
 
     if (apad_net_init() != APAD_OK) {
