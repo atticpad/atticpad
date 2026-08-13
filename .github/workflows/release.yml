@@ -1,0 +1,141 @@
+# release.yml — turn a version tag into a GitHub Release.
+#
+# This workflow builds NOTHING of its own. It calls ci.yml, which already
+# knows how to build every target correctly (pinned container digests, the
+# makerom glibc split, the ABI and symbol assertions), and then collects what
+# that run produced. Duplicating those job definitions here would guarantee
+# the two drift, and the copy that drifts is the one that only runs on
+# release day, when nobody is watching it closely.
+#
+# docs/DESIGN.md §8.2: "the release job fails if any artifact is missing. A partial
+# release is worse than a failed one." That is the `assemble` step below, and
+# it is deliberately a hard failure rather than a warning.
+#
+# Tag convention:
+#   v0.4.0-rc1   -> published as a PRERELEASE (any tag containing a hyphen)
+#   v0.4.0       -> published as a normal release
+#
+# The tag must match core/include/atticpad/version.h, which the version gate
+# below enforces -- forgetting the version bump is the single easiest mistake
+# to make here, and it produces a release whose binaries all report the
+# previous version.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+# Releases must never be cancelled halfway: a cancelled run can leave a
+# Release created with only some of its assets attached.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # required to create the Release and upload assets
+
+jobs:
+  # Every build job, exactly as it runs on main -- plus the tag-gated .cia
+  # and signed-apk steps, which switch on because a called workflow sees this
+  # workflow's github.ref (the tag).
+  ci:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  release:
+    name: release
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: version gate — the tag must match version.h
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          HEADER=core/include/atticpad/version.h
+          MAJOR=$(sed -n 's/^#define APAD_VERSION_MAJOR \([0-9]*\).*/\1/p' "$HEADER")
+          MINOR=$(sed -n 's/^#define APAD_VERSION_MINOR \([0-9]*\).*/\1/p' "$HEADER")
+          PATCH=$(sed -n 's/^#define APAD_VERSION_PATCH \([0-9]*\).*/\1/p' "$HEADER")
+          SUFFIX=$(sed -n 's/^#define APAD_VERSION_SUFFIX "\(.*\)".*/\1/p' "$HEADER")
+          VERSION="${MAJOR}.${MINOR}.${PATCH}${SUFFIX}"
+          echo "tag=${TAG} header=${VERSION}"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag v${TAG} does not match ${HEADER} (${VERSION}). Every shipped binary reports the header's value, so publishing this would ship binaries that disagree with their own release."
+            exit 1
+          fi
+          echo "APAD_VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: assemble the release assets, or fail
+        # Stable, versionless asset names: the version lives inside every
+        # binary, and third-party trackers (Universal-Updater for the 3DS)
+        # match releases by asset-name pattern. Renaming these per release
+        # would break that matching on every single release.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          collect() {  # collect <found-path> <published-name>
+            if [ ! -f "$1" ]; then
+              echo "::error::missing release artifact: $2 (expected the ci workflow to upload $1)"
+              MISSING=1
+              return
+            fi
+            cp "$1" "dist/$2"
+          }
+          MISSING=0
+          collect artifacts/atticpad-3ds/atticpad-3ds.3dsx              atticpad-3ds.3dsx
+          collect artifacts/atticpad-3ds-cia/atticpad-3ds.cia           atticpad-3ds.cia
+          collect artifacts/atticpad-android-release-apk/app-release.apk atticpad-android.apk
+          collect artifacts/atticpad-server-linux/atticpad-server       atticpad-server-linux-x86_64
+          collect artifacts/atticpad-server-windows/atticpad-server.exe atticpad-server-windows-x86_64.exe
+          if [ "$MISSING" -ne 0 ]; then
+            echo "--- what the ci run actually uploaded: ---"
+            find artifacts -type f | sort
+            echo "::error::refusing to publish a partial release (docs/DESIGN.md §8.2)"
+            exit 1
+          fi
+          cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS
+
+      - name: extract this version's changelog section
+        # The release body is the CHANGELOG section for this version, so the
+        # two cannot disagree. A missing section is a hard failure: a release
+        # with no notes is a release nobody can evaluate.
+        run: |
+          set -euo pipefail
+          # A release candidate documents the release it is a candidate FOR,
+          # so v0.4.0-rc1 reads the [0.4.0] section. Keeping a separate rc
+          # section would mean maintaining notes that are deleted days later.
+          CHANGELOG_VER="${APAD_VERSION%%-*}"
+          awk -v ver="$CHANGELOG_VER" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && /^## \[/         { exit }
+            grab                     { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## [${CHANGELOG_VER}]' section to use as release notes"
+            exit 1
+          fi
+          if [ "$APAD_VERSION" != "$CHANGELOG_VER" ]; then
+            printf '\n---\n\n**This is a release candidate for %s, not a final release.** Please report anything that behaves differently from the notes above.\n' \
+              "$CHANGELOG_VER" >> release-notes.md
+          fi
+          cat release-notes.md
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Any tag carrying a hyphen (v0.4.0-rc1) is a prerelease.
+          PRERELEASE=""
+          case "$GITHUB_REF_NAME" in *-*) PRERELEASE="--prerelease" ;; esac
+          # shellcheck disable=SC2086
+          gh release create "$GITHUB_REF_NAME" \
+            --title "AtticPad $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            $PRERELEASE \
+            dist/*

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive icon BACKGROUND layer colour: the exact SLATE (#1C212B)
+  `clients/3ds/meta/make-assets.py`'s SLATE constant draws behind its own
+  gamepad mark, and Theme.BG (Theme.kt) — so this launcher icon and the 3DS
+  one sit on the same background, not two different colour choices.
+
+  A flat colour resource, not a bitmap: a solid fill survives a circle,
+  squircle, or rounded-square launcher mask with zero risk of a raster
+  edge showing at a seam, and it is smaller than a PNG that would just be
+  one colour anyway. See mipmap-anydpi-v26/ic_launcher.xml for how this is
+  wired in, and clients/3ds/meta/make-assets.py's `make_android_assets()`
+  for the foreground layer this sits behind.
+-->
+<resources>
+    <color name="ic_launcher_background">#FF1C212B</color>
+</resources>

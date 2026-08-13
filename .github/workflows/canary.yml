@@ -1,0 +1,112 @@
+name: Canary (unpinned toolchains)
+
+# docs/DESIGN.md §8.2: devkitPro's `latest` moves and will break a build
+# mid-sprint. This workflow is the ONE place `:latest` is allowed — every
+# other workflow and scripts/build.sh reference a pinned digest from
+# scripts/toolchains.env by KEY. Never wire an unpinned tag into ci.yml or
+# scripts/build.sh; if a job here starts failing, that is the signal to
+# investigate on a schedule, not mid-release.
+#
+# There is no clients/{3ds,switch,psp,vita}/ yet (docs/DESIGN.md §11: M2 for 3ds,
+# M5 for the rest), so there is no real client build to run against
+# `:latest` today. What CAN be verified now, and is worth verifying now
+# rather than waiting for M2/M5 to discover it the hard way, is that each
+# toolchain's compiler actually runs inside its own container: the compiler
+# binary matches the container's own libc, the expected env vars are set
+# (or aren't — see the devkitA64 note below), and a trivial translation
+# unit compiles. Once real client code exists, replace each job's smoke
+# step with the real build (the same commands the future pinned CI job and
+# scripts/build.sh would use) and keep the `:latest` image reference.
+#
+# nds/BlocksDS is deliberately absent: docs/DESIGN.md D8 records that no BlocksDS
+# image has been chosen or pinned yet (scripts/toolchains.env has no NDS
+# key). Guessing an image here would repeat exactly the mistake this
+# project's own rules warn about (there is no vitasdk/vitasdk on Docker
+# Hub) — add this job when a BlocksDS image is deliberately chosen and
+# pinned, not before.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  devkitarm-latest:
+    name: devkitARM (:latest)
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm:latest
+    steps:
+      - name: compiler smoke test (arm-none-eabi-gcc)
+        run: |
+          export PATH="${DEVKITARM}/bin:${PATH}"
+          which arm-none-eabi-gcc
+          arm-none-eabi-gcc --version
+          echo 'int f(void){return 1;}' > /tmp/t.c
+          arm-none-eabi-gcc -c /tmp/t.c -o /tmp/t.o
+          echo "OK"
+
+  devkita64-latest:
+    name: devkitA64 (:latest)
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+    steps:
+      - name: compiler smoke test (aarch64-none-elf-gcc)
+        # Verified 2026-08-09 against the pinned digest: this image's own
+        # environment exports DEVKITARM (it bundles devkitARM too) but NOT
+        # DEVKITA64, even though devkitA64 is installed at
+        # /opt/devkitpro/devkitA64. Set it explicitly — do not trust the
+        # image's env for this one variable.
+        run: |
+          export DEVKITA64=/opt/devkitpro/devkitA64
+          export PATH="${DEVKITA64}/bin:${PATH}"
+          which aarch64-none-elf-gcc
+          aarch64-none-elf-gcc --version
+          echo 'int f(void){return 1;}' > /tmp/t.c
+          aarch64-none-elf-gcc -c /tmp/t.c -o /tmp/t.o
+          echo "OK"
+
+  pspdev-latest:
+    name: PSPDEV (:latest)
+    runs-on: ubuntu-latest
+    container:
+      image: pspdev/pspdev:latest
+    steps:
+      - name: compiler smoke test (psp-gcc)
+        # PSPDEV's own env sets $PSPDEV (install prefix) but not PATH to
+        # $PSPDEV/bin — verified 2026-08-09 against the pinned digest.
+        run: |
+          export PATH="${PSPDEV}/bin:${PATH}"
+          which psp-gcc
+          psp-gcc --version
+          echo 'int f(void){return 1;}' > /tmp/t.c
+          psp-gcc -c /tmp/t.c -o /tmp/t.o
+          echo "OK"
+
+  vitasdk-latest:
+    name: VitaSDK (:latest)
+    runs-on: ubuntu-latest
+    container:
+      image: gnuton/vitasdk-docker:latest
+    steps:
+      - name: compiler smoke test (arm-vita-eabi-gcc)
+        # KNOWN BROKEN as of 2026-08-09 (verified against :latest AND the
+        # currently pinned digest AND the 2026-07-01 dated tag — this is not
+        # a one-day fluke): every toolchain binary in this image
+        # (arm-vita-eabi-gcc, -ar, -as, ...) is linked against a newer glibc
+        # (GLIBC_2.38, cascading to 2.36) than the image's own base OS
+        # provides (Ubuntu 22.04, glibc 2.35). The compiler cannot run at
+        # all. This job is expected to fail until upstream fixes the image,
+        # a different pinned tag is found that works, or the image is
+        # rebuilt on a matching base — see the ci-engineer report from the
+        # session that added this workflow for the exact verification
+        # steps. Left failing on purpose rather than weakened, per this
+        # project's rule against softening assertions to get a green run.
+        run: |
+          export PATH="${VITASDK}/bin:${PATH}"
+          which arm-vita-eabi-gcc
+          arm-vita-eabi-gcc --version
+          echo 'int f(void){return 1;}' > /tmp/t.c
+          arm-vita-eabi-gcc -c /tmp/t.c -o /tmp/t.o
+          echo "OK"

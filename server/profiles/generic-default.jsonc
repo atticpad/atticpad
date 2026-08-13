@@ -1,0 +1,52 @@
+{
+  // Generic fallback profile. An empty "device" match makes this a
+  // wildcard: server/src/profiles.c's apad_profiles_match() returns the
+  // first LOADED profile whose match_device is empty or a substring of
+  // the connecting client's device_name, trying files in filename-sorted
+  // order -- so a device-specific profile just needs a name that sorts
+  // before this one alphabetically to be tried first ("3ds-default.jsonc"
+  // already does; a hypothetical "vita-default.jsonc" would too).
+  //
+  // Every value below matches the compiled-in, always-available default
+  // (server/src/profiles.c: set_builtin_default()) -- this file exists so
+  // there is something to copy and edit for a new device, not because its
+  // own settings differ from what the server does with no profile files
+  // present at all. Missing/unparsable profile files are never fatal
+  // (server/src/profiles.c logs and falls back to that same compiled-in
+  // default) -- this file is a convenience and documentation aid, not
+  // something the server depends on existing.
+  "profile": "generic-default",
+  "match": { "device": "" },
+
+  // Physical-position button naming (docs/PROTOCOL.md §5.4's default:
+  // wire A, the right-hand face button, -> Xbox B; B, bottom, -> A; X,
+  // top, -> Y; Y, left, -> X). This section is a no-op today -- the
+  // built-in default already applies exactly this swap -- but is spelled
+  // out so a copy of this file is easy to retarget for a new device:
+  // change any one line to remap that button, or delete a line to fall
+  // back to this same default for just that button.
+  "buttons": {
+    "A": "B", "B": "A", "X": "Y", "Y": "X",
+    "L": "LB", "R": "RB"
+  },
+
+  "sticks": {
+    "deadzone": 0.08,
+    "curve": "quadratic"
+  },
+
+  "triggers": {
+    "deadzone": 0.02
+  },
+
+  // No touch or gyro substitution by default: a device with two real
+  // sticks (APAD_CAP_STICK_L | APAD_CAP_STICK_R) never needs either, and
+  // a device with one stick but no touch/gyro capability bits set has
+  // nothing for these sections to substitute in the first place -- the
+  // mapping engine gates every substitute on the client's own capability
+  // mask regardless of what a profile asks for (server/src/mapping.c:
+  // compute_stick() checks APAD_CAP_TOUCH / APAD_CAP_GYRO before ever
+  // looking at these sections).
+  "touch": { "mode": "none" },
+  "gyro": { "mode": "none" }
+}

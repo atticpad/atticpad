@@ -1,0 +1,115 @@
+{
+  // 3DS default profile. Matches any HELLO whose decoded device_name
+  // contains "3DS" (server/src/profiles.c: apad_profiles_match() does a
+  // plain substring test against the whole device_name field). This one
+  // file now covers BOTH 3DS variants -- see the "gyro" section below for
+  // why a second, separately-matched profile isn't needed.
+  //
+  // docs/DESIGN.md §6.2's own worked example is for the Old 3DS: "no C-stick, so
+  // gyro drives the right stick." A New 3DS (caps=0x000004EF in the field
+  // report this profile was written against) advertises APAD_CAP_STICK_R
+  // AND APAD_CAP_GYRO together -- a working C-stick plus a gyro that, under
+  // the old substitute-only priority chain (physical stick > touch
+  // substitute > gyro substitute > centred), was read off the wire, mapped,
+  // and then silently discarded every time because the physical stick
+  // always won. Gyro aim had never once affected the pad on that hardware.
+  //
+  // "mode": "aim" (server/src/profiles.h's apad_gyro_mode_t) fixes this:
+  // gyro now ADDS to the C-stick's own output (clamped to the axis range)
+  // instead of only substituting for a missing one. On an Old 3DS, which
+  // never sets APAD_CAP_STICK_R, the "physical" side of that sum is 0, so
+  // the sum is just the gyro alone -- numerically identical to the old
+  // substitute-only behaviour (server/src/mapping.c's compute_stick()
+  // comment has the proof). That equivalence is exactly why one profile,
+  // not two, is correct here: a second "3ds-gyro-aim.jsonc" matched on the
+  // same "3DS" substring would only ever be reached if it sorted before
+  // this file's name (server/src/profiles.c's apad_profiles_match() takes
+  // the FIRST loaded profile whose match_device matches, in filename-sorted
+  // order) -- an ambiguity with no user-facing way to pick between them,
+  // since device_name comes from client firmware, not a user setting. This
+  // file resolves that by being the one and only 3DS profile, correct for
+  // both consoles.
+  "profile": "3ds-default",
+  "match": { "device": "3DS" },
+
+  // Identity button naming (wire "A" -> pad "A", and so on), matching
+  // docs/DESIGN.md §6.2's own example verbatim. This deliberately does NOT use
+  // the protocol's default physical-position swap (docs/PROTOCOL.md §5.4:
+  // wire A, the right-hand face button, -> Xbox B, the right-hand Xbox
+  // button in a *different* physical slot than A) -- §5.4 explicitly
+  // reserves that choice for a profile: "Per-profile A/B and X/Y swapping
+  // is a mapping concern, not a protocol concern." Every 3DS game tells
+  // the player to "press A"; keeping the label the player already
+  // associates with that physical button outweighs matching an Xbox pad's
+  // own physical face-button layout.
+  "buttons": {
+    "A": "A", "B": "B", "X": "X", "Y": "Y",
+    "L": "LB", "R": "RB"
+    // L3/R3/START/SELECT/HOME are left at the built-in default mapping
+    // (LTHUMB/RTHUMB/START/BACK/GUIDE) -- nothing 3DS-specific to say
+    // about them, and a 3DS HELLO never sets the L3/R3 bits anyway (no
+    // clickable sticks on the hardware).
+  },
+
+  // Circle Pad -> left stick. 8% deadzone (a physical circle pad's rest
+  // position drifts more than a modern digital stick's centring spring),
+  // quadratic curve: gentle near centre for fine aiming, full deflection
+  // still reachable at the physical edge of travel.
+  "sticks": {
+    "deadzone": 0.08,
+    "curve": "quadratic"
+  },
+
+  // Bottom touchscreen, split into two soft on-screen shoulder triggers:
+  // left half of the screen drives LT, right half drives RT, both analog.
+  // "analog: true" ramps pressure with how far the thumb slides into its
+  // half (see server/src/profiles.h's apad_touch_region comment for the
+  // exact "depth-into-region" definition this engine uses -- these rects
+  // are taller than they are wide, so depth reads as vertical travel: a
+  // soft downward slide feels like squeezing a real analog trigger).
+  // This is docs/DESIGN.md §6.2's own worked example, reproduced here.
+  "touch": {
+    "mode": "regions",
+    "regions": [
+      { "rect": [0.0, 0.0, 0.5, 1.0], "emit": "LT", "analog": true },
+      { "rect": [0.5, 0.0, 1.0, 1.0], "emit": "RT", "analog": true }
+    ]
+  },
+
+  // Gyro aims the right stick -- adds to the C-stick when the client has
+  // one (New 3DS), stands in for it alone when it doesn't (Old 3DS). See
+  // the header comment for why "aim" (not "substitute") is correct as the
+  // one default for both. Yaw drives stick X (turning the whole system
+  // left/right), pitch drives stick Y (tilting the top screen toward/away
+  // from the player).
+  //
+  // Every number below is a GUESS, least-to-most trustworthy:
+  //  - deadzone 0.02 (2% of the 6000 dds full-scale below = 12 deg/s) is
+  //    now backed by real hardware data (2026-08 field report): resting
+  //    bias 1.8 deg/s, noise floor +-0.2 deg/s. 12 deg/s is comfortably
+  //    clear of both, so it will not drift or false-trigger -- but that
+  //    only proves it's SAFE, not that it's the right size for fine aiming.
+  //    A large deadzone flattens exactly the small corrective nudges "aim"
+  //    mode exists for. First thing to try if aim feels dead/sticky near
+  //    centre: drop this toward roughly 2x the noise floor, e.g. 0.006-0.01
+  //    (3.6-6 deg/s), and have someone actually aim with it before settling.
+  //  - sensitivity 1.5 is carried over from the old substitute-only value
+  //    and has NEVER been judged against the additive "aim" feel -- additive
+  //    correction on top of a C-stick that's already moving may want to be
+  //    lower (a twitchy gyro fighting the stick instead of refining it) or
+  //    higher (barely perceptible on top of C-stick motion). Untouched here
+  //    because changing it blind is exactly the "guess the untested number"
+  //    problem this section exists to flag, not to hide.
+  //  - the 6000 dds (600 deg/s) full-scale constant (mapping.c's
+  //    APAD_GYRO_FULL_SCALE_DDS) that "sensitivity" multiplies on top of is
+  //    a picked constant, not a spec value or a measured device limit --
+  //    see mapping.c's own comment above compute_gyro_stick().
+  "gyro": {
+    "mode": "aim",
+    "stick": "right",
+    "axis_x": "yaw",
+    "axis_y": "pitch",
+    "sensitivity": 1.5,
+    "deadzone": 0.02
+  }
+}

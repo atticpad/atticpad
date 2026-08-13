@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Torch toggle glyph (the floating control over the live preview) — a
+  lightning-bolt outline, same 24x24 grid / 1.7 stroke / round join as
+  every icon in this directory (see ic_scan.xml's header comment). Replaces
+  the bare "lightning bolt emoji" text that used to sit in this button,
+  same reason as the other three: an emoji is not a tintable asset.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M13,2 L5,14 H10.5 L9,22 L19,9 H13.5 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

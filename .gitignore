@@ -1,0 +1,54 @@
+build/
+# Private per-agent build dirs (APAD_BUILD_DIR), so concurrent agents do not
+# race on build/ and produce a green result that is not real.
+build-*/
+*.o
+__pycache__/
+*.pyc
+*.elf
+*.3dsx
+*.smdh
+*.cia
+*.nro
+*.vpk
+*.nds
+EBOOT.PBP
+PARAM.SFO
+compile_commands.json
+
+# tools/fuzz: built harness binary + regenerable corpora (seed_corpus is
+# regenerated from core/testdata/generate.py by make_seed_corpus.py; corpus
+# is libFuzzer's own mutation output). Neither belongs in version control.
+tools/fuzz/fuzz_decoder
+tools/fuzz/corpus/
+tools/fuzz/seed_corpus/
+tools/fuzz/*.log
+
+# tools/loopback-client: built binary
+tools/loopback-client/loopback-client
+
+# tools/server-harness: built binary
+tools/server-harness/server-harness
+
+# leftover host binary from M0 netloading; not part of the build
+spike/
+
+# clients/android: Gradle/AGP build outputs and machine-local SDK paths.
+# gradle/wrapper/gradle-wrapper.jar IS committed on purpose — it is how
+# ./gradlew bootstraps itself, and its checksum is pinned in
+# gradle-wrapper.properties (distributionSha256Sum).
+clients/android/.gradle/
+clients/android/build/
+clients/android/app/build/
+clients/android/app/.cxx/
+clients/android/local.properties
+
+# tools/engine-client: built binary
+tools/engine-client/engine-client
+
+# tools/apad-ui-test, tools/secret-length-check: built binaries. These were
+# tracked by mistake until the 0.4.0 release prep; they embed absolute build
+# paths (the build machine's home directory) in their debug strings, so they
+# are both build artifacts AND an identity leak in a public tree.
+tools/apad-ui-test/apad-ui-test
+tools/secret-length-check/secret-length-check

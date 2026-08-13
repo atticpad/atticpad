@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Bluetooth-controller card header glyph (MainActivity's fourth connect-
+  screen card, BtControllerActivity's own headers) — the classic Bluetooth
+  rune as a single continuous stroke, same 24x24 grid / 1.7 stroke / round
+  caps as every other icon in this directory (see ic_scan.xml's header
+  comment for why that consistency matters). Point layout follows the same
+  shape Feather Icons' own "bluetooth" glyph traces (a public-domain-
+  equivalent, MIT-licensed icon set — this is redrawn from the shape, not a
+  copied file, so it costs nothing against the zero-dependency rule), just
+  rescaled onto this file's shared 24x24 grid.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M8,7.75 L16,16.25 L12,20.5 L12,3.5 L16,7.75 L8,16.25"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

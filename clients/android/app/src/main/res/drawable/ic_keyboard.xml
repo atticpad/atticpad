@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Manual-entry glyph (CARD 3 header) — a keyboard outline with two rows of
+  key dashes and a spacebar, same 24x24 grid / 1.7 stroke / round caps as
+  every other icon here (see ic_scan.xml). §7: manual entry is first-class,
+  not a fallback, so its icon gets the same treatment as the other two.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M4.5,6 H19.5 A2,2 0 0 1 21.5,8 V16 A2,2 0 0 1 19.5,18 H4.5 A2,2 0 0 1 2.5,16 V8 A2,2 0 0 1 4.5,6 Z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M5.5,9.6 H6.5 M8.5,9.6 H9.5 M11.5,9.6 H12.5 M14.5,9.6 H15.5 M17.5,9.6 H18.5
+                           M5.5,12.6 H6.5 M8.5,12.6 H9.5 M11.5,12.6 H12.5 M14.5,12.6 H15.5 M17.5,12.6 H18.5"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M6.5,15.6 H17.5"
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

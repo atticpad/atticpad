@@ -1,0 +1,836 @@
+name: CI
+
+# docs/DESIGN.md §8: CI is the gate, local is the loop. This workflow covers what
+# exists as of M2 -- core/, server/, tools/, clients/3ds/. The other console
+# clients (psp, vita, nds, switch) have no code yet (docs/DESIGN.md §11 roadmap: M5,
+# and vita is SHELVED, not just unscheduled -- see the vita_shelved()
+# function in scripts/build.sh and docs/DESIGN.md §11), so there are deliberately
+# no client-{psp,vita,nds,switch} jobs here yet; adding one before there is
+# anything to build would just be a job that always fails on a missing
+# directory. See scripts/build.sh's console-target stubs for the same
+# reasoning, and .github/workflows/canary.yml for how the *toolchains* those
+# future jobs will use are watched for drift starting now.
+#
+# client-3ds produces .3dsx on every run. client-3ds-cia, a SEPARATE job
+# that needs: client-3ds, produces the .cia (docs/DESIGN.md §8.3) on tag pushes
+# only, matching docs/DESIGN.md §8.2's "signing only on tags" rule -- makerom's
+# `-target t` test-key signing needs no secret, but a .cia is a
+# release-shaped artifact and gating it to tags keeps ordinary PR/push CI
+# fast and keeps forks (no tags they control) building the .3dsx-only path
+# that has run since M2. It is a separate job, not extra steps in
+# client-3ds, because it must NOT run inside the devkitARM container --
+# see client-3ds-cia's own comment for why (a real glibc mismatch found by
+# actually running it, not a hypothetical one). The pinned makerom release
+# lives in scripts/cia-tools.env, fetched fresh in that job (no persistent
+# cache in CI, unlike clients/3ds/build.sh's local
+# ${REPO_ROOT}/build/cia-tools/ cache) and verified by sha256 before use,
+# same rule as every other fetched-not-pulled tool in this repo.
+#
+# bannertool is NEVER fetched here, on tags or otherwise -- docs/DESIGN.md §8.3 /
+# risk 11's fallback: it is archived upstream (confirmed 2026-08-10:
+# github.com/Steveice10/bannertool now 404s entirely, not merely stale).
+# clients/3ds/meta/banner.bnr and icon.icn are committed prebuilt outputs,
+# fed straight to makerom by clients/3ds/Makefile's `cia` target -- see
+# scripts/cia-tools.env for exactly what produced them and how to
+# regenerate them if the placeholder art in clients/3ds/meta/ is replaced.
+#
+# release.yml now exists and CALLS this workflow (workflow_call above) on a
+# version tag, then collects every artifact uploaded here into a GitHub
+# Release. This workflow still creates no Release of its own: it uploads
+# workflow artifacts (actions/upload-artifact), which are not a Release.
+# The one thing it does do on a tag is SIGN the Android release apk, from
+# repository secrets -- docs/DESIGN.md §8.2, "signing only on tags, so forks can
+# build".
+#
+# Required status check: core-test only. The other jobs are valuable but
+# must NOT block merges on their own -- see each job's comment for why
+# (this is a branch-protection setting in GitHub's repo settings, not
+# something expressible in this YAML file; whoever configures branch
+# protection should mark ONLY core-test as required).
+
+on:
+  push:
+    # dev is where published snapshots land; main only ever receives a
+    # release. Both need CI -- a snapshot nobody built is not worth much.
+    branches: [main, dev]
+  pull_request:
+  schedule:
+    # Nightly: same jobs, but core-fuzz gets a much bigger time budget
+    # (docs/DESIGN.md §8.1: "5 min on PR, 1 hour nightly").
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+  # release.yml calls this workflow on a tag rather than duplicating the job
+  # definitions. A called workflow sees the CALLER's github.ref, so every
+  # `startsWith(github.ref, 'refs/tags/')` guard below fires exactly as it
+  # would on a direct tag push -- that is what turns the .cia job and the
+  # Android signing steps on for a release.
+  workflow_call:
+    secrets:
+      APAD_ANDROID_KEYSTORE_BASE64:
+        required: false
+      APAD_ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      APAD_ANDROID_KEY_ALIAS:
+        required: false
+      APAD_ANDROID_KEY_PASSWORD:
+        required: false
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------
+  # core-test — REQUIRED. No console build merges with a broken codec
+  # (docs/DESIGN.md §8.2).
+  # ---------------------------------------------------------------------
+  core-test:
+    name: core-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: core — build libapad + run the on-device self-test (ASan+UBSan)
+        # core/src/selftest.c runs BOTH the codec's internal invariant checks
+        # AND all of core/testdata/vectors.h's independently-authored
+        # conformance vectors, unconditionally (no build flag) -- see that
+        # file's header comment. scripts/build.sh core also runs the
+        # standalone compile check below as part of this same call (local
+        # loop); it's repeated as its own named step here so a failure is
+        # attributable at a glance in CI logs, not buried inside this step's
+        # combined output -- see scripts/support/vectors_compile_check.c for
+        # why the two checks are not redundant with each other.
+        run: ./scripts/build.sh core
+
+      - name: core/testdata/vectors.h — dead-vectors guard (every *_vectors[] table must have a driver in selftest.c)
+        # Repeated as its own named step for the same reason as the
+        # standalone compile check below: ./scripts/build.sh core above
+        # already runs scripts/support/check_vectors_wired.sh as its last
+        # step, so this is not new coverage, only attributability -- a
+        # failure here reads as "the dead-vectors guard fired", not buried
+        # inside core's combined build+selftest+guard log.
+        #
+        # What this actually guards against: a whole vectors.h section can
+        # be added, compile cleanly, and apad_selftest_run() will still
+        # report a green "N/N passed, 0 failed" if nobody separately wrote
+        # a driver loop in core/src/selftest.c referencing it -- see
+        # scripts/support/check_vectors_wired.sh's header for the incident
+        # (Section H, 14 vectors, never executed) that made this necessary,
+        # and why it will keep recurring: whoever owns vectors.h is kept
+        # out of core/src/ (which owns selftest.c) on purpose, so every
+        # future section arrives the same way until someone writes its
+        # driver.
+        run: ./scripts/support/check_vectors_wired.sh
+
+      - name: core — case count (the signal a human would have caught)
+        # The exit status of the two steps above can never show a vector
+        # sitting inert -- only the total moving does, and a scrolling CI
+        # log is exactly where that is easiest to miss. Surface it in the
+        # job summary, not just stdout, so it is visible without opening
+        # this step's log at all.
+        run: |
+          COUNT="$(grep -o '[0-9]*/[0-9]* passed, [0-9]* failed' build/core/selftest-output.txt || echo '(not found)')"
+          echo "**apad_selftest_run: ${COUNT}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "core case count: ${COUNT}"
+
+      - name: vectors.h — standalone compile check (proves it depends on nothing but stdint.h)
+        # NOT redundant with core/src/selftest.c compiling vectors.h (which
+        # ./scripts/build.sh core above already exercises, under identical
+        # flags): selftest.c has atticpad.h (and therefore input.h,
+        # protocol.h, ...) in scope before it #includes vectors.h, so an
+        # accidental dependency on a project type there would compile fine
+        # inside selftest.c and fail everywhere vectors.h is compiled alone
+        # -- every blind-platform client's on-device self-test screen. This
+        # step includes ONLY vectors.h, with an include path that does not
+        # contain core/include, so that specific failure mode can't hide.
+        # See scripts/support/vectors_compile_check.c's header comment in
+        # full.
+        run: |
+          cc -std=c99 -Wall -Wextra -Werror -pedantic \
+             -Icore/testdata \
+             scripts/support/vectors_compile_check.c \
+             -o /tmp/vectors_compile_check
+          /tmp/vectors_compile_check
+
+      - name: vectors.h — reproducibility (generate.py must be byte-identical)
+        # docs/DESIGN.md §9.1 / core/testdata/generate.py's own header: re-running
+        # the generator MUST produce a byte-identical vectors.h. This is the
+        # only thing standing between "the generator's output" and "what
+        # ships on six untestable platforms" staying in sync. Regenerating
+        # here mutates this job's own ephemeral checkout only.
+        run: |
+          python3 core/testdata/generate.py
+          if ! git diff --exit-code -- core/testdata/vectors.h; then
+            echo "::error::core/testdata/vectors.h is not byte-identical to what core/testdata/generate.py produces right now. Regenerate locally (python3 core/testdata/generate.py) and commit the result."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------
+  # core-fuzz — libFuzzer on codec.c. Not required: a fuzz timeout finding
+  # a crash should block merges via core-test failing on the regression
+  # test that gets written from it, not by making every PR wait on fuzzing.
+  #
+  # Reviewed for overlap with core-test now that core-test's
+  # apad_selftest_run() runs all 157 conformance vectors unconditionally
+  # (core/src/selftest.c commit d22eabb) -- not duplicated work. core-test
+  # checks a FIXED set of byte-exact vectors against their exact expected
+  # decoded values (correctness: "does this known input decode to this
+  # known struct"). core-fuzz mutates the codec's input space with
+  # libFuzzer under ASan+UBSan (robustness: "does ANY input, most of which
+  # nobody wrote a vector for, avoid a crash or UB"). tools/fuzz's seed
+  # corpus is generated FROM the same vectors
+  # (tools/fuzz/make_seed_corpus.py imports core/testdata/generate.py's
+  # data directly, without re-running its file-writing main() -- doesn't
+  # touch core/testdata/vectors.h, so it doesn't overlap with core-test's
+  # reproducibility check below either), which is the normal, intentional
+  # pattern -- seed a fuzzer from known-interesting inputs, then let it
+  # explore past them -- not redundant CI minutes.
+  # ---------------------------------------------------------------------
+  core-fuzz:
+    name: core-fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fuzz codec.c (5 min on PR/push, 1h on the nightly schedule)
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            DURATION=3600
+          else
+            DURATION=300
+          fi
+          echo "fuzzing for ${DURATION}s"
+          ./tools/fuzz/build.sh "${DURATION}"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-corpus
+          path: tools/fuzz/corpus/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # toolchains — reads scripts/toolchains.env and exposes each pinned
+  # digest as a job output, so downstream jobs' `container: image:` (which
+  # GitHub Actions evaluates before any step in that job runs, so it can't
+  # itself `source` a file) never hardcodes a digest. This is the single
+  # place a workflow YAML reads that file; every console job below
+  # references the digest by KEY through this job's outputs, same as
+  # scripts/build.sh does locally (docs/DESIGN.md §8.2: "reference images by
+  # stable key, not by path").
+  # ---------------------------------------------------------------------
+  toolchains:
+    name: toolchains (read pinned digests)
+    runs-on: ubuntu-latest
+    outputs:
+      devkitarm: ${{ steps.read.outputs.devkitarm }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: read
+        name: parse scripts/toolchains.env
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source scripts/toolchains.env
+          if [ -z "${DEVKITARM:-}" ]; then
+            echo "::error::DEVKITARM is not set in scripts/toolchains.env"
+            exit 1
+          fi
+          echo "devkitarm=${DEVKITARM}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # client-3ds — builds clients/3ds/ (landed M2, commit 453b8e3) inside the
+  # SAME pinned devkitARM digest scripts/build.sh 3ds uses locally
+  # (docs/DESIGN.md §8.5: "local console builds use the same pinned image digest
+  # CI does"). Not required (see the top-of-file note): a 3DS build
+  # failure should not block merges unrelated to clients/3ds/ or core/;
+  # core-test already gates codec correctness for every platform.
+  #
+  # .3dsx only -- see the top-of-file note on why .cia is not built here.
+  #
+  # This job runs make -C clients/3ds directly rather than going through
+  # clients/3ds/build.sh: that script's own job is choosing between native
+  # devkitPro and spinning up *this same* pinned container from a host
+  # shell (docs/DESIGN.md §8.5's local fast path) -- inside a GitHub Actions
+  # `container:` job we are already running natively inside the pinned
+  # image, docker-in-docker is not available on hosted runners, and there
+  # is no host devkitPro to prefer. `make -C clients/3ds` is the command
+  # clients/3ds/build.sh itself runs once it has picked this same
+  # container (see that script), so this is not a second, divergent build
+  # path -- it is that same command with the toolchain-selection layer
+  # that only makes sense on a developer's host removed.
+  # ---------------------------------------------------------------------
+  client-3ds:
+    name: client-3ds
+    needs: toolchains
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.toolchains.outputs.devkitarm }}
+    # Inside a container job the runner resolves the default shell through
+    # /bin/sh, which in this image is dash -- so `set -euo pipefail` dies with
+    # "Illegal option -o pipefail" before a single build command runs. bash is
+    # present at /usr/bin/bash (verified against this exact digest), it is just
+    # not what /bin/sh points at. Every other job in this file gets bash for
+    # free by running directly on the runner; this one has to ask.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build atticpad-3ds.3dsx (devkitARM)
+        # The pinned image exports DEVKITARM and DEVKITPRO already
+        # (verified 2026-08-09 in canary.yml's devkitarm-latest job and
+        # again against this exact digest) but does NOT put
+        # $DEVKITARM/bin on PATH -- add it explicitly, same as
+        # canary.yml's smoke step does.
+        run: |
+          set -euo pipefail
+          export PATH="${DEVKITARM}/bin:${PATH}"
+          which arm-none-eabi-gcc
+          make -C clients/3ds all
+
+      - name: verify the artifact exists
+        # The release job's rule (docs/DESIGN.md §8.2: "fails if any artifact is
+        # missing") starts here -- a make target that reports success
+        # without producing its output should fail this job loudly, not
+        # surface as a missing file three jobs later in release.
+        run: test -f clients/3ds/atticpad-3ds.3dsx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-3ds
+          path: clients/3ds/atticpad-3ds.3dsx
+          if-no-files-found: error
+
+      # atticpad-3ds.elf feeds client-3ds-cia below (tag builds only,
+      # uploaded unconditionally is harmless but wasteful on every PR).
+      # Uploaded here rather than rebuilt in that job: rebuilding would
+      # need this same devkitARM container a second time for a step whose
+      # whole point is to run makerom OUTSIDE it (see client-3ds-cia's
+      # comment for why it must not use this container).
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: atticpad-3ds-elf
+          path: clients/3ds/atticpad-3ds.elf
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # client-3ds-cia — .cia packaging (docs/DESIGN.md §8.3), tag pushes only
+  # (docs/DESIGN.md §8.2 "signing only on tags": makerom's -target t test-key
+  # signing needs no secret, but a .cia is a release-shaped artifact, so
+  # gating it to tags keeps ordinary PR/push CI on the .3dsx-only path
+  # that's run since M2, and keeps forks -- no tags they control -- building
+  # cleanly). A SEPARATE job from client-3ds, deliberately NOT running
+  # inside the devkitARM container:
+  #
+  # Discovered 2026-08-10 by actually running this job's steps against the
+  # pinned devkitARM digest before adding them here (see the report from
+  # the task that added this job): the container is Debian 12 "bookworm"
+  # (glibc 2.36), but 3DSGuy/Project_CTR's prebuilt makerom-v0.19.0 Linux
+  # binary is linked against GLIBC_2.38 and refuses to run inside it
+  # ("version `GLIBC_2.38' not found"). GitHub's own ubuntu-latest runner
+  # (Ubuntu 24.04, glibc 2.39 as of this writing) satisfies it -- so this
+  # job runs makerom there instead of inside the cross-compiler container
+  # makerom never needed in the first place (it operates on an
+  # already-built .elf, not source). Same species of toolchain-glibc
+  # mismatch as VITASDK's (see scripts/build.sh's vita_shelved()) but this
+  # one has a real fix rather than being shelved, because the tool that
+  # doesn't run in the container simply doesn't need to run in it.
+  # ---------------------------------------------------------------------
+  client-3ds-cia:
+    name: client-3ds-cia
+    needs: client-3ds
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: atticpad-3ds-elf
+          path: clients/3ds
+
+      - name: fetch pinned makerom
+        # Verified 2026-08-10 against ubuntu-latest's glibc (see the
+        # job-level comment above) -- this is the same binary+sha256 that
+        # failed inside the devkitARM container, run here instead.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source scripts/cia-tools.env
+          mkdir -p /tmp/makerom
+          curl -sSL -o /tmp/makerom.zip "${MAKEROM_LINUX_URL}"
+          echo "${MAKEROM_LINUX_SHA256}  /tmp/makerom.zip" | sha256sum -c -
+          unzip -q -o /tmp/makerom.zip -d /tmp/makerom
+          chmod +x /tmp/makerom/makerom
+          echo "/tmp/makerom" >> "$GITHUB_PATH"
+
+      - name: build atticpad-3ds.cia
+        # No DEVKITARM needed -- clients/3ds/Makefile's top-of-file guard
+        # skips the devkitARM requirement and the 3ds_rules include when
+        # `cia` is the only goal (see that file). bannertool is never
+        # fetched here; clients/3ds/meta/banner.bnr and icon.icn are
+        # committed inputs (docs/DESIGN.md §8.3 / risk 11, see the top-of-file
+        # note).
+        run: |
+          set -euo pipefail
+          which makerom
+          make -C clients/3ds cia
+
+      - name: verify the .cia artifact exists
+        # Same rule as client-3ds's .3dsx check (docs/DESIGN.md §8.2: "fails if
+        # any artifact is missing") -- applies per-artifact, not just
+        # per-job.
+        run: test -f clients/3ds/atticpad-3ds.cia
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-3ds-cia
+          path: clients/3ds/atticpad-3ds.cia
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # server-linux — native Linux server build (uinput backend). Not
+  # required: a build failure here still shows up loudly, but should not
+  # block merges to work that has nothing to do with server/ (branch
+  # protection setting, see the top-of-file note).
+  # ---------------------------------------------------------------------
+  server-linux:
+    name: server-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: server — build (+ smoke run if /dev/uinput is usable on this runner)
+        run: ./scripts/build.sh server
+
+      - name: verify the artifact exists and is an ELF binary
+        # Same rule as server-windows above: docs/DESIGN.md §8.2's "the release job
+        # fails if any artifact is missing" is cheapest to enforce where the
+        # artifact is produced, and keeps the failure attributable.
+        run: |
+          set -euo pipefail
+          test -f build/server/atticpad-server
+          file build/server/atticpad-server
+          file build/server/atticpad-server | grep -q "ELF 64-bit" \
+            || { echo "::error::build/server/atticpad-server exists but is not an ELF 64-bit binary"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-server-linux
+          path: build/server/atticpad-server
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # server-windows — the Windows server (server/host/windows/,
+  # server/backends/vigem.c, docs/DESIGN.md §2.1/§6.4), cross-compiled from Linux
+  # with mingw-w64. Deliberately `ubuntu-latest`, NOT `windows-latest`:
+  # nothing here is EXECUTED in CI, only compiled and statically linked --
+  # same reasoning as docs/DESIGN.md §2.1's "the Windows test machine has no C
+  # toolchain at all, so build on Linux and copy the binary over", just
+  # applied to CI instead of the one physical test machine. See
+  # scripts/build.sh's build_windows() for the exact recipe (mirrored here
+  # 1:1: this job's only real content is `./scripts/build.sh windows`) and
+  # server/backends/vendor/README.md for why the final link must go through
+  # g++ with -static (the vendored ViGEmClient TU is C++, and the target
+  # machine has no C/C++ runtime DLLs of its own to dynamically link
+  # against).
+  #
+  # mingw-w64 is a host package, not a container digest -- same shape as
+  # client-android below, not client-3ds above. scripts/windows.env pins
+  # the version this backend was last verified against (real ViGEmBus
+  # hardware, docs/DESIGN.md §2.1 / server/backends/vigem.c's header); this job
+  # installs whatever ubuntu-latest currently offers under those package
+  # names and WARNS, not fails, on a version difference -- see
+  # windows.env's header for why an apt version isn't hard-pinned the way a
+  # Docker digest is.
+  #
+  # Not required (top-of-file note): should not block merges unrelated to
+  # server/ or the Windows host. Verified compiling here is NOT the same
+  # claim as verified running -- this job proves the cross-build stays
+  # sound, nothing more; see server/backends/vigem.c's header comment for
+  # what has and has not been confirmed on real Windows hardware.
+  # ---------------------------------------------------------------------
+  server-windows:
+    name: server-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install mingw-w64 (scripts/windows.env)
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source scripts/windows.env
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y ${APAD_MINGW_PACKAGES}
+
+      - name: report the installed mingw-w64 version against the pinned/verified one
+        # WARNS, does not fail, on a mismatch -- scripts/windows-mingw-check.sh
+        # and scripts/windows.env's header both explain why.
+        run: ./scripts/windows-mingw-check.sh
+
+      - name: build atticpad-server.exe (scripts/build.sh windows)
+        # Compile-only, same as the local loop -- scripts/build.sh never
+        # produces a release artifact (docs/DESIGN.md §8.5), and this job does not
+        # sign anything (docs/DESIGN.md §8.2 "signing only on tags": there is
+        # nothing to sign here regardless -- a plain PE32+ binary, not an
+        # installer).
+        run: ./scripts/build.sh windows
+
+      - name: verify the artifact exists and is a PE32+ binary
+        # docs/DESIGN.md §8.2 "the release job fails if any artifact is missing"
+        # starts here, same rule client-3ds applies to its .3dsx below --
+        # scripts/build.sh windows already checks this internally and would
+        # have failed the previous step, but re-checking here keeps the
+        # failure attributable to "no artifact" specifically rather than
+        # buried in that step's combined build output, same pattern this
+        # workflow already uses for client-3ds and client-android.
+        run: |
+          set -euo pipefail
+          test -f build/windows/atticpad-server.exe
+          file build/windows/atticpad-server.exe
+          file build/windows/atticpad-server.exe | grep -q "PE32+ executable" \
+            || { echo "::error::build/windows/atticpad-server.exe exists but is not a PE32+ executable"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-server-windows
+          path: build/windows/atticpad-server.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # client-android (docs/DESIGN.md §8.1). NO `container:` — Android is the one
+  # target docs/DESIGN.md §8.5 builds with a NATIVE toolchain, and §8.1 gives this
+  # job `ubuntu-latest` + SDK/NDK. So there is no digest in
+  # scripts/toolchains.env to match; what keeps CI and a developer's machine
+  # equivalent is scripts/android.env, which this job and
+  # scripts/android-sdk-bootstrap.sh both read.
+  #
+  # ubuntu-latest already ships a JDK and an Android SDK, but NOT necessarily
+  # the pinned NDK/CMake/build-tools, and definitely not pinned. This job
+  # installs exactly what android.env names, via the same script a developer
+  # runs, so a green build here means the same packages produced it.
+  # ---------------------------------------------------------------------
+  client-android:
+    name: client-android
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: read pinned versions
+        id: pins
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source scripts/android.env
+          {
+            echo "jdk=${APAD_JDK_FEATURE}"
+            echo "ndk=${APAD_NDK_VERSION}"
+            echo "cmake=${APAD_CMAKE_VERSION}"
+            echo "build_tools=${APAD_BUILD_TOOLS}"
+            echo "compile_sdk=${APAD_COMPILE_SDK}"
+            echo "agp=${APAD_AGP_VERSION}"
+            echo "gradle=${APAD_GRADLE_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "AGP ${APAD_AGP_VERSION} / Gradle ${APAD_GRADLE_VERSION} / NDK ${APAD_NDK_VERSION} / JDK ${APAD_JDK_FEATURE}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.pins.outputs.jdk }}
+
+      - uses: android-actions/setup-android@v3
+
+      - name: install the pinned SDK packages
+        run: |
+          set -euo pipefail
+          source scripts/android.env
+          yes 2>/dev/null | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-${APAD_COMPILE_SDK}" \
+            "build-tools;${APAD_BUILD_TOOLS}" \
+            "ndk;${APAD_NDK_VERSION}" \
+            "cmake;${APAD_CMAKE_VERSION}"
+
+      - name: build the debug apk (arm64-v8a, armeabi-v7a, x86_64)
+        run: ./scripts/build.sh android
+
+      - name: verify the artifact exists and carries all three ABIs
+        # A gradle build that "succeeds" while packaging no .so at all is a
+        # real failure mode: externalNativeBuild silently contributing
+        # nothing looks identical to a clean build from the task list.
+        run: |
+          set -euo pipefail
+          APK=clients/android/app/build/outputs/apk/debug/app-debug.apk
+          [ -f "$APK" ] || { echo "::error::$APK was not produced"; exit 1; }
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -l "$APK" | grep -q "lib/${abi}/libapadjni.so" \
+              || { echo "::error::$APK has no lib/${abi}/libapadjni.so -- the NDK build contributed nothing for that ABI"; exit 1; }
+          done
+          ls -l "$APK"
+
+      - name: assert the codec was linked, not reimplemented
+        # The whole point of the JNI boundary (docs/DESIGN.md §7.2) is that the
+        # protocol lives in libapad. If apad_seq_newer and apad_time_after
+        # are not real symbols in the .so, something has inlined or
+        # reimplemented the wrap-safe comparisons that six untestable
+        # platforms depend on -- the failure that passes every test shorter
+        # than nine minutes and then freezes the client forever.
+        run: |
+          set -euo pipefail
+          source scripts/android.env
+          NM="${ANDROID_SDK_ROOT}/ndk/${APAD_NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+
+          # Check the tool FIRST. Until 0.4.0 this step piped a possibly
+          # missing llvm-nm straight into grep, so a wrong NDK path produced
+          # the message "apad_seq_newer is not a defined symbol" -- blaming
+          # the code for a broken toolchain path, which is the most expensive
+          # kind of wrong error message to debug.
+          if [ ! -x "$NM" ]; then
+            echo "::error::llvm-nm not found at $NM (ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT, APAD_NDK_VERSION=$APAD_NDK_VERSION). This is a toolchain path problem, NOT a symbol problem."
+            ls "${ANDROID_SDK_ROOT}/ndk" 2>&1 || true
+            exit 1
+          fi
+
+          # Inspect the library that actually SHIPS, not the intermediate.
+          # The apk copy is stripped; .dynsym survives stripping, which is
+          # exactly the table this assertion is about.
+          mkdir -p /tmp/apkx
+          unzip -o -q clients/android/app/build/outputs/apk/debug/app-debug.apk 'lib/arm64-v8a/*' -d /tmp/apkx
+          SO=/tmp/apkx/lib/arm64-v8a/libapadjni.so
+          test -f "$SO" || { echo "::error::no lib/arm64-v8a/libapadjni.so inside the debug apk"; exit 1; }
+
+          # Read the symbol table ONCE, into a variable, and compare in the
+          # shell. The obvious `nm ... | grep -q "$sym"` per symbol is a race:
+          # grep -q exits at its first match and closes the pipe, nm takes
+          # SIGPIPE on its next write, and `set -o pipefail` reports that as a
+          # failed test. It fails most often on the EARLIEST-matching symbol,
+          # because that leaves nm the most output still to write -- which is
+          # why it always accused apad_seq_newer, passed on a fast machine,
+          # and passed intermittently in CI. A green run was luck, not proof.
+          SYMS="$("$NM" -D --defined-only "$SO" | awk '{ print $NF }')"
+          [ -n "$SYMS" ] || { echo "::error::$NM produced no symbols for $SO"; exit 1; }
+
+          missing=0
+          for sym in apad_seq_newer apad_time_after Java_net_atticpad_AtticPadNative_clientPump; do
+            found=0
+            for have in $SYMS; do
+              if [ "$have" = "$sym" ]; then found=1; break; fi
+            done
+            if [ "$found" -eq 1 ]; then
+              echo "  ok  $sym"
+            else
+              echo "::error::$sym is not a dynamic defined symbol in the shipped $SO"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "--- dynamic defined symbols actually present: ---"
+            printf '%s\n' "$SYMS"
+            exit 1
+          fi
+          echo "libapad symbols present in the shipped .so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-android-debug-apk
+          path: clients/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------
+      # Tag-only: the signed release apk. Steps rather than a separate job,
+      # because the SDK/NDK setup above is the expensive part and a second
+      # job would duplicate all of it. (client-3ds-cia is a separate job for
+      # a reason that does not apply here: makerom needs a newer glibc than
+      # the devkitARM container has.)
+      #
+      # docs/DESIGN.md §8.2, "signing only on tags, so forks can build": on any
+      # ordinary push or PR these steps do not run at all, and a fork that
+      # tags without secrets fails HERE with a clear message rather than
+      # silently publishing an unsigned apk.
+      # -----------------------------------------------------------------
+      - name: decode the release keystore (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          KEYSTORE_B64: ${{ secrets.APAD_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "::error::APAD_ANDROID_KEYSTORE_BASE64 is not set. A tagged build must be signed; see docs/INSTALL.md on why an unsigned release apk cannot upgrade an installed one."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/atticpad-release.jks"
+          test -s "$RUNNER_TEMP/atticpad-release.jks"
+
+      - name: build the signed release apk (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          APAD_ANDROID_KEYSTORE: ${{ runner.temp }}/atticpad-release.jks
+          APAD_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.APAD_ANDROID_KEYSTORE_PASSWORD }}
+          APAD_ANDROID_KEY_ALIAS: ${{ secrets.APAD_ANDROID_KEY_ALIAS }}
+          APAD_ANDROID_KEY_PASSWORD: ${{ secrets.APAD_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd clients/android
+          ./gradlew --no-daemon assembleRelease
+
+      - name: verify the release apk is signed and carries all three ABIs
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          source scripts/android.env
+          APK=clients/android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${APAD_BUILD_TOOLS}/apksigner"
+          "$APKSIGNER" verify --print-certs "$APK"
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -l "$APK" | grep -q "lib/$abi/libapadjni.so" \
+              || { echo "::error::$APK is missing lib/$abi/libapadjni.so"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: atticpad-android-release-apk
+          path: clients/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # integration — loopback client -> uinput server, asserts input arrives
+  # (docs/DESIGN.md §8.1). NOT required (see the top-of-file note): whether this
+  # job can even run depends on this GitHub-hosted runner exposing
+  # /dev/uinput, which was NOT verified before this workflow was written
+  # (see the ci-engineer report). It fails loudly and specifically if that
+  # assumption is wrong, rather than skipping silently.
+  # ---------------------------------------------------------------------
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: verify /dev/uinput is usable on this runner
+        run: |
+          sudo modprobe uinput || true
+          if [ ! -e /dev/uinput ]; then
+            echo "::error::/dev/uinput does not exist on this ubuntu-latest runner, even after 'sudo modprobe uinput'. This was an open question when this workflow was written (see docs/CONVENTIONS.md / the ci-engineer report) -- GitHub's hosted runners are not guaranteed to expose it. If this fires, the fix is a self-hosted runner (or a runner image) with the uinput kernel module available and /dev/uinput accessible to the job user -- not a workaround inside this job."
+            exit 1
+          fi
+          sudo chmod 666 /dev/uinput
+          ls -l /dev/uinput
+
+      - name: build server + loopback-client + engine-client (native)
+        run: |
+          ./scripts/build.sh server
+          ./tools/loopback-client/build.sh build-only
+          # engine-client drives clients/common/apad_client.c -- the SHARED
+          # engine every real client (Android, 3DS, ...) links -- through a
+          # real session. It has no self-loopback mode (see its build.sh),
+          # so it is build-only here too; it is run below, against the same
+          # server loopback-client uses.
+          ./tools/engine-client/build.sh build-only
+          command -v strace >/dev/null || { sudo apt-get update && sudo apt-get install -y strace; }
+
+      - name: run server under strace, drive it with loopback-client and engine-client --target, assert real uinput writes happened
+        # Why strace instead of evtest: evtest needs read access to the
+        # /dev/input/eventN device uinput creates, which does not inherit
+        # any permission grant on /dev/uinput itself and needs its own
+        # udev rule or group membership -- unverified on this runner, same
+        # open question as /dev/uinput above. strace only needs to ptrace
+        # its own child (the server we just spawned), which needs no extra
+        # permissions, and the write(2) payload it captures is the literal
+        # struct input_event the kernel delivers downstream -- byte-for-byte
+        # equivalent to what evtest would report, just read differently.
+        #
+        # loopback-client and engine-client both run against this SAME
+        # server process, under the SAME strace session -- one server, not
+        # two. loopback-client is ADVERSARIAL instrumentation that hand-rolls
+        # datagrams to test THE SERVER; engine-client contains no protocol
+        # code of its own and tests THE SHARED CLIENT ENGINE
+        # (clients/common/apad_client.c), on Linux, in CI, a path that used
+        # to only run inside an installed APK. Neither replaces the other --
+        # see tools/engine-client/main.c's header.
+        run: |
+          PORT=21100
+          strace -f -yy -e trace=write -e write=all -o trace.log \
+            ./build/server/atticpad-server "${PORT}" &
+          SERVER_PID=$!
+          sleep 1
+
+          set +e
+          ./tools/loopback-client/loopback-client --target 127.0.0.1 "${PORT}"
+          CLIENT_RC=$?
+          set -e
+
+          sleep 0.5
+
+          echo "loopback-client --target exit code: ${CLIENT_RC}"
+          if [ "${CLIENT_RC}" -ne 0 ]; then
+            echo "::error::loopback-client --target did not complete the DISCOVER/ANNOUNCE + HELLO/WELCOME + PING/PONG flow (docs/DESIGN.md §8.1). Exit code gates on WELCOME + PONG only -- see tools/loopback-client/main.c. Full trace below."
+            cat trace.log || true
+            kill -9 "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+          fi
+
+          WRITES_LOOPBACK="$(grep -c '/dev/uinput' trace.log || true)"
+          if [ "${WRITES_LOOPBACK}" -eq 0 ]; then
+            echo "::error::loopback-client completed its handshake (exit 0) but no write(2) to /dev/uinput was observed -- INPUT_STATE never reached the virtual pad. Full trace below."
+            cat trace.log || true
+            kill -9 "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "PASS: ${WRITES_LOOPBACK} write(2) call(s) to /dev/uinput observed after loopback-client's handshake."
+
+          # Same running server, same strace session -- NOT a second server.
+          set +e
+          ./tools/engine-client/engine-client --target 127.0.0.1 "${PORT}"
+          ENGINE_RC=$?
+          set -e
+
+          sleep 0.5
+
+          echo "engine-client --target exit code: ${ENGINE_RC}"
+          if [ "${ENGINE_RC}" -ne 0 ]; then
+            echo "::error::engine-client --target did not complete a full session (probe/ANNOUNCE + connect/WELCOME + pump + PONG + disconnect/BYE) driven entirely by clients/common/apad_client.c, the same engine every real client links. Full trace below."
+            cat trace.log || true
+            kill -9 "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Extend the same uinput-write assertion to engine-client's own
+          # INPUT_STATE frames: the trace.log write count must have grown
+          # past what loopback-client alone produced.
+          WRITES_TOTAL="$(grep -c '/dev/uinput' trace.log || true)"
+          if [ "${WRITES_TOTAL}" -le "${WRITES_LOOPBACK}" ]; then
+            echo "::error::engine-client completed its session (exit 0) but no NEW write(2) to /dev/uinput was observed since loopback-client finished -- engine-client's INPUT_STATE frames never reached the virtual pad. Full trace below."
+            cat trace.log || true
+            kill -9 "${SERVER_PID}" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "PASS: $((WRITES_TOTAL - WRITES_LOOPBACK)) additional write(2) call(s) to /dev/uinput observed after engine-client's session."
+
+          # Bounded shutdown, not a plain `wait`: observed locally that
+          # strace -f can be slow to unwind after its tracee exits, and a
+          # bare `wait` on strace's own PID occasionally hung past this
+          # step's implicit timeout. `tail --pid` polls /proc instead of
+          # relying on job-control reaping, so a stuck strace can't hang
+          # the job -- it gets 5s, then SIGKILL.
+          kill -TERM "${SERVER_PID}" 2>/dev/null || true
+          timeout 5 tail --pid="${SERVER_PID}" -f /dev/null 2>/dev/null || true
+          kill -9 "${SERVER_PID}" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-trace
+          path: trace.log
+          retention-days: 14

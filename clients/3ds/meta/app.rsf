@@ -1,0 +1,172 @@
+# clients/3ds/meta/app.rsf
+#
+# makerom ROM Spec File for atticpad-3ds.cia (docs/DESIGN.md §8.3). makerom ships
+# no bundled RSF template of its own (checked the 3DSGuy/Project_CTR repo
+# tree at the pinned makerom-v0.19.0 tag -- no template file exists there
+# to copy), so this mirrors the structure of two real, actively-maintained
+# homebrew CIAs' RSFs rather than being invented from memory, the same
+# grounding rule docs/CONVENTIONS.md §10 applies to blind-platform networking code:
+#   - github.com/mkst/sm64-port  3ds/template.rsf   (minimal homebrew app)
+#   - github.com/FlagBrew/Checkpoint  3ds/assets/app.rsf  (full SVC/IO
+#     mapping block reused verbatim below -- every homebrew CIA needs the
+#     same baseline kernel syscalls for threads/mutexes/memory, trimming
+#     this list is a good way to get a CIA that installs but never boots)
+#
+# ServiceAccessControl below is scoped down from both of those, using only
+# services this project's clients/3ds/source/*.c actually calls (grepped,
+# not guessed -- see the report from the task that added this file):
+# gfxInitDefault -> gsp::Gpu/gsp::Lcd, hidScanInput -> hid:USER,
+# irrstInit -> ir:rst (Circle Pad Pro extension), socInit -> soc:U, plus
+# APT:U/fs:USER/ac:u/cfg:u, which every libctru app needs from its default
+# crt0 init and which both reference RSFs include unconditionally.
+#
+# NOT verified by installing this CIA on hardware -- see the report from
+# the task that added this file for the full list of what is and is not
+# verified.
+
+BasicInfo:
+  Title       : AtticPad
+  ProductCode : CTR-P-ATCP
+  Logo        : Homebrew
+
+TitleInfo:
+  Category : Application
+  # 0xA771C -- chosen 2026-08-10. Checked against db.universal-team.net/3ds
+  # and a direct web search for the literal ID; neither turned up a
+  # collision. There is no central 3DS homebrew unique-ID authority (the
+  # "homebrew unique-ID list" docs/DESIGN.md §8.3 refers to is a decentralized,
+  # community-maintained convention -- GBAtemp thread + titledb.com), so
+  # this is best-effort collision avoidance, not a guarantee. Flagged as
+  # unverified in the report.
+  UniqueId : 0xA771C
+
+Option:
+  UseOnSD          : true
+  FreeProductCode  : true
+  MediaFootPadding : false
+  # A build-time substitution, not a literal, because docs/DESIGN.md §8.3's own
+  # example makerom invocation passes -DAPP_ENCRYPTED=false explicitly.
+  # clients/3ds/Makefile's cia target always passes that -- test-key CIAs
+  # are never encrypted, there is no key to encrypt them with.
+  EnableCrypt      : $(APP_ENCRYPTED)
+  EnableCompress   : true
+
+AccessControlInfo:
+  CoreVersion                 : 2
+  DescVersion                 : 2
+  ReleaseKernelMajor          : "02"
+  ReleaseKernelMinor          : "46"
+  UseExtSaveData              : false
+  FileSystemAccess:
+   - DirectSdmc
+  MemoryType                  : Application
+  SystemMode                  : 64MB
+  IdealProcessor               : 0
+  AffinityMask                 : 1
+  Priority                     : 16
+  MaxCpu                       : 0x9E
+  HandleTableSize              : 0x200
+  DisableDebug                 : false
+  EnableForceDebug             : false
+  CanWriteSharedPage           : true
+  CanUsePrivilegedPriority     : false
+  CanUseNonAlphabetAndNumber   : true
+  PermitMainFunctionArgument   : true
+  CanShareDeviceMemory         : true
+  RunnableOnSleep               : false
+  SpecialMemoryArrange          : true
+  SystemModeExt                 : Legacy
+  CpuSpeed                      : 268MHz
+  EnableL2Cache                 : false
+  CanAccessCore2                : false
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
+  # Standard baseline kernel syscalls every libctru homebrew app needs
+  # (threads, mutexes, memory blocks, timers, IPC to services). Reused
+  # verbatim from FlagBrew/Checkpoint's app.rsf (a real, working homebrew
+  # CIA) rather than guessed -- trimming this list risks a CIA that
+  # installs but faults on boot, which is exactly the class of failure
+  # this task cannot detect without hardware (see the report).
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    GetProcessIdealProcessor: 6
+    SetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    Run: 18
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    SignalAndWait: 38
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+    OpenProcess: 51
+    OpenThread: 52
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetThreadId: 55
+    GetResourceLimit: 56
+    GetResourceLimitLimitValues: 57
+    GetResourceLimitCurrentValues: 58
+    GetThreadContext: 59
+    Break: 60
+    OutputDebugString: 61
+    ControlPerformanceCounter: 62
+  # Scoped down from Checkpoint's full ServiceAccessControl list to only
+  # what clients/3ds/source/*.c actually calls, plus the libctru baseline
+  # -- see the header comment above.
+  ServiceAccessControl:
+   - APT:U
+   - ac:u
+   - cfg:u
+   - fs:USER
+   - gsp::Gpu
+   - gsp::Lcd
+   - hid:USER
+   - ir:rst
+   - soc:U
+
+SystemControlInfo:
+  SaveDataSize    : 0KB
+  RemasterVersion : 0
+  StackSize       : 0x40000

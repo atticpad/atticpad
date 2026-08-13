@@ -1,0 +1,51 @@
+/* server/host/windows/atticpad.rc -- Win32 resources for atticpad-server.exe.
+ *
+ * atticpad.ico is GENERATED, not drawn here and not hand-edited:
+ *
+ *     python3 clients/3ds/meta/make-assets.py --windows
+ *
+ * That script is the one place the AtticPad mark exists (see its header for
+ * why -- a hand-ported second copy of the mark drifted into a visibly wrong
+ * D-pad on Android before this rule existed). The .ico carries nine
+ * dedicated renders (16..256), each drawn at its own size rather than
+ * downsampled from one master, because 16x16 is what the tray and the title
+ * bar actually display.
+ *
+ * Compiled by windres in scripts/build.sh's build_windows().
+ */
+#include <windows.h>
+#include "resource.h"
+#include "atticpad/version.h"
+
+IDI_APPICON ICON "atticpad.ico"
+
+VS_VERSION_INFO VERSIONINFO
+  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+  FILEFLAGS     0x0L
+  FILEOS        VOS_NT_WINDOWS32
+  FILETYPE      VFT_APP
+  FILESUBTYPE   VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"   /* US English, Unicode */
+    BEGIN
+      VALUE "CompanyName",      "AtticPad"
+      VALUE "FileDescription",  "AtticPad server -- use phones and old consoles as PC game controllers"
+      /* APAD_VERSION_STR ALREADY has the suffix concatenated into it
+       * (version.h: `#define APAD_VERSION_STR "0.3.0" APAD_VERSION_SUFFIX`),
+       * so naming both here yields "0.3.0-dev-dev". Caught by reading the
+       * property sheet off the built .exe on Windows. */
+      VALUE "FileVersion",      APAD_VERSION_STR
+      VALUE "InternalName",     "atticpad-server"
+      VALUE "OriginalFilename", "atticpad-server.exe"
+      VALUE "ProductName",      "AtticPad"
+      VALUE "ProductVersion",   APAD_VERSION_STR
+      VALUE "LegalCopyright",   "MIT licensed"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

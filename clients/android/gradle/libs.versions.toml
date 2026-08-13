@@ -1,0 +1,15 @@
+# The AGP version, and nothing else.
+#
+# AGP 9.0 removed support for applying the Kotlin Gradle Plugin and brought
+# Kotlin compilation in-house, so there is no Kotlin version to pin here — AGP
+# picks it. scripts/android.env records which one it turned out to be, for the
+# benefit of anyone reading "what built this?".
+#
+# Duplicated in scripts/android.env, which is what CI and
+# scripts/android-sdk-bootstrap.sh read. clients/android/build.sh checks the
+# two agree and fails if they drift.
+[versions]
+agp = "9.3.1"
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }

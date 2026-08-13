@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  API 26+ adaptive icon (`android:icon="@mipmap/ic_launcher"` resolves here
+  on a device that can use it; a pre-26 launcher falls through to the
+  density-specific mipmap-<density>/ic_launcher.png files instead).
+
+  GENERATED, both layers: the background is a flat colour resource
+  (@color/ic_launcher_background, see values/colors.xml) and the foreground
+  is a raster PNG per density (mipmap-<density>/ic_launcher_foreground.png)
+  produced by clients/3ds/meta/make-assets.py's `make_android_assets()` —
+  the SAME render_mark() the 3DS icon/banner use, just recomposed to fit
+  the adaptive icon's 66dp safe-zone circle instead of filling a tile. Do
+  not hand-edit the PNGs; rerun `make-assets.py` in its Android mode (see
+  that script's own header for the exact invocation, which this comment
+  can't repeat verbatim: the flag it needs is two hyphens followed by the
+  word "android", and XML comments reject two consecutive hyphens).
+
+  This replaces a hand-drawn VectorDrawable pair that drifted from the 3DS
+  mark almost immediately — its D-pad was two overlapping rectangles cut
+  with evenOdd, so the overlap filled back in and the cross rendered as a
+  checkerboard on a real device.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

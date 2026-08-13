@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- UDP on the LAN. docs/PROTOCOL.md §1: IPv4, LAN-only by design. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      CHANGE_WIFI_STATE is what WifiManager.createWifiLock()/acquire() needs.
+      The lock itself is docs/DESIGN.md §7.2's first "most likely to cost a day"
+      item and risk 13 in §12: without it Android powers the radio down
+      between beacons and 60 Hz input arrives in erratic clumps that look
+      exactly like a protocol bug.
+
+      CHANGE_WIFI_MULTICAST_STATE is for the MulticastLock that tier-1 mDNS
+      discovery needs (§7).
+
+      Both also satisfy the manifest-permission prerequisite for the
+      `connectedDevice` foreground-service type below, so nothing here is
+      declared solely to unlock that.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Android 13+: without this the ongoing notification is not shown. The
+         service still runs; the user just cannot stop it from the shade. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- §6.7 RUMBLE. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!--
+      Bluetooth Controller mode (BtHidController.kt / BtControllerActivity.kt)
+      — the phone registers itself as a Bluetooth HID gamepad for a PC or
+      console, no AtticPad server involved. Started as a same-day spike
+      (a deliberate, reviewed decision), promoted to a first-class
+      product mode 2026-08-12.
+
+      BLUETOOTH / BLUETOOTH_ADMIN cover API 26..30, where they are normal
+      (install-time) permissions. From API 31 they are replaced by the
+      runtime BLUETOOTH_CONNECT (registerApp/sendReport/getBondedDevices)
+      and BLUETOOTH_ADVERTISE (ACTION_REQUEST_DISCOVERABLE) below —
+      requested at runtime only when this screen is opened
+      (BtControllerActivity.beginPermissionFlow), never on ordinary launch,
+      the same "never unless a screen actually needs it" rule the CAMERA
+      permission already follows.
+    -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
+    <!--
+      §10.3 in-app QR scanning. Requested at RUNTIME only when the user taps
+      "Scan QR code" (QrScanner.kt) — never on launch, and never required:
+      the deep link (below) and manual entry (§7 tier 3, always available)
+      both pair without ever touching this permission.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Advertised as capabilities, never required: a phone with no gyro is
+         a perfectly good pad and says so by leaving APAD_CAP_GYRO clear in
+         HELLO (§6.3), which is the protocol's ONLY mechanism for "this
+         hardware does not exist" (§5.5). A camera-less phone is the same
+         story one layer up: §7 keeps manual entry mandatory precisely so
+         this is never a second-class device. -->
+    <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+    <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <!-- Bluetooth Controller mode only — never required, exactly like the
+         camera above: a device with no Bluetooth radio at all must still
+         install and run the ordinary UDP client. -->
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <!-- BOTH of these, and both required="false", deliberately.
+         Declaring the CAMERA permission makes Android IMPLY
+         `android.hardware.camera` as REQUIRED, which would stop the app
+         installing on a device with no camera at all. A camera is an
+         accelerator for pairing (§10.3), never a requirement: §7 keeps manual
+         entry mandatory and §10.1 keeps the token typeable precisely so a
+         camera-less client is not second-class. `camera.any` covers front-only
+         devices. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen.multitouch" android:required="true" />
+
+    <application
+        android:label="AtticPad"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+
+        <!-- configChanges: handle these ourselves. A rotation, or a gamepad
+             being plugged in, must not recreate the Activity while a session
+             is live.
+
+             screenOrientation="fullSensor" (not the old "sensorLandscape"):
+             the connect/pairing/self-test screens are ordinary phone UI
+             that work in portrait, and the pad overlay now carries its own
+             portrait layout (PadLayout.Orientation) — see MainActivity's
+             onConfigurationChanged, which is what actually reacts to a
+             rotation this attribute allows through. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="fullSensor"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|smallestScreenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+              docs/PROTOCOL.md §10.3 pairing URI as a deep link. The system
+              camera app — which every modern phone already has, and which
+              already reads QR codes without this app ever touching the
+              CAMERA permission — can hand a scanned `atticpad://` URI
+              straight here.
+
+              No android:host / android:port: §10.3's host is a caller-
+              chosen IPv4 dotted quad and the port is whatever the server is
+              bound to, so nothing about either is fixed at build time. The
+              scheme alone is the whole filter; cpp/apad_jni.c's
+              `pairUriParse` (core's `apad_pair_uri_parse`, §10.3) is what
+              actually validates the rest, exactly as hostile input.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="atticpad" />
+            </intent-filter>
+        </activity>
+
+        <!-- Bluetooth Controller mode — see BtHidController.kt's class doc.
+             Not `exported`: reachable only from inside this app
+             (MainActivity's "No PC? Bluetooth Controller" card), never
+             from outside. -->
+        <activity
+            android:name=".BtControllerActivity"
+            android:exported="false"
+            android:label="AtticPad — Bluetooth Controller"
+            android:screenOrientation="fullSensor"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|smallestScreenSize" />
+
+        <!--
+          The app's spine (docs/DESIGN.md §7.2). foregroundServiceType is mandatory
+          from Android 14; `connectedDevice` is the documented fit —
+          "interactions with external devices that require a ... network
+          connection" — and its prerequisite is met by CHANGE_WIFI_STATE
+          above. It is NOT `specialUse`, which needs a free-form justification
+          reviewed by Play and is the catch-all for cases no real type covers.
+        -->
+        <service
+            android:name=".AtticPadService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>
