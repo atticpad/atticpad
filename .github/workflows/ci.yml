@@ -54,10 +54,26 @@ on:
     # release. Both need CI -- a snapshot nobody built is not worth much.
     branches: [main, dev]
   pull_request:
-  schedule:
-    # Nightly: same jobs, but core-fuzz gets a much bigger time budget
-    # (docs/DESIGN.md §8.1: "5 min on PR, 1 hour nightly").
-    - cron: '17 3 * * *'
+  # NIGHTLY DISABLED WHILE THIS REPOSITORY IS PRIVATE.
+  #
+  # docs/DESIGN.md §8.1 asks for "5 min on PR, 1 hour nightly", and the hour is the
+  # part that matters on a frozen codec. But private repositories bill Actions
+  # minutes against a 2000/month allowance, and this schedule costs ~60 minutes
+  # of fuzzing plus ~5 of everything else, EVERY NIGHT -- about 1950 a month,
+  # or essentially the entire allowance, to re-fuzz code that mostly has not
+  # changed since the previous night.
+  #
+  # Public repositories get unlimited minutes, so RESTORE THIS THE DAY THE
+  # REPOSITORY GOES PUBLIC -- uncomment the two lines below. Until then the
+  # long fuzz is a local job:
+  #
+  #     ./tools/fuzz/build.sh 3600
+  #
+  # The 5-minute push fuzz still runs whenever core/, shim/ or tools/fuzz/
+  # changes, so the decoder is not unguarded in the meantime.
+  #
+  # schedule:
+  #   - cron: '17 3 * * *'
   workflow_dispatch: {}
   # release.yml calls this workflow on a tag rather than duplicating the job
   # definitions. A called workflow sees the CALLER's github.ref, so every
