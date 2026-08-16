@@ -62,7 +62,7 @@
  * UI and not two, and sockcompat.h's for the short list of calls that are
  * genuinely not the same on Winsock. All header-only, because
  * scripts/build.sh names an exact list of .c files per target. */
-#include "../common/profiles_builtin.h"   /* profiles compiled into the binary */
+#include "../common/profile_sources.h"    /* disk + built-in profile assembly */
 #include "../common/webui.h"
 
 /* Loopback-only port the UI listens on. Same default and same
@@ -790,7 +790,11 @@ int main(int argc, char **argv)
     apad_server *server;
     profile_store_file files[PROFILE_STORE_MAX_FILES];
     apad_profile_source sources[PROFILE_STORE_MAX_FILES];
-    size_t file_count, i;
+    /* file_count counts entries in files[] that OWN heap memory and must be
+     * freed. source_count counts what is handed to the library, which may
+     * instead be the compiled-in profiles -- static storage that must NEVER
+     * be freed. Conflating the two frees uninitialised stack pointers. */
+    size_t file_count, source_count;
     char base_dir[MAX_PATH];
     char default_profiles_dir[MAX_PATH + 16];
     /* Resolved once below, kept alive for the whole process: webui.h's
@@ -872,30 +876,17 @@ int main(int argc, char **argv)
         default_profiles_dir[sizeof default_profiles_dir - 1] = '\0';
         profiles_dir = default_profiles_dir;
     }
-    file_count = profile_store_scan(profiles_dir, files,
-                                    (size_t)PROFILE_STORE_MAX_FILES);
+    /* Disk first, then any built-in the directory does not override.
+     * profile_sources.h owns this so startup and the web UI reload can
+     * never disagree about what the profile set is. */
+    source_count = profile_sources_build(profiles_dir, files, sources,
+                                         (size_t)PROFILE_STORE_MAX_FILES,
+                                         &file_count);
     if (file_count == 0u) {
-        /* Same reasoning as the Linux host: fall back to the profiles
-         * compiled into this binary, not to the library's lone built-in
-         * default. A downloaded .exe has no profiles folder beside it, and
-         * without this a 3DS would get a pad whose touch triggers and gyro
-         * aim silently do nothing while the client still draws them. */
-        for (i = 0; i < ATTICPAD_BUILTIN_PROFILE_COUNT; i++) {
-            sources[i].label = ATTICPAD_BUILTIN_PROFILES[i].label;
-            sources[i].name  = ATTICPAD_BUILTIN_PROFILES[i].name;
-            sources[i].text  = ATTICPAD_BUILTIN_PROFILES[i].text;
-        }
-        file_count = ATTICPAD_BUILTIN_PROFILE_COUNT;
         (void)fprintf(stderr,
                       "[atticpad] profiles: none on disk in \"%s\" -- using "
                       "the %u profiles built into this binary\n",
                       profiles_dir, (unsigned)ATTICPAD_BUILTIN_PROFILE_COUNT);
-    } else {
-        for (i = 0; i < file_count; i++) {
-            sources[i].label = files[i].label;
-            sources[i].name  = files[i].name;
-            sources[i].text  = files[i].text;
-        }
     }
 
     if (apad_net_init() != APAD_OK) {
@@ -952,8 +943,8 @@ int main(int argc, char **argv)
     cfg.user          = NULL;   /* g_sock is file-scope; nothing to carry */
     cfg.server_port   = port;
     cfg.server_name   = NULL;   /* library default: "AtticPad Server" */
-    cfg.profiles      = (file_count > 0) ? sources : NULL;
-    cfg.profile_count = file_count;
+    cfg.profiles      = (source_count > 0) ? sources : NULL;
+    cfg.profile_count = source_count;
     /* §7 tier 2 subnet-broadcast filtering (apadserver.h cfg.broadcast_addrs,
      * server/src/server.c is_bad_reply_target()). Left at the memset above's
      * NULL/0 -- GetAdaptersAddresses does not hand back a broadcast address

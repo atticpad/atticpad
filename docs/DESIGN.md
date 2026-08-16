@@ -328,7 +328,7 @@ Three reasons it is more than convenience:
 
 - **It rescues exactly the case tier 3 exists for.** On the development LAN,
   AP client isolation kills tier-2 broadcast entirely, so manual IP is the only
-  path that works. Typing `192.168.0.118` on a DS numpad is the worst UX in the
+  path that works. Typing `192.168.1.107` on a DS numpad is the worst UX in the
   project; pointing a camera at a screen is the best.
 - **It removes the PIN's worst property.** A 6-digit PIN is weak
   ([§5.10](#510-security) is explicit that it stops a housemate, not an
@@ -514,7 +514,7 @@ Because of [§2.4](#24-nintendo-ds-wep-or-open-networks-only), the link layer pr
 - Both sides derive a session key with **PBKDF2-HMAC-SHA256, 10,000 iterations**, salted with a 16-byte server nonce.
 - Every packet after `WELCOME` carries a truncated HMAC-SHA256 tag.
 - Sequence numbers plus a replay window prevent packet replay.
-- Paired devices are remembered by a persistent client ID, so the PIN is a one-time step. **Not implemented as of 0.4.0:** the server authenticates only while a pairing window is open and keeps no trusted-device list between sessions, so today the PIN protects the moment of connection rather than the server. Until this lands, an unpaired client on the LAN can connect.
+- Paired devices are remembered by a persistent client ID, so the PIN is a one-time step. **Not implemented as of 0.5.0:** the server authenticates only while a pairing window is open and keeps no trusted-device list between sessions, so today the PIN protects the moment of connection rather than the server. Until this lands, an unpaired client on the LAN can connect.
 
 **Why 10,000 and not 600,000.** The iteration count is bounded by the DS: at roughly 8,000–10,000 PBKDF2 iterations per second on a 67 MHz ARM9, 10,000 iterations costs about one second of pairing time, which is the most a user will tolerate on a handheld with no progress feedback.
 

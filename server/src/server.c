@@ -76,6 +76,12 @@ typedef struct {
      * is not here: apad_session_set_key() puts it in core.key, where
      * apad_session_next_header() and apad_packet_verify() can reach it and
      * apad_session_close() wipes it. */
+    uint8_t       touchmap_dirty;   /* v2: profile changed, layout needs resend */
+    uint8_t       profile_pinned;   /* set by apad_server_set_profile(): a
+                                     * human chose this one, so a reload must
+                                     * not silently re-match over the top */
+    uint8_t       touchmap_repeats;  /* v2: unreliable, so send it more than once */
+    uint32_t      touchmap_next_ms;  /* v2: when the next repeat is due        */
     uint8_t       auth_required;    /* its WELCOME carried AUTH_REQUIRED    */
     uint8_t       auth_verified;    /* >=1 inbound tag has verified         */
     uint8_t       auth_charged;     /* already cost the window one attempt  */
@@ -242,6 +248,13 @@ static void free_session(apad_server *s, int slot)
     s->sessions[slot].in_use          = 0;
     s->sessions[slot].retx_len        = 0;
     s->sessions[slot].auth_required   = 0;
+    /* v2 EXPERIMENT: cleared with the rest of the session, so a device that
+     * reconnects into this slot is sent its layout again rather than
+     * inheriting "already delivered" from whoever held the slot before. */
+    s->sessions[slot].touchmap_dirty  = 0;
+    s->sessions[slot].profile_pinned  = 0;
+    s->sessions[slot].touchmap_repeats = 0;
+    s->sessions[slot].touchmap_next_ms = 0;
     s->sessions[slot].auth_verified   = 0;
     s->sessions[slot].auth_charged    = 0;
     s->sessions[slot].pair_generation = 0;
@@ -615,6 +628,10 @@ static void send_ack(apad_server *s, uint32_t now, server_session *ss,
     apad_session_on_sent(&ss->core, &hdr, now);   /* unconditional: see emit() */
 }
 
+/* v2 EXPERIMENT (experiment/touchmap-v2): defined below, called from the
+ * HELLO handler above it. */
+static void send_touchmap(apad_server *s, server_session *ss, uint32_t now);
+
 /* Send one payload through a session's tx sequence/flags, cache it for
  * retransmit if the session FSM armed it (§9). */
 static int send_via_session(apad_server *s, server_session *ss, uint8_t type,
@@ -974,9 +991,68 @@ static void handle_hello(apad_server *s, const apad_addr *from,
         (void)send_via_session(s, ss, (uint8_t)APAD_MSG_WELCOME, payload,
                                (uint16_t)wn, now);
 
+        /* Name the matched profile here. "My edit does not apply" is
+         * otherwise indistinguishable from "my edit applied but does not do
+         * what I expected", and the difference is one substring match nobody
+         * can see. */
         apad_logf(&s->log, APAD_LOG_INFO,
-                  "device \"%s\" connected (slot %d)", ss->device_name, slot);
+                  "device \"%s\" connected (slot %d), profile \"%s\"",
+                  ss->device_name, slot,
+                  (ss->profile != NULL) ? ss->profile->name : "none");
     }
+}
+
+/* v2 EXPERIMENT (branch experiment/touchmap-v2): tell the client what its
+ * touchscreen currently maps to, so it can draw the real layout.
+ *
+ * Sent once, right after WELCOME, because that is the moment the session's
+ * profile is decided and the client is about to render its first frame. A
+ * profile can be hot-reloaded later (apad_profiles_load), which this does NOT
+ * yet chase -- see the branch's open questions.
+ *
+ * Silent when the profile has no touch mapping: a client that hears nothing
+ * keeps whatever it drew before, and "no message" is the honest encoding of
+ * "this profile does not use the touchscreen".
+ */
+static void send_touchmap(apad_server *s, server_session *ss, uint32_t now)
+{
+    const apad_profile *p = ss->profile;
+    apad_touchmap tm;
+    uint8_t payload[APAD_LEN_TOUCHMAP];
+    int n, i;
+
+    if (p == NULL || p->touch.mode == APAD_TOUCH_MODE_NONE) {
+        return;
+    }
+
+    memset(&tm, 0, sizeof tm);
+    tm.mode = (uint8_t)p->touch.mode;
+    tm.region_count = (uint8_t)((p->touch.region_count < 0) ? 0
+                        : (p->touch.region_count > (int)APAD_TOUCHMAP_MAX_REGIONS
+                           ? (int)APAD_TOUCHMAP_MAX_REGIONS
+                           : p->touch.region_count));
+    for (i = 0; i < (int)tm.region_count; i++) {
+        const apad_touch_region *r = &p->touch.regions[i];
+        /* 0..1 -> 0..255. The profile's rect is already normalised and +Y
+         * down (profiles.h), which is the wire convention too, so this is a
+         * scale and nothing else -- no axis flip to get wrong. */
+        tm.regions[i].x0 = (uint8_t)(r->rect[0] * 255.0 + 0.5);
+        tm.regions[i].y0 = (uint8_t)(r->rect[1] * 255.0 + 0.5);
+        tm.regions[i].x1 = (uint8_t)(r->rect[2] * 255.0 + 0.5);
+        tm.regions[i].y1 = (uint8_t)(r->rect[3] * 255.0 + 0.5);
+        tm.regions[i].target  = (uint8_t)r->target;
+        tm.regions[i].analog  = (uint8_t)(r->analog ? 1 : 0);
+        tm.regions[i].pad_bit = r->pad_bit;
+    }
+    n = apad_encode_touchmap(payload, sizeof payload, &tm);
+    if (n < 0) {
+        return;
+    }
+    (void)send_via_session(s, ss, (uint8_t)APAD_MSG_TOUCHMAP, payload,
+                           (uint16_t)n, now);
+    apad_logf(&s->log, APAD_LOG_INFO,
+              "sent touch layout to \"%s\": %u region(s), profile \"%s\"",
+              ss->device_name, (unsigned)tm.region_count, p->name);
 }
 
 static void handle_input_state(apad_server *s, const apad_addr *from,
@@ -1196,6 +1272,16 @@ static void handle_ack(apad_server *s, const apad_addr *from,
         return;
     }
     (void)apad_session_on_recv(&ss->core, pkt, now);   /* clears retx_armed */
+
+    /* v2 EXPERIMENT: the layout goes out HERE, not straight after WELCOME.
+     * §9 allows one reliable message in flight and a second arm REPLACES the
+     * first, so arming a reliable TOUCHMAP a line after WELCOME would cancel
+     * WELCOME's own retransmit -- trading a reliably-delivered layout for an
+     * unreliable handshake. Once this ACK has discharged the WELCOME the slot
+     * is free, and the client has demonstrably received it. */
+    /* Mark, do not send: apad_server_tick() owns delivery and repetition,
+     * so connect and profile-edit take the identical path. */
+    ss->touchmap_dirty = 1u;
 }
 
 /* Tear down every session that was issued an AUTH_REQUIRED WELCOME and has
@@ -1468,6 +1554,36 @@ int apad_server_tick(apad_server *s, uint32_t now_ms)
 
     if (s == NULL) {
         return APAD_ERR_ARG;
+    }
+
+    /* v2 EXPERIMENT: deliver the touch layout.
+     *
+     * TOUCHMAP is deliberately UNRELIABLE -- §9 delivery would let a client
+     * that does not ACK it be torn down, which is exactly what happened to a
+     * test client that claimed support and stayed silent. An unreliable
+     * message costs a lost layout at worst, never a lost session.
+     *
+     * Robustness comes from repetition instead: three copies about 250 ms
+     * apart. 68 bytes each, on a LAN where the loss that would drop all
+     * three is the kind that breaks the session anyway. A profile edit
+     * re-arms the same three. */
+    for (i = 0; i < (int)APAD_MAX_SESSIONS; i++) {
+        server_session *ss = &s->sessions[i];
+
+        if (!ss->in_use) {
+            continue;
+        }
+        if (ss->touchmap_dirty) {
+            ss->touchmap_dirty   = 0;
+            ss->touchmap_repeats = 3u;
+            ss->touchmap_next_ms = now_ms;
+        }
+        if (ss->touchmap_repeats > 0u &&
+            apad_time_after(now_ms, ss->touchmap_next_ms)) {
+            ss->touchmap_repeats--;
+            ss->touchmap_next_ms = now_ms + 250u;
+            send_touchmap(s, ss, now_ms);
+        }
     }
 
     /* §11's 120 s window. Reaped here rather than in the datagram path
@@ -1761,6 +1877,12 @@ int apad_server_set_profile(apad_server *s, uint8_t slot,
         return APAD_ERR_ARG;
     }
     s->sessions[slot].profile = p;
+    s->sessions[slot].profile_pinned = 1u;
+    /* v2 EXPERIMENT: switching profiles changes the touch layout just as much
+     * as editing one does, so the client has to be told. Missing this was the
+     * third of three ways to change a mapping -- connect and save both
+     * resent, and only picking an existing profile silently did not. */
+    s->sessions[slot].touchmap_dirty = 1u;
     apad_logf(&s->log, APAD_LOG_INFO,
               "device (slot %u): profile switched to \"%s\"",
               (unsigned)slot, p->name);
@@ -1841,8 +1963,23 @@ int apad_server_reload_profiles(apad_server *s, const apad_profile_source *sourc
          * otherwise -- the file was renamed or deleted, so this lands the
          * session exactly where a brand-new HELLO from the same device
          * would land today (apad_profiles_match() never returns NULL). */
-        newp = had_profile[i] ? apad_profiles_find(old_names[i]) : NULL;
-        if (newp == NULL) {
+        /* Land this session where a brand-new HELLO from the same device
+         * would land NOW. Keeping the old name instead -- which is what this
+         * did until 0.4.0 -- meant a profile the user had just created or
+         * edited could never take over a live session: the old name still
+         * resolved, so the session stayed on it and the edit appeared to do
+         * nothing until a reconnect. That is the single most confusing thing
+         * the editor can do, because the file on disk plainly says otherwise.
+         *
+         * A profile a HUMAN picked in the UI is the exception and stays put:
+         * re-matching over a deliberate choice would be the same bug with
+         * the roles reversed. */
+        if (ss->profile_pinned && had_profile[i]) {
+            newp = apad_profiles_find(old_names[i]);
+            if (newp == NULL) {
+                newp = apad_profiles_match(ss->device_name);
+            }
+        } else {
             newp = apad_profiles_match(ss->device_name);
         }
         if (strcmp(old_names[i], newp->name) != 0) {
@@ -1851,6 +1988,12 @@ int apad_server_reload_profiles(apad_server *s, const apad_profile_source *sourc
                       i, had_profile[i] ? old_names[i] : "(none)", newp->name);
         }
         ss->profile = newp;
+        /* v2 EXPERIMENT: the layout this client is drawing is now stale --
+         * a region moved, a profile was edited, or it matched a different
+         * file entirely. Marked rather than sent, because this function has
+         * no clock: apadserver.h is explicit that the host supplies now_ms,
+         * and send_via_session() needs one. apad_server_tick() flushes it. */
+        ss->touchmap_dirty = 1;
     }
     return APAD_OK;
 }

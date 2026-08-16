@@ -93,6 +93,7 @@
 #include "strbuf.h"      /* ui_strbuf + sb_* -- factored out so
                           * profile_json.h can build JSON without depending
                           * on this file (see strbuf.h's own top comment) */
+#include "profile_sources.h" /* disk + built-in assembly, shared with the hosts */
 #include "profile_store.h"  /* directory scan, atomic save/delete, the
                           * shipped-profile check -- the filesystem half of
                           * the remapping editor's profile routes below */
@@ -689,17 +690,15 @@ static int ui_reload_profiles(apad_server *server, const char *profiles_dir)
 {
     profile_store_file  files[PROFILE_STORE_MAX_FILES];
     apad_profile_source sources[PROFILE_STORE_MAX_FILES];
-    size_t count, i;
+    size_t count, file_count;
     int rc;
 
-    count = profile_store_scan(profiles_dir, files, PROFILE_STORE_MAX_FILES);
-    for (i = 0; i < count; i++) {
-        sources[i].label = files[i].label;
-        sources[i].name  = files[i].name;
-        sources[i].text  = files[i].text;
-    }
+    /* Same assembly as host startup, via the same function -- see
+     * profile_sources.h for why this must not be reimplemented here. */
+    count = profile_sources_build(profiles_dir, files, sources,
+                                  PROFILE_STORE_MAX_FILES, &file_count);
     rc = apad_server_reload_profiles(server, (count > 0) ? sources : NULL, count);
-    profile_store_free_files(files, count);
+    profile_store_free_files(files, file_count);   /* NOT count: see header */
     return rc == APAD_OK;
 }
 

@@ -200,6 +200,37 @@ typedef struct {                       /* §6.7 RUMBLE, 8 bytes */
     uint16_t duration_ms;              /* 0 = until superseded */
 } apad_rumble;
 
+/* v2 EXPERIMENT (branch experiment/touchmap-v2) -- TOUCHMAP 0x43.
+ *
+ * Lets the server tell a client what its touchscreen currently maps to, so a
+ * client can DRAW the real layout instead of a hardcoded guess. The 3DS
+ * bottom screen presently draws "3ds-default" and an LT/RT split from
+ * constants in screen_session.c, and has to disclaim that the server may
+ * disagree -- because it genuinely cannot know.
+ *
+ * Deliberately carries no text. `pad_bit` is the canonical §5.7 button
+ * bitmask and the client already owns button labels (3DS ui_widgets.c has
+ * the table it draws A/B/X/Y/L/R/ZL/ZR from), so a Vita can render "L1"
+ * where a 3DS renders "L" from the identical packet -- and no encoding,
+ * truncation or localisation question ever reaches the wire.
+ *
+ * Rect is normalised 0..1 in eighths-of-a-percent (uint8/255), +Y down to
+ * match §5.3's touch convention. On a 320x240 screen one step is 1.25 px
+ * horizontally and 0.94 px vertically -- far finer than a fingertip.
+ */
+typedef struct {
+    uint8_t  x0, y0, x1, y1;           /* normalised 0..255, +Y down     */
+    uint8_t  target;                   /* 0 button, 1 LT, 2 RT           */
+    uint8_t  analog;                   /* 1 = depth-into-region is analog */
+    uint16_t pad_bit;                  /* §5.7 mask, when target == 0    */
+} apad_touch_region_wire;
+
+typedef struct {                       /* v2 TOUCHMAP, 68 bytes */
+    uint8_t                mode;       /* 0 none, 1 regions, 2 delta, 3 absolute */
+    uint8_t                region_count;
+    apad_touch_region_wire regions[APAD_TOUCHMAP_MAX_REGIONS];
+} apad_touchmap;
+
 typedef struct {                       /* §6.8 LED, 4 bytes */
     uint8_t player_index;              /* 1..4, 0 = off */
     uint8_t r, g, b;
@@ -255,6 +286,10 @@ int apad_encode_bye        (uint8_t *b, size_t cap, const apad_bye        *in);
 int apad_decode_bye        (const uint8_t *b, size_t len, apad_bye        *out);
 int apad_encode_ping       (uint8_t *b, size_t cap, const apad_ping       *in);
 int apad_decode_ping       (const uint8_t *b, size_t len, apad_ping       *out);
+/* v2 EXPERIMENT (experiment/touchmap-v2) */
+int apad_encode_touchmap   (uint8_t *b, size_t cap, const apad_touchmap   *in);
+int apad_decode_touchmap   (const uint8_t *b, size_t len, apad_touchmap   *out);
+
 int apad_encode_rumble     (uint8_t *b, size_t cap, const apad_rumble     *in);
 int apad_decode_rumble     (const uint8_t *b, size_t len, apad_rumble     *out);
 int apad_encode_led        (uint8_t *b, size_t cap, const apad_led        *in);

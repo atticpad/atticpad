@@ -48,20 +48,11 @@ typedef struct {
     uint8_t  hat;        /* HID hat value, apad_hat_lut: 0=N..7=NW, 8=null  */
 } apad_pad_state;
 
-/* Xbox-convention buttons the virtual pad exposes. Distinct from the wire's
- * Nintendo-convention APAD_BTN_* bits in core/include/atticpad/protocol.h —
- * translating between the two is mapping.c's job, never the backend's. */
-#define APAD_PADBTN_A       (1u << 0)
-#define APAD_PADBTN_B       (1u << 1)
-#define APAD_PADBTN_X       (1u << 2)
-#define APAD_PADBTN_Y       (1u << 3)
-#define APAD_PADBTN_LB      (1u << 4)
-#define APAD_PADBTN_RB      (1u << 5)
-#define APAD_PADBTN_BACK    (1u << 6)   /* SELECT */
-#define APAD_PADBTN_START   (1u << 7)
-#define APAD_PADBTN_GUIDE   (1u << 8)   /* HOME / Xbox button */
-#define APAD_PADBTN_LTHUMB  (1u << 9)   /* L3 */
-#define APAD_PADBTN_RTHUMB  (1u << 10)  /* R3 */
+/* Xbox-convention buttons the virtual pad exposes: APAD_PADBTN_* now live
+ * in core/include/atticpad/protocol.h, because TOUCHMAP puts one of them on
+ * the wire and a client has to be able to name it. Still distinct from the
+ * wire's Nintendo-convention APAD_BTN_* -- translating between the two is
+ * mapping.c's job, never the backend's. */
 
 /* Feedback flowing server -> client (RUMBLE/LED payloads, PROTOCOL.md
  * §6.7/§6.8). Not exercised by this task — no client here advertises

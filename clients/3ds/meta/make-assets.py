@@ -4,6 +4,8 @@
     python3 clients/3ds/meta/make-assets.py [--transparent]   # 3DS only
     python3 clients/3ds/meta/make-assets.py --android          # Android only
     python3 clients/3ds/meta/make-assets.py --windows          # Windows .ico
+    python3 clients/3ds/meta/make-assets.py --brand            # README logo +
+                                                               # org avatar
     python3 clients/3ds/meta/make-assets.py --banner3d-mark    # 3D banner tex
     python3 clients/3ds/meta/make-assets.py --banner3d-glyph   # 3D banner
                                                                # particle outline
@@ -53,6 +55,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
 TRANSPARENT = "--transparent" in sys.argv
 ANDROID     = "--android" in sys.argv
 WINDOWS     = "--windows" in sys.argv
+BRAND       = "--brand" in sys.argv
 BANNER3D    = "--banner3d-mark" in sys.argv
 GLYPH       = "--banner3d-glyph" in sys.argv
 
@@ -655,6 +658,94 @@ if BANNER3D:
                 S/2, S*0.225, S*0.29, S*0.130, S*0.055)
     im.resize((128, 128), Image.LANCZOS).save("clients/3ds/meta/banner3d/mark.png")
     print("  wrote banner3d/mark.png (128x128)")
+    sys.exit(0)
+
+# ---- brand lockup + org avatar -----------------------------------------
+#
+# GitHub artwork: the README header logo and the organisation avatar. Same
+# render_mark() as everything else (see the header) -- a README logo drawn
+# by hand would be the second copy this file exists to prevent.
+#
+# Two things here are measured rather than assumed, both for the same
+# reason as the Android foreground fit above: render_mark()'s shadow and
+# sheen blur radii are fractions of the CANVAS, not of the mark, so the
+# ink's extent is not linear in the requested scale and closed form drifts.
+#
+#   fit_mark()  scales until the INK spans a target fraction of the box,
+#               then re-centres on that ink. The avatar needs this because
+#               GitHub crops an org avatar to a circle in some views and a
+#               rounded square in others: rendered at 68% the mark clears
+#               BOTH masks, and at 74% the chevron tips clip the circle.
+#
+#   pad_cy      is where the gamepad BODY sits, handed back from the same
+#               render so the wordmark can sit on the controller's axis.
+#               Centring the word on the mark as a whole reads high: the
+#               chevron floats above the body and drags the midpoint up
+#               with it, so the word appears to align with empty space.
+BRAND_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+BRAND_WORD = "atticpad"          # the org/repo name, lowercase, as it is typed
+
+def _brand_mark(S, scale):
+    """Bare mark centred in an SxS box; also returns the pad body's centre y."""
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    s = S * scale
+    render_mark(im, S/2, S/2 + 0.10*s, 0.60*s, 0.29*s, True,
+                S/2, S/2 - 0.275*s, 0.29*s, 0.130*s, 0.055*s, depth_scale=0.45)
+    return im, S/2 + 0.10*s
+
+def _brand_ink_bbox(im):
+    # >16 ignores the blurred shadow's faint tail, exactly as the Android
+    # foreground fit does, so the shadow does not dominate the measurement.
+    return im.split()[3].point(lambda a: 255 if a > 16 else 0).getbbox()
+
+def fit_mark(S, frac, iters=6):
+    """Mark scaled so its ink spans `frac` of S, re-centred on that ink.
+    Returns (image, pad_body_cy_in_that_image)."""
+    scale = frac
+    for _ in range(iters):
+        im, _ = _brand_mark(S, scale)
+        bb = _brand_ink_bbox(im)
+        scale *= (frac * S) / max(bb[2]-bb[0], bb[3]-bb[1])
+    im, pad_cy = _brand_mark(S, scale)
+    bb = _brand_ink_bbox(im)
+    ox, oy = int(S/2 - (bb[2]-bb[0])/2), int(S/2 - (bb[3]-bb[1])/2)
+    out = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    out.alpha_composite(im.crop(bb), (ox, oy))
+    return out, (pad_cy - bb[1]) + oy
+
+def make_brand_assets():
+    SSB = 4                                    # 4x is plenty at these sizes
+    # ---------------------------------------------------------- README logo
+    H  = 360
+    Hs = H * SSB
+    f  = ImageFont.truetype(BRAND_FONT, int(Hs*0.34))
+    tw = int(ImageDraw.Draw(Image.new("RGBA", (8, 8))).textlength(BRAND_WORD, font=f))
+    pad, m, gap = int(Hs*0.13), int(Hs*0.76), int(Hs*0.10)
+    Ws = pad + m + gap + tw + pad              # width follows the word, so the
+    im = Image.new("RGBA", (Ws, Hs), (0, 0, 0, 0))   # card keeps even padding
+    d  = ImageDraw.Draw(im)
+    d.rounded_rectangle([0, 0, Ws-1, Hs-1], radius=Hs*0.15, fill=SLATE + (255,))
+    tile, pad_cy = fit_mark(m, 0.92)
+    my = int(Hs/2 - m/2)
+    im.alpha_composite(tile, (pad, my))
+    d.text((pad + m + gap, my + pad_cy), BRAND_WORD, font=f,
+           fill=CREAM + (255,), anchor="lm")
+    im.resize((Ws//SSB, H), Image.LANCZOS).save("docs/img/logo.png")
+
+    # ---------------------------------------------------------- org avatar
+    A = 1024
+    S = A * SSB
+    av = Image.new("RGBA", (S, S), SLATE + (255,))   # full bleed: GitHub applies
+    mark, _ = fit_mark(S, 0.68)                      # its own corner rounding
+    av.alpha_composite(mark)
+    av.resize((A, A), Image.LANCZOS).save("docs/img/avatar.png")
+    print(f"  wrote docs/img/logo.png ({Ws//SSB}x{H}) and docs/img/avatar.png ({A}x{A})")
+
+if BRAND:
+    # Mutually exclusive with the other modes, same as --windows: writes only
+    # docs/img/, nothing under clients/.
+    print("AtticPad: README logo + org avatar")
+    make_brand_assets()
     sys.exit(0)
 
 if WINDOWS:

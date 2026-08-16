@@ -1,4 +1,12 @@
-# AtticPad
+<p align="center">
+  <img src="docs/img/logo.png" alt="AtticPad" width="360">
+</p>
+
+<p align="center">
+  <a href="https://github.com/atticpad/atticpad/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/atticpad/atticpad/ci.yml?branch=main&amp;label=CI"></a>
+  <a href="https://github.com/atticpad/atticpad/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/atticpad/atticpad?include_prereleases&amp;label=release"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-informational"></a>
+</p>
 
 **Bring the hardware down from the attic and use it as a game controller.**
 
@@ -31,7 +39,21 @@ The 3DS client mid-session, both screens, captured on the console itself:
 The round-trip figure is live, and the panel beneath it mirrors exactly what the
 server is being told — usually enough to tell "the console isn't sending" apart
 from "the game isn't listening" without any other tooling. The touchscreen
-becomes the analog triggers the 3DS hardware doesn't have.
+becomes the analog triggers the 3DS hardware doesn't have — and since 0.5.0 the
+regions it draws are the ones in the server's profile, so editing the profile
+in the web UI redraws the console's bottom screen.
+
+And the server's own page, served on `127.0.0.1` only — backend health, the
+address to type into a client, pairing, connected clients with live round-trip
+times, a profile editor, and the log:
+
+![The AtticPad server's local web page. A header reads 192.168.1.42 (wlan0), UDP :21100. Cards below show the uinput backend healthy, discovery and pairing controls, one connected client with its profile and round-trip time, a drawing of an Xbox 360 controller with the B button and the D-pad's right arm lit up, and a log ending in three "sent touch layout" lines.](docs/img/webui.png)
+
+The controller drawing is deliberately *not* AtticPad's view of itself: it is
+the browser's Gamepad API, reading the same virtual pad a game would read. If a
+control lights up there, the pad your game sees is moving — which is the
+fastest way to tell "the console isn't sending" apart from "the game isn't
+listening".
 
 ## Install
 

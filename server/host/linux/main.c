@@ -60,7 +60,7 @@
                       * same build-script reason as webui.h; owns its own 5353
                       * socket because mDNS is not AtticPad protocol traffic and
                       * shim/ exposes no multicast API (see that file's top). */
-#include "../common/profiles_builtin.h"   /* profiles compiled into the binary */
+#include "../common/profile_sources.h"    /* disk + built-in profile assembly */
 #include "../common/webui.h"   /* server/host/common/webui.h -- the HTTP UI, header-only */
 
 /* Bounds how late apad_session_tick() can discover a due retransmit.
@@ -337,7 +337,11 @@ int main(int argc, char **argv)
     apad_server *server;
     profile_store_file files[PROFILE_STORE_MAX_FILES];
     apad_profile_source sources[PROFILE_STORE_MAX_FILES];
-    size_t file_count, i;
+    /* file_count counts entries in files[] that OWN heap memory and must be
+     * freed. source_count counts what is handed to the library, which may
+     * instead be the compiled-in profiles -- static storage that must NEVER
+     * be freed. Conflating the two frees uninitialised stack pointers. */
+    size_t file_count, source_count, i;
     apad_addr bcast_addrs[HOST_MAX_OWN_ADDRS];   /* §7 tier 2, see below */
     size_t bcast_count = 0;
     /* ATTICPAD_PROFILES_DIR-or-default, resolved once below and kept alive
@@ -435,35 +439,17 @@ int main(int argc, char **argv)
             profiles_dir = "profiles";
         }
     }
-    file_count = profile_store_scan(profiles_dir, files,
-                                    (size_t)PROFILE_STORE_MAX_FILES);
+    /* Disk first, then any built-in the directory does not override.
+     * profile_sources.h owns this so startup and the web UI reload can
+     * never disagree about what the profile set is. */
+    source_count = profile_sources_build(profiles_dir, files, sources,
+                                         (size_t)PROFILE_STORE_MAX_FILES,
+                                         &file_count);
     if (file_count == 0u) {
-        /* Missing directory, empty directory, or nothing with a .jsonc
-         * suffix -- profile_store_scan() does not distinguish these (never
-         * fatal either way, see profile_store.h), so neither does this
-         * message.
-         *
-         * Fall back to the profiles compiled into this binary rather than to
-         * the library's single built-in default. That difference is the
-         * whole point: the built-in default has no touch regions and no gyro
-         * aim, so a downloaded server would hand a 3DS a pad with dead
-         * triggers while the client kept drawing them. */
-        for (i = 0; i < ATTICPAD_BUILTIN_PROFILE_COUNT; i++) {
-            sources[i].label = ATTICPAD_BUILTIN_PROFILES[i].label;
-            sources[i].name  = ATTICPAD_BUILTIN_PROFILES[i].name;
-            sources[i].text  = ATTICPAD_BUILTIN_PROFILES[i].text;
-        }
-        file_count = ATTICPAD_BUILTIN_PROFILE_COUNT;
         (void)fprintf(stderr,
                       "[atticpad] profiles: none on disk in \"%s\" -- using "
                       "the %u profiles built into this binary\n",
                       profiles_dir, (unsigned)ATTICPAD_BUILTIN_PROFILE_COUNT);
-    } else {
-        for (i = 0; i < file_count; i++) {
-            sources[i].label = files[i].label;
-            sources[i].name  = files[i].name;
-            sources[i].text  = files[i].text;
-        }
     }
 
     if (apad_net_init() != APAD_OK) {
@@ -515,8 +501,8 @@ int main(int argc, char **argv)
     cfg.user          = NULL;   /* g_sock is file-scope; nothing to carry */
     cfg.server_port   = port;
     cfg.server_name   = NULL;   /* library default: "AtticPad Server" */
-    cfg.profiles      = (file_count > 0) ? sources : NULL;
-    cfg.profile_count = file_count;
+    cfg.profiles      = (source_count > 0) ? sources : NULL;
+    cfg.profile_count = source_count;
     cfg.broadcast_addrs      = (bcast_count > 0) ? bcast_addrs : NULL;
     cfg.broadcast_addr_count = bcast_count;
 
