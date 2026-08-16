@@ -489,9 +489,9 @@ static int mdns_put_record(const mdns_responder *m, uint8_t *b, size_t cap,
          * phone connecting and not. This machine has six non-loopback IPv4
          * addresses (two NICs, three docker bridges, a tailscale link). A
          * single host name carrying all six lets the resolver pick any of
-         * them, and the first live run of this file handed avahi-browse
-         * 100.66.55.59, the tailscale address, which no client on the LAN
-         * can reach. Every real responder publishes the address OF THE
+         * them, and the first live run of this file handed avahi-browse the
+         * tailscale address -- a CGNAT address no client on the LAN can
+         * reach. Every real responder publishes the address OF THE
          * INTERFACE the answer goes out on; so does this one now, and
          * mdns_emit_multicast() builds a separate packet per interface for
          * exactly that reason. addr_index < 0 means "every address", used

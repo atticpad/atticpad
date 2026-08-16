@@ -108,6 +108,13 @@ int apad_payload_size(uint8_t type)
     case APAD_MSG_RUMBLE:      return (int)APAD_LEN_RUMBLE;
     case APAD_MSG_LED:         return (int)APAD_LEN_LED;
     case APAD_MSG_STATUS:      return (int)APAD_LEN_STATUS;
+    /* v2 EXPERIMENT (experiment/touchmap-v2). Registering the length here
+     * is what makes the type RECEIVABLE at all: this table is the §4
+     * unknown-type gate, so a message absent from it is discarded during
+     * parse and never reaches any handler. The server could encode and
+     * send TOUCHMAP happily while every client silently dropped it --
+     * which is exactly what happened until this line existed. */
+    case APAD_MSG_TOUCHMAP:    return (int)APAD_LEN_TOUCHMAP;
     case APAD_MSG_ACK:         return (int)APAD_LEN_ACK;
     case APAD_MSG_ERROR:       return (int)APAD_LEN_ERROR;
     default:                   return APAD_ERR_TYPE;   /* §4: discard silently */
@@ -633,6 +640,81 @@ int apad_encode_rumble(uint8_t *b, size_t cap, const apad_rumble *in)
     wr_u16(b + 4, in->duration_ms);
     /* b[6..7] reserved0 already zero */
     return (int)APAD_LEN_RUMBLE;
+}
+
+/* ---- v2 EXPERIMENT: TOUCHMAP (0x43) -------------------------------------
+ *
+ * Branch experiment/touchmap-v2. Not v1, not in docs/PROTOCOL.md, and not to
+ * be merged without a v2 decision -- see the struct comment in atticpad.h.
+ *
+ * Layout, little-endian, assembled byte by byte like everything else here:
+ *
+ *   0   1  mode
+ *   1   1  region_count (0..8; anything higher is a decode failure)
+ *   2   2  reserved0
+ *   4  64  regions[8], 8 bytes each:
+ *            +0 x0  +1 y0  +2 x1  +3 y1
+ *            +4 target (0 button, 1 LT, 2 RT)
+ *            +5 analog (0/1)
+ *            +6 pad_bit u16
+ *
+ * Unused region slots are transmitted zeroed rather than omitted: a fixed
+ * 68 bytes means the decoder has no length arithmetic to get wrong, and 68
+ * of 236 authenticated payload bytes is cheap enough that saving 8 of them
+ * would be a poor trade for a variable-length parse.
+ */
+int apad_encode_touchmap(uint8_t *b, size_t cap, const apad_touchmap *in)
+{
+    size_t i;
+
+    ENC_GUARD(APAD_LEN_TOUCHMAP);
+    if (in->region_count > APAD_TOUCHMAP_MAX_REGIONS) {
+        return APAD_ERR_ARG;
+    }
+    b[0] = in->mode;
+    b[1] = in->region_count;
+    /* b[2..3] reserved0 already zero */
+    for (i = 0; i < APAD_TOUCHMAP_MAX_REGIONS; i++) {
+        uint8_t *r = b + 4u + (i * 8u);
+        if (i < in->region_count) {
+            r[0] = in->regions[i].x0;
+            r[1] = in->regions[i].y0;
+            r[2] = in->regions[i].x1;
+            r[3] = in->regions[i].y1;
+            r[4] = in->regions[i].target;
+            r[5] = (uint8_t)(in->regions[i].analog ? 1u : 0u);
+            wr_u16(r + 6, in->regions[i].pad_bit);
+        }
+        /* else: left zeroed by ENC_GUARD's caller-provided buffer contract */
+    }
+    return (int)APAD_LEN_TOUCHMAP;
+}
+
+int apad_decode_touchmap(const uint8_t *b, size_t len, apad_touchmap *out)
+{
+    size_t i;
+
+    DEC_GUARD(APAD_LEN_TOUCHMAP);
+    out->mode         = b[0];
+    out->region_count = b[1];
+    /* A count past the array would let a peer walk this struct off its end
+     * in every client that trusts it. Reject the packet instead of clamping:
+     * a truncated layout drawn as if complete is a worse outcome than no
+     * layout at all. */
+    if (out->region_count > APAD_TOUCHMAP_MAX_REGIONS) {
+        return APAD_ERR_ARG;
+    }
+    for (i = 0; i < APAD_TOUCHMAP_MAX_REGIONS; i++) {
+        const uint8_t *r = b + 4u + (i * 8u);
+        out->regions[i].x0      = r[0];
+        out->regions[i].y0      = r[1];
+        out->regions[i].x1      = r[2];
+        out->regions[i].y1      = r[3];
+        out->regions[i].target  = r[4];
+        out->regions[i].analog  = r[5];
+        out->regions[i].pad_bit = rd_u16(r + 6);
+    }
+    return (int)APAD_LEN_TOUCHMAP;
 }
 
 int apad_decode_rumble(const uint8_t *b, size_t len, apad_rumble *out)

@@ -3,15 +3,18 @@
 **Status: FROZEN.** The v1 wire format was frozen on 2026-08-09 at the end of
 M1. Every constant, offset, bit position, payload size, normalisation rule and
 the reliability contract in §8/§9 are now fixed. **Any change to them is a v2
-change** — stop and report rather than making one.
+change** — stop and report rather than making one. Adding a NEW message type is
+the one additive exception, ruled and bounded in §6.14; §6.12 was added that way
+and the format is otherwise unchanged.
 
 Frozen against, **as of 2026-08-09**: 193 conformance vectors derived from this
 document by an author who never read the codec, 990 self-test cases, 675 + 46
 cross-validation checks with zero disagreements, a clean libFuzzer run, and two
 independent audits. Those are the figures the freeze was taken against and are
 left as the historical record; the suite has grown since (239 vectors, 1141
-self-test cases at 0.4.0) without any wire-visible change. §15 tracks what has
-been verified since.
+self-test cases at 0.5.0) without any wire-visible change. §15 tracks what has
+been verified since — including, at §15.9, the one message type that has no
+independently derived vectors.
 
 **Authority.** This document is the source of truth. `DESIGN.md` §5 is rationale
 and may lag; where they differ, this document is right. Implementations that
@@ -119,6 +122,7 @@ mitigations. Checks 4 and 6 are separate and both mandatory.
 | `0x40` | `RUMBLE` | server → client | yes | 8 bytes (§6.7) |
 | `0x41` | `LED` | server → client | yes | 4 bytes (§6.8) |
 | `0x42` | `STATUS` | server → client | yes | 64 bytes (§6.9) |
+| `0x43` | `TOUCHMAP` | server → client | no | 68 bytes (§6.12) |
 | `0x50` | `ACK` | either | no | 4 bytes (§6.10) |
 | `0x51` | `ERROR` | either | no | 64 bytes (§6.11) |
 
@@ -442,6 +446,97 @@ Values above 4 are reserved and MUST be treated as 0 (off) on receive.
 | 5 | too many pairing attempts |
 | 6 | malformed packet |
 | 7 | unknown session |
+
+
+### 6.12 `TOUCHMAP` (0x43) — 68 bytes
+
+**Added after the v1 freeze, additively.** See §6.14 for why that is permitted
+and what it does not permit.
+
+Tells a client what its touchscreen currently maps to, so it can DRAW the
+mapping instead of guessing. Optional in both directions: a server need never
+send one, and a client that does not understand it discards it under §4 like
+any unknown type.
+
+| Off | Size | Field |
+|---|---|---|
+| 0 | 1 | `mode` — 0 none, 1 regions, 2 delta-stick, 3 absolute-stick |
+| 1 | 1 | `region_count` — 0..8; **greater than 8 MUST be rejected** |
+| 2 | 2 | `reserved0` |
+| 4 | 64 | `regions[8]`, 8 bytes each, below |
+
+Each region:
+
+| Off | Size | Field |
+|---|---|---|
+| 0 | 1 | `x0` — normalised 0..255 across the touch surface |
+| 1 | 1 | `y0` — normalised 0..255, **+Y down** (§5) |
+| 2 | 1 | `x1` |
+| 3 | 1 | `y1` |
+| 4 | 1 | `target` — 0 button, 1 LT, 2 RT |
+| 5 | 1 | `analog` — 1 if depth-into-region drives an analogue value |
+| 6 | 2 | `pad_bit` — §6.13 pad-output button, when `target` is 0 |
+
+Unused region slots are transmitted zeroed. The payload is a fixed 68 bytes
+whatever `region_count` says, so a decoder has no length arithmetic to get
+wrong; 68 of the 236 authenticated payload bytes (§11) is cheap enough that
+saving eight would be a poor trade for a variable-length parse.
+
+A `region_count` above 8 MUST be rejected rather than clamped. Clamping draws a
+truncated layout as though it were complete, and a client that cannot show the
+real mapping is better off showing none.
+
+**No text crosses the wire.** `pad_bit` names a button and the client renders
+its own label, so a Vita may print "L1" where a 3DS prints "L" from the
+identical packet, and no encoding, truncation or localisation question ever
+reaches the protocol.
+
+**Unreliable, deliberately.** It carries no state the session depends on, and
+making it reliable would let a client that never ACKs it be torn down under §9
+for failing to answer a message it does not understand — trading a lost layout
+for a lost session. A sender wanting delivery confidence SHOULD repeat it (the
+reference server sends three copies about 250 ms apart, and repeats them
+whenever the mapping changes) rather than request acknowledgement.
+
+### 6.13 Pad-output buttons
+
+`TOUCHMAP.pad_bit` names a button on the VIRTUAL PAD the server creates, in
+Xbox convention. Deliberately not the Nintendo-convention §5.7 mask a client
+sends: one describes what the PC will see, the other what the device did.
+
+| Bit | Button | Bit | Button |
+|---|---|---|---|
+| 0 | A | 6 | BACK / SELECT |
+| 1 | B | 7 | START |
+| 2 | X | 8 | GUIDE / HOME |
+| 3 | Y | 9 | L3 |
+| 4 | LB | 10 | R3 |
+| 5 | RB | 11..15 | reserved, MUST be zero |
+
+### 6.14 Ruling — what "frozen" permits
+
+§6.12 was added on 2026-08-16, after the v1 freeze of 2026-08-09. That is
+permitted, and the boundary is worth stating precisely because it will be
+tested again.
+
+**Permitted:** allocating an unused `type` and specifying its payload. §4
+already requires a receiver to discard an unknown type silently, so a peer
+predating the addition behaves correctly by construction — verified, not
+assumed: a v1 client completed a full conformance run while a server sent it
+TOUCHMAP throughout.
+
+**Not permitted, still a v2 change:** altering any existing constant, offset,
+bit position, payload size or normalisation rule; changing the §8/§9
+reliability contract; and — the case that nearly slipped through — consuming a
+bit a v1 peer is required to mask off. Widening `caps` to admit a new
+capability bit is NOT additive: a v1 server does not ignore that bit, it erases
+it, so both ends must change together. An earlier draft of §6.12 did exactly
+that, and a conformance vector caught it.
+
+`docs/V2-NOTES.md` inventories what the remaining extension space can absorb
+under this ruling and what would genuinely require a v2. It is non-normative
+and may lag; this section is the ruling.
+
 
 ---
 
@@ -1018,3 +1113,11 @@ unsigned helper form, §11 payload caps, §13 coverage, and Appendix A.
 8. **PBKDF2 at 10,000 iterations has never been timed on a 67 MHz ARM9.**
    `DESIGN.md` D3's "about one second" is the entire justification for the
    iteration count and remains taken on faith until DS hardware runs it.
+9. **`TOUCHMAP` (§6.12) has no conformance vectors.** Every other message type
+   is pinned by vectors derived from this document by an author who never read
+   the codec; that independence is what makes the suite evidence rather than a
+   restatement of the implementation. `TOUCHMAP` was specified and implemented
+   by the same author, so writing its vectors now would produce agreement, not
+   verification. What it has instead: a live 3DS drawing the regions a real
+   server sent, and the §4 discard rule keeping an older client unaffected
+   either way. Deriving its vectors independently is the outstanding work.

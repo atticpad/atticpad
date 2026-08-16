@@ -72,6 +72,8 @@
 #else
 #include <dirent.h>
 #include <errno.h>
+#include <sys/stat.h>   /* mkdir: profile_store_save creates the directory */
+#include <sys/types.h>
 #endif
 
 /* Independent of server/src/profiles.h's own APAD_PROFILES_MAX (the size of
@@ -343,6 +345,17 @@ static int profile_store_save(const char *dir, const char *name,
     if (!profile_store_name_valid(name) || profile_store_is_shipped(name)) {
         return 0;
     }
+    /* Create the directory if it is not there yet. Since the shipped profiles
+     * became compiled-in, "no profiles directory" is the NORMAL state of a
+     * freshly downloaded server -- it serves the built-ins happily -- so the
+     * first edit a user makes is also the first time anything needs the
+     * directory to exist. Without this the editor could only ever save on a
+     * machine that already had one, which is the bug this comment replaces.
+     * ERROR_ALREADY_EXISTS is success for our purposes. */
+    if (!CreateDirectoryA(dir, NULL) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return 0;
+    }
     (void)snprintf(tmp_path, sizeof tmp_path, "%s\\.%s.jsonc.tmp", dir, name);
     (void)snprintf(final_path, sizeof final_path, "%s\\%s.jsonc", dir, name);
     tmp_path[sizeof tmp_path - 1]     = '\0';
@@ -452,6 +465,12 @@ static int profile_store_save(const char *dir, const char *name,
     size_t len, written;
 
     if (!profile_store_name_valid(name) || profile_store_is_shipped(name)) {
+        return 0;
+    }
+    /* See the Windows half: with the shipped profiles compiled in, a server
+     * that has never been edited has no profiles directory at all, so the
+     * first save has to create it. EEXIST is success. */
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
         return 0;
     }
     (void)snprintf(tmp_path, sizeof tmp_path, "%s/.%s.jsonc.tmp", dir, name);

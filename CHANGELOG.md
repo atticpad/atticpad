@@ -8,10 +8,47 @@ it and play a game, which is what 1.0 will mean.
 The **product version** and the **protocol version** move independently. The
 wire format is AtticPad protocol **v1, frozen** — see `docs/PROTOCOL.md`.
 
-## [0.4.0] — unreleased
+## [0.5.0] — unreleased
 
 First public release. Everything below was built before this release and is
 listed once here rather than backdated into releases that were never published.
+
+0.4.0 reached two release candidates and was never finalised; its work is part
+of this release. If you installed `v0.4.0-rc1` or `v0.4.0-rc2`, the section
+directly below is everything that changed since.
+
+### New since the 0.4.0 release candidates
+
+- **The server now tells the client where its touch controls are.** A new
+  message, `TOUCHMAP` (§6.12), carries the active profile's touch regions —
+  their rectangles and the button each one presses. The 3DS draws them on the
+  touchscreen, so the bottom screen finally shows the controls you actually
+  have instead of a fixed block of text. The server sends the layout when a
+  client connects, when the profile is edited and saved, and when a connected
+  pad is switched to a different profile.
+- **Protocol v1 is still frozen, and this did not unfreeze it.** §4 requires a
+  client to silently discard message types it does not know, which is exactly
+  what a 0.4.0 client does with `TOUCHMAP`. Nothing that existed before changed
+  size, position or meaning. `docs/PROTOCOL.md` §6.14 records what "frozen"
+  permits, so the next addition does not have to re-argue it.
+- **The web UI's test view draws a real Xbox 360 pad** instead of numbered
+  boxes: sticks, triggers, bumpers and d-pad light up in place, so it is
+  obvious at a glance which physical control a client is actually sending.
+
+### Fixed since the 0.4.0 release candidates
+
+- **The Windows server crashed on startup** when it had no profiles directory,
+  because it freed uninitialised stack pointers on the built-in-profile
+  fallback path. Linux had the same bug and survived it by luck.
+- **Duplicating a profile failed** with "could not write the profile file" on a
+  machine that had never saved one. The profiles directory is now created on
+  demand.
+- **A profile saved to disk hid the built-in profiles** instead of taking
+  precedence over them, so editing one profile made the others disappear.
+  Startup and hot reload now assemble the list the same way, from one place.
+- **Reloading profiles left already-connected pads on their old profile.** A
+  live session now moves to a newly matching profile, unless it was pinned to
+  one by hand in the web UI.
 
 ### Added
 
@@ -60,7 +97,10 @@ listed once here rather than backdated into releases that were never published.
   only on a network you trust. See `README.md`.
 - Pairing is toy-grade even when open: a 6-digit PIN cannot resist offline
   brute-force by an attacker already on your LAN.
+- The server-sent touch layout is drawn by the **3DS client only**. Android
+  receives it through the same shared engine and ignores it; its on-screen
+  controls are still laid out by the app.
 - PS Vita, PSP, DS/DSi, Switch and desktop clients are designed but not built.
   The Vita toolchain is additionally blocked upstream.
 
-[0.4.0]: https://github.com/atticpad/atticpad/releases/tag/v0.4.0
+[0.5.0]: https://github.com/atticpad/atticpad/releases/tag/v0.5.0

@@ -31,7 +31,9 @@ The 3DS client mid-session, both screens, captured on the console itself:
 The round-trip figure is live, and the panel beneath it mirrors exactly what the
 server is being told — usually enough to tell "the console isn't sending" apart
 from "the game isn't listening" without any other tooling. The touchscreen
-becomes the analog triggers the 3DS hardware doesn't have.
+becomes the analog triggers the 3DS hardware doesn't have — and since 0.5.0 the
+regions it draws are the ones in the server's profile, so editing the profile
+in the web UI redraws the console's bottom screen.
 
 ## Install
 

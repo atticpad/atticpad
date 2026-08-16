@@ -95,9 +95,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    c = apad_client_create("atticpad-engine-client",
+    c = apad_client_create("AtticPad 3DS engine-client",
                            APAD_CAP_DPAD | APAD_CAP_FACE4 | APAD_CAP_SHOULDER |
-                           APAD_CAP_STICK_L | APAD_CAP_STICK_R);
+                           APAD_CAP_STICK_L | APAD_CAP_STICK_R |
+                           APAD_CAP_TOUCH);
     if (c == NULL) {
         fprintf(stderr, "apad_client_create failed\n");
         return 1;

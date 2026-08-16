@@ -103,6 +103,16 @@ typedef struct {
     uint32_t status_serial;
     int32_t  status_code;
 
+    /* v2 EXPERIMENT (branch experiment/touchmap-v2) -- §6.12 TOUCHMAP 0x43.
+     * The layout the SERVER says this device's touchscreen maps to, so a
+     * client can draw the truth instead of a compiled-in guess. Follows the
+     * same serial convention as rumble/led/status: the serial changes when a
+     * new one arrives, and the UI redraws off that rather than polling. Zero
+     * serial means none has ever been received -- draw nothing, or whatever
+     * the client drew before. */
+    uint32_t      touchmap_serial;
+    apad_touchmap touchmap;
+
     /* §10 pairing, all four for the UI and none of them for the protocol. */
     int32_t  pairing_required; /* §6.2 ANNOUNCE; -1 until one is seen        */
     int32_t  auth_required;    /* §6.4 WELCOME flags bit 0                   */

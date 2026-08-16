@@ -293,12 +293,114 @@ static void session_draw_top(app_ctx *ctx)
  * for a UI pass and not obviously worth a wire change. So: shipped-default
  * only, said out loud.
  */
+/* v2 EXPERIMENT (branch experiment/touchmap-v2).
+ *
+ * Draw the layout the SERVER sent, rather than the compiled-in guess below.
+ * The old drawing hardcoded an LT/RT half-split and had to caption itself
+ * "shipped DEFAULT profile only -- the server may have an edited one",
+ * because the client genuinely could not know: an edited profile, or any
+ * profile matched by device name, produced a screen that was confidently
+ * wrong. With TOUCHMAP the caption is unnecessary -- the screen is the
+ * mapping.
+ *
+ * Region rects arrive normalised 0..255, +Y down, which is this screen's own
+ * coordinate convention, so this is a scale with no flip.
+ *
+ * Labels are resolved LOCALLY from the §5.7 pad_bit: the wire carries no
+ * text, so this console renders "L"/"ZL" from its own table while another
+ * platform can render its own names from the identical packet.
+ */
+static const char *touchmap_label(const apad_touch_region_wire *r)
+{
+    if (r->target == 1u) { return "LT"; }
+    if (r->target == 2u) { return "RT"; }
+    /* pad_bit is the OUTPUT pad's button (Xbox naming), not the Nintendo
+     * APAD_BTN_* this client sends -- a touch region says what the PC will
+     * see, which is the useful thing to show. The constants live in
+     * protocol.h precisely so a client can do this by name. */
+    switch (r->pad_bit) {
+    case APAD_PADBTN_A:      return "A";
+    case APAD_PADBTN_B:      return "B";
+    case APAD_PADBTN_X:      return "X";
+    case APAD_PADBTN_Y:      return "Y";
+    case APAD_PADBTN_LB:     return "LB";
+    case APAD_PADBTN_RB:     return "RB";
+    case APAD_PADBTN_BACK:   return "SELECT";
+    case APAD_PADBTN_START:  return "START";
+    case APAD_PADBTN_GUIDE:  return "HOME";
+    case APAD_PADBTN_LTHUMB: return "L3";
+    case APAD_PADBTN_RTHUMB: return "R3";
+    default:         return "?";
+    }
+}
+
+/* Returns 1 if it drew a server-supplied layout, 0 if there is none to draw
+ * and the caller should fall back. */
+static int session_draw_bottom_from_touchmap(app_ctx *ctx)
+{
+    const apad_touchmap *tm = &ctx->stats.touchmap;
+    const float top = 24.0f, bottom = 216.0f;
+    const float usable_h = bottom - top;
+    unsigned i;
+
+    if (ctx->stats.touchmap_serial == 0u || tm->region_count == 0u) {
+        return 0;
+    }
+
+    ui_header(UI_BOT_W, "touch mapping", "from server", ui_c_dim());
+
+    for (i = 0; i < tm->region_count; i++) {
+        const apad_touch_region_wire *r = &tm->regions[i];
+        float x0 = (float)r->x0 / 255.0f * UI_BOT_W;
+        float x1 = (float)r->x1 / 255.0f * UI_BOT_W;
+        float y0 = top + (float)r->y0 / 255.0f * usable_h;
+        float y1 = top + (float)r->y1 / 255.0f * usable_h;
+        float w  = x1 - x0, h = y1 - y0;
+        int   hit;
+
+        if (w <= 0.0f || h <= 0.0f) {
+            continue;   /* a degenerate rect is the server's bug, not a crash */
+        }
+        hit = (ctx->st.touch_count > 0)
+              && ((float)ctx->touch.px >= x0) && ((float)ctx->touch.px < x1)
+              && ((float)ctx->touch.py >= y0) && ((float)ctx->touch.py < y1);
+
+        ui_rect(x0, y0, w, h, hit ? ui_c_panel_hi() : ui_c_panel());
+        ui_outline(x0, y0, w, h, 1.0f, ui_c_border());
+        ui_textf(x0 + w * 0.5f, y0 + h * 0.5f - 12.0f, 1.30f,
+                 hit ? ui_c_accent() : ui_c_text(), UI_ALIGN_CENTER,
+                 "%s", touchmap_label(r));
+        if (r->analog) {
+            ui_textf_fit(x0 + w * 0.5f, y0 + h * 0.5f + 26.0f, UI_S_TINY,
+                         ui_c_dim(), UI_ALIGN_CENTER, w - 8.0f,
+                         "analog: slide to squeeze");
+        }
+    }
+
+    if (ctx->st.touch_count > 0) {
+        C2D_DrawCircleSolid((float)ctx->touch.px, (float)ctx->touch.py, 0.0f,
+                            6.0f, ui_c_good());
+    }
+    /* Deliberately does NOT draw the footer buttons or the confirm overlay:
+     * this function owns the region area only, and its caller owns everything
+     * below it. Drawing them here and returning early is what broke
+     * DISCONNECT and SELF-TEST -- the tap registered and set s_sub, but the
+     * confirmation panel lives past the early return, so nothing appeared and
+     * the YES/NO targets were invisible. The button was never unresponsive;
+     * it was answering a prompt nobody could see. */
+    return 1;
+}
+
 static void session_draw_bottom(app_ctx *ctx)
 {
     const float split = UI_BOT_W * 0.5f;
     const float top = 24.0f, bottom = 216.0f;
     int touch_left  = (ctx->st.touch_count > 0) && (ctx->touch.px < (u16)split);
     int touch_right = (ctx->st.touch_count > 0) && (ctx->touch.px >= (u16)split);
+
+    /* Server-supplied layout when there is one, the compiled-in guess when
+     * there is not. Either way the footer below runs. */
+    if (!session_draw_bottom_from_touchmap(ctx)) {
 
     ui_header(UI_BOT_W, "touch mapping", "3ds-default", ui_c_dim());
 
@@ -330,7 +432,11 @@ static void session_draw_bottom(app_ctx *ctx)
                  "shipped DEFAULT profile only -- the server may have an "
                  "edited one");
 
-    /* kButtonStrip: the reserved rectangle a touch inside never reaches the
+    }
+
+    /* Shared footer, reached by BOTH layouts.
+     *
+     * kButtonStrip: the reserved rectangle a touch inside never reaches the
      * wire (see session_update()'s exclusion check, which hit-tests the same
      * box). These two ui_button() calls are its only content, styled like
      * the connect screen's buttons (reuse, not a new look). */

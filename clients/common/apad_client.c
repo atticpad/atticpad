@@ -59,6 +59,9 @@ struct apad_client {
     uint32_t status_serial;
     int32_t  status_code;
     char     message[APAD_TEXT_LEN + 1];
+    /* v2 EXPERIMENT: last TOUCHMAP the server sent (experiment/touchmap-v2). */
+    uint32_t      touchmap_serial;
+    apad_touchmap touchmap;
 
     /* §10. `secret` is the only key material this struct holds that outlives
      * a session; it is wiped in destroy(). The derived key lives in
@@ -320,6 +323,18 @@ static void handle_packet(apad_client *c, const apad_packet *pkt)
             c->status_code = (int32_t)s.code;
             apad_text_get(c->message, sizeof c->message, s.text, APAD_TEXT_LEN);
             c->status_serial++;
+        }
+        break;
+    }
+    /* v2 EXPERIMENT: store the server's touch layout for the UI. Never
+     * affects input handling -- this is a drawing hint and nothing else, so a
+     * malformed one costs a redraw, not a session. */
+    case APAD_MSG_TOUCHMAP: {
+        apad_touchmap tm;
+        memset(&tm, 0, sizeof tm);
+        if (apad_decode_touchmap(pkt->payload, pkt->payload_len, &tm) >= 0) {
+            c->touchmap = tm;
+            c->touchmap_serial++;
         }
         break;
     }
@@ -878,6 +893,8 @@ void apad_client_get_stats(const apad_client *c, apad_client_stats *out)
     out->led_rgb            = c->led_rgb;
     out->status_serial      = c->status_serial;
     out->status_code        = c->status_code;
+    out->touchmap_serial    = c->touchmap_serial;
+    out->touchmap           = c->touchmap;
     out->pairing_required   = c->pairing_required;
     out->auth_required      = c->auth_required;
     out->auth_state         = c->auth_state;

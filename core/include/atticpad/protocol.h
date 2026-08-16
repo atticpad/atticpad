@@ -72,6 +72,10 @@ enum apad_msg_type {
     APAD_MSG_RUMBLE      = 0x40,
     APAD_MSG_LED         = 0x41,
     APAD_MSG_STATUS      = 0x42,
+    /* v2 EXPERIMENT (branch experiment/touchmap-v2): not in v1, not in
+     * docs/PROTOCOL.md, and NOT to be merged to master without a v2
+     * decision. 0x43 is the first free server->client type. */
+    APAD_MSG_TOUCHMAP    = 0x43,
     APAD_MSG_ACK         = 0x50,
     APAD_MSG_ERROR       = 0x51
 };
@@ -88,6 +92,10 @@ enum apad_msg_type {
 #define APAD_LEN_RUMBLE          8u
 #define APAD_LEN_LED             4u
 #define APAD_LEN_STATUS          64u
+/* v2 EXPERIMENT: 4-byte header + 8 regions x 8 bytes. 68 of the 236
+ * authenticated payload bytes (§11), so one datagram, never fragmented. */
+#define APAD_TOUCHMAP_MAX_REGIONS 8u
+#define APAD_LEN_TOUCHMAP        68u
 #define APAD_LEN_ACK             4u
 #define APAD_LEN_ERROR           64u
 
@@ -187,6 +195,33 @@ uint8_t apad_hat_from_buttons(uint32_t buttons);
 #define APAD_CAP_BATTERY         (1u << 13)
 /* bits 14..31 reserved, MUST be zero (§6.3) */
 #define APAD_CAP_VALID_MASK      0x00003FFFu
+
+/* ---- pad-output buttons ------------------------------------------------
+ *
+ * The buttons a VIRTUAL PAD exposes on the host, in Xbox convention --
+ * deliberately NOT the Nintendo-convention APAD_BTN_* above, which is what a
+ * client SENDS. Translating between the two is the server mapping engine's
+ * job.
+ *
+ * These live here rather than in server/backends/backend.h because
+ * TOUCHMAP's `pad_bit` carries one of them ACROSS THE WIRE, and a field whose
+ * constants are defined in a server-private header cannot be interpreted by
+ * the side receiving it: the 3DS client had to hardcode the bit positions
+ * numerically to draw a region's label. A wire field's vocabulary belongs to
+ * the protocol.
+ */
+#define APAD_PADBTN_A       (1u << 0)
+#define APAD_PADBTN_B       (1u << 1)
+#define APAD_PADBTN_X       (1u << 2)
+#define APAD_PADBTN_Y       (1u << 3)
+#define APAD_PADBTN_LB      (1u << 4)
+#define APAD_PADBTN_RB      (1u << 5)
+#define APAD_PADBTN_BACK    (1u << 6)   /* SELECT */
+#define APAD_PADBTN_START   (1u << 7)
+#define APAD_PADBTN_GUIDE   (1u << 8)   /* HOME / Xbox button */
+#define APAD_PADBTN_LTHUMB  (1u << 9)   /* L3 */
+#define APAD_PADBTN_RTHUMB  (1u << 10)  /* R3 */
+
 
 /* ---- §6.4 WELCOME flags ------------------------------------------------ */
 

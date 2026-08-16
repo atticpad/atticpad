@@ -42,7 +42,7 @@ android {
         // monotonic; it is deliberately NOT derived from the version string,
         // because a release candidate and its final release share a version
         // string suffix change but must still install over one another.
-        versionCode = 5
+        versionCode = 6
         versionName = apadVersionName()
 
         ndk {
