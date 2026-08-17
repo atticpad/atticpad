@@ -19,6 +19,10 @@ ancestor) on the physical device, and the report says what was seen.
 working networking. **Built blind** = compiles in the pinned container; nothing
 more is claimed.
 
+A tier moves only when a person has run the thing and said what they saw.
+[`QA.md`](QA.md) is the protocol for that: the checks emulators and CI cannot
+answer, which is most of what "hardware-proven" actually means here.
+
 Why publish this at all: most of these platforms cannot be tested directly, so
 the difference between "it compiled" and "someone watched it work" is real and
 worth stating. People forgive an honest label; they do not forgive a broken
