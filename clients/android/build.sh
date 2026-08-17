@@ -55,7 +55,21 @@ ACTION="${1:-build}"
 SERIAL="${2:-}"
 ADB="${ANDROID_SDK_ROOT}/platform-tools/adb"
 APK="${HERE}/app/build/outputs/apk/debug/app-debug.apk"
-PKG="net.atticpad"
+
+# DERIVED from the APK, never hardcoded. This was "net.atticpad" and silently
+# went wrong the day the debug build got applicationIdSuffix ".debug": the
+# selftest action installed the freshly built debug APK and then started the
+# OLD net.atticpad package. On a device with a stale release build that is a
+# CLEAN PASS reported against code from a previous release -- observed
+# reporting libapad 0.3.0-dev and 1018 cases while the tree said 0.5.0-rc2 and
+# 1141. A test that can pass without running what you built is worse than no
+# test, so this resolves the id from the artifact and dies if it cannot.
+apk_package() {
+  local aapt2
+  aapt2="$(ls "${ANDROID_SDK_ROOT}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+  [[ -x "${aapt2}" ]] || die "no aapt2 under ${ANDROID_SDK_ROOT}/build-tools -- cannot determine the APK's package id, and guessing it is how a self-test comes back green against the wrong app"
+  "${aapt2}" dump packagename "${APK}" 2>/dev/null | tr -d '\r' | head -1
+}
 
 adb_() {
   if [[ -n "${SERIAL}" ]]; then "${ADB}" -s "${SERIAL}" "$@"; else "${ADB}" "$@"; fi
@@ -88,6 +102,9 @@ case "${ACTION}" in
     # vectors on the device's own ARM build of the codec and prints the
     # result, so a build can be reported as RUN rather than merely built.
     do_build
+    PKG="$(apk_package)"
+    [[ -n "${PKG}" ]] || die "aapt2 returned no package id for ${APK}"
+    log "package under test: ${PKG} (read from the APK, not assumed)"
     adb_ install -r "${APK}" >/dev/null
     log "running apad_selftest_run() on the device"
     adb_ shell am force-stop "${PKG}" || true
@@ -106,7 +123,18 @@ case "${ACTION}" in
     [[ -n "${result}" ]] || die "no self-test result in logcat after 30 s -- did the app start?"
     printf '%s\n' "${result}"
     grep -q 'failed=0' <<<"${result}" || die "SELF-TEST FAILED on device"
-    log "self-test PASSED on device"
+    # Belt to the braces above: the result line carries the libapad version it
+    # was built from, so assert it is THIS tree's. Deriving the package id fixes
+    # the known way this went wrong; this catches every other way a stale
+    # install could answer for a fresh one.
+    want="$(sed -n 's/^#define APAD_VERSION_STR "\([^"]*\)" APAD_VERSION_SUFFIX/\1/p' \
+              "${REPO_ROOT}/core/include/atticpad/version.h")$(
+            sed -n 's/^#define APAD_VERSION_SUFFIX "\([^"]*\)"/\1/p' \
+              "${REPO_ROOT}/core/include/atticpad/version.h")"
+    if ! grep -q "libapad=${want}" <<<"${result}"; then
+      die "the self-test that passed reports a different libapad than this tree (want ${want}) -- something OTHER than the build you just made answered: ${result}"
+    fi
+    log "self-test PASSED on device (libapad ${want}, package ${PKG})"
     ;;
 
   *)

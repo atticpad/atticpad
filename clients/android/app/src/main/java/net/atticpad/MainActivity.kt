@@ -7,7 +7,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -1361,6 +1363,26 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * An [AlertDialog] whose WINDOW is transparent, so the only thing drawn is
+     * the caller's own [Theme.cardBackground] card.
+     *
+     * Without this the platform supplies its own opaque dialog background,
+     * which is a rectangle sitting behind our rounded card: the card's corners
+     * are transparent, so the platform rectangle shows through them as four
+     * grey notches. Invisible against a light background and obvious against
+     * the near-black session screen, which is where it was spotted on a real
+     * phone.
+     *
+     * Both dialogs in this file go through here rather than repeating the
+     * incantation, because the second copy is how one of them silently keeps
+     * the square corners.
+     */
+    private fun cardDialog(view: View): AlertDialog =
+        AlertDialog.Builder(this).setView(view).create().apply {
+            window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        }
+
     private fun showMenu() {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1373,7 +1395,7 @@ class MainActivity : Activity() {
             },
         )
 
-        val dialog = AlertDialog.Builder(this).setView(col).create()
+        val dialog = cardDialog(col)
         fun item(label: String, action: () -> Unit) {
             col.addView(
                 rowButton(this, label) { action(); dialog.dismiss() },
@@ -1485,7 +1507,7 @@ class MainActivity : Activity() {
             )
         }
 
-        val dialog = AlertDialog.Builder(this).setView(col).create()
+        val dialog = cardDialog(col)
         col.addView(primaryButton(this, "OK") { dialog.dismiss() }, vlp(dp(Theme.SPACE_LG)))
         dialog.show()
     }

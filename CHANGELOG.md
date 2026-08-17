@@ -77,6 +77,10 @@ directly below is everything that changed since.
 - **Reloading profiles left already-connected pads on their old profile.** A
   live session now moves to a newly matching profile, unless it was pinned to
   one by hand in the web UI.
+- **The Android in-session dialogs had square corners showing through.** The
+  platform draws its own opaque rectangular window behind a dialog, which showed
+  through the transparent corners of the app's rounded card as four grey
+  notches — visible against the near-black session screen.
 - **Debug and release Android builds can now coexist.** They shared an
   application ID, so installing either over the other failed on the signature
   mismatch and the only way through was to uninstall first, taking the app's
