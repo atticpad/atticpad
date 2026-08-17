@@ -88,7 +88,7 @@
     <uses-feature android:name="android.hardware.touchscreen.multitouch" android:required="true" />
 
     <application
-        android:label="AtticPad"
+        android:label="${appLabel}"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
@@ -145,7 +145,7 @@
         <activity
             android:name=".BtControllerActivity"
             android:exported="false"
-            android:label="AtticPad — Bluetooth Controller"
+            android:label="${appLabel} — Bluetooth Controller"
             android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|smallestScreenSize" />
 

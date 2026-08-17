@@ -180,6 +180,27 @@ build_server() {
   log "server: embedded-profiles guard (scripts/support/check_profiles_builtin.sh)"
   "${HERE}/support/check_profiles_builtin.sh"
 
+  # A stick's reachable set must be a DISC. Shaping each axis independently
+  # (what this did until the radial fix) turns a round stick into a diamond:
+  # with the default quadratic curve, a circular input becomes
+  # (cos^2 t, sin^2 t), whose components sum to 1. Diagonals measured 0.657 of
+  # cardinal magnitude. Both clients send a round stick, so this was felt on
+  # every platform at once -- and nothing tested the mapping engine at all.
+  log "server: stick-shape guard (scripts/support/stick_shape_test.c — reachable set must be circular)"
+  mkdir -p "${BUILD_DIR}/server"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      -I"${REPO_ROOT}/server/include" -I"${REPO_ROOT}/server/src" \
+      "${HERE}/support/stick_shape_test.c" \
+      "${CORE_SRC}/codec.c" "${CORE_SRC}/hmac_sha256.c" \
+      "${CORE_SRC}/seq.c" "${CORE_SRC}/session.c" \
+      "${SHIM}/net_bsd.c" "${SHIM}/time_posix.c" \
+      "${REPO_ROOT}/server/src/server.c" "${REPO_ROOT}/server/src/mapping.c" \
+      "${REPO_ROOT}/server/src/jsonc.c" "${REPO_ROOT}/server/src/profiles.c" \
+      "${REPO_ROOT}/server/src/pairing.c" \
+      -lm -o "${BUILD_DIR}/server/stick-shape-test"
+  "${BUILD_DIR}/server/stick-shape-test"
+
   log "server: compiling libapadserver + linux host -> atticpad-server (-std=c11 -Wall -Wextra -Werror, uinput backend)"
   mkdir -p "${BUILD_DIR}/server"
   "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
@@ -193,6 +214,7 @@ build_server() {
       "${REPO_ROOT}/server/src/pairing.c" \
       "${REPO_ROOT}/server/backends/uinput.c" \
       "${REPO_ROOT}/server/host/linux/main.c" \
+      -lm \
       -o "${BUILD_DIR}/server/atticpad-server"
 
   log "server: smoke run — bind a scratch port, init uinput backend, SIGTERM, expect clean shutdown"

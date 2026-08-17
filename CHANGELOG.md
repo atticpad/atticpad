@@ -37,6 +37,34 @@ directly below is everything that changed since.
 
 ### Fixed since the 0.4.0 release candidates
 
+- **Analog sticks reached a diamond, not a circle.** The server shaped each
+  stick axis independently, so with the default quadratic response curve a
+  round stick became the locus `|x| + |y| = 1` — full deflection on a diagonal
+  produced only **0.66** of the magnitude a cardinal push did, so every
+  diagonal was a third slower than it should have been. Shaping is now radial:
+  the magnitude is shaped once and re-projected along the input direction, so
+  direction is preserved exactly and the reachable set is a disc. The deadzone
+  becomes a dead *disc* rather than a dead *cross*, so a nearly-horizontal push
+  no longer has its small vertical component silently zeroed. This was
+  server-side, so it affected every client at once and is fixed for all of them
+  without updating anything on the device.
+- **Bluetooth HID mode put the sticks and triggers on the wrong axes.** The
+  HID report descriptor declared the right stick on `Z`/`Rz` and the triggers
+  on `Rx`/`Ry` — the DualShock arrangement — while Windows assigns axis slots
+  by usage and games expect the Xbox one. The result was a right stick that
+  drove a trigger and a trigger that drove a stick axis. The descriptor now
+  matches what an Xbox Bluetooth controller reports: left stick `X`/`Y`, left
+  trigger `Z`, right stick `Rx`/`Ry`, right trigger `Rz`, D-pad on the hat.
+  **Re-pair the phone after updating** — a host caches the report descriptor
+  from pairing, so it will keep using the old axis map until you remove the
+  device and pair again.
+- **The web UI's pad view mis-drew controllers the browser does not remap.** It
+  assumed the Gamepad API's `standard` layout for every pad. One the browser
+  does not recognise reports no mapping and exposes its axes in the device's own
+  order, so the view drew the wrong controls and printed misleading axis
+  numbers. It now says so plainly and lists the raw axis and button values
+  instead of a picture that cannot be trusted.
+
 - **The Windows server crashed on startup** when it had no profiles directory,
   because it freed uninitialised stack pointers on the built-in-profile
   fallback path. Linux had the same bug and survived it by luck.
@@ -49,6 +77,11 @@ directly below is everything that changed since.
 - **Reloading profiles left already-connected pads on their old profile.** A
   live session now moves to a newly matching profile, unless it was pinned to
   one by hand in the web UI.
+- **Debug and release Android builds can now coexist.** They shared an
+  application ID, so installing either over the other failed on the signature
+  mismatch and the only way through was to uninstall first, taking the app's
+  data with it. A debug build is now `net.atticpad.debug`, labelled "AtticPad
+  debug".
 
 ### Added
 
