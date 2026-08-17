@@ -32,6 +32,7 @@ static const char ATTICPAD_INDEX_HTML[] =
 "<meta charset=\"utf-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
 "<title>AtticPad Server</title>\n"
+"<link rel=\"icon\" type=\"image/png\" href=\"/favicon.png\">\n"
 "<style>\n"
 "  :root { color-scheme: dark light; }\n"
 "  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0;\n"

@@ -8,16 +8,18 @@ it and play a game, which is what 1.0 will mean.
 The **product version** and the **protocol version** move independently. The
 wire format is AtticPad protocol **v1, frozen** — see `docs/PROTOCOL.md`.
 
-## [0.5.0] — unreleased
+## [0.5.0] — 2026-08-17
 
-First public release. Everything below was built before this release and is
-listed once here rather than backdated into releases that were never published.
+**First public release.** AtticPad was built over several months before this
+tag; everything is listed once here rather than backdated into releases that
+were never published. A 0.4.0 was prepared and never finalised, so its work is
+part of this release too.
 
-0.4.0 reached two release candidates and was never finalised; its work is part
-of this release. If you installed `v0.4.0-rc1` or `v0.4.0-rc2`, the section
-directly below is everything that changed since.
+Install instructions are in [`docs/INSTALL.md`](docs/INSTALL.md) — including a
+QR code you can scan straight from FBI to install on a 3DS without touching an
+SD card.
 
-### New since the 0.4.0 release candidates
+### Highlights
 
 - **The server now tells the client where its touch controls are.** A new
   message, `TOUCHMAP` (§6.12), carries the active profile's touch regions —
@@ -35,7 +37,7 @@ directly below is everything that changed since.
   boxes: sticks, triggers, bumpers and d-pad light up in place, so it is
   obvious at a glance which physical control a client is actually sending.
 
-### Fixed since the 0.4.0 release candidates
+### Fixed
 
 - **Analog sticks reached a diamond, not a circle.** The server shaped each
   stick axis independently, so with the default quadratic response curve a
@@ -87,7 +89,7 @@ directly below is everything that changed since.
   data with it. A debug build is now `net.atticpad.debug`, labelled "AtticPad
   debug".
 
-### Added
+### Everything else that is in this release
 
 - **Protocol v1**, frozen: a byte-exact UDP wire format with a 12-byte header,
   capability bits, three-tier discovery, a PIN/QR pairing handshake, and

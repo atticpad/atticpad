@@ -111,15 +111,38 @@ without that, clients cannot reach it.
 - Tested on a **New 3DS**. The Old 3DS is expected to work but has never been
   run — if you try it, a report either way is welcome.
 
-### Install the CIA (recommended)
+### Install with a QR code (no SD card needed)
+
+If the console is already on your Wi-Fi, FBI can fetch the `.cia` itself:
+
+1. Open **FBI** → *Remote Install* → **Scan QR Code**.
+2. Point it at this:
+
+<img src="img/fbi-install-qr.png" alt="QR code encoding https://github.com/atticpad/atticpad/releases/latest/download/atticpad-3ds.cia" width="220">
+
+3. Confirm the install, then launch **AtticPad** from the HOME menu.
+
+The code encodes
+`https://github.com/atticpad/atticpad/releases/latest/download/atticpad-3ds.cia`,
+which always points at the newest release — so the same code keeps working
+after an update, and you can re-scan it to upgrade in place.
+
+Two honest caveats. The URL is an HTTPS redirect to the actual asset, and
+whether a given console's HTTP client follows it and negotiates GitHub's TLS
+depends on the console and its firmware; if the download fails, use the SD-card
+route below, which always works. And this path has been verified by decoding
+the image with the same QR decoder the client itself uses — not yet by a person
+scanning it from FBI, so a report either way is welcome.
+
+### Install the CIA from the SD card
 
 1. Copy `atticpad-3ds.cia` to your SD card.
 2. Open **FBI** → *SD* → browse to the file → **Install and delete** (or
    *Install*, to keep the copy).
 3. Launch **AtticPad** from the HOME menu.
 
-FBI can also install over the network: *Remote Install → Receive URLs over the
-network*, then send the URL of the `.cia` from your PC.
+FBI can also take a URL you type or send yourself: *Remote Install → Receive
+URLs over the network*.
 
 ### Or run the 3DSX
 
@@ -129,8 +152,9 @@ the HOME menu.
 
 ### Self-test
 
-Hold **L + R + Start** while the app launches to run the on-device conformance
-self-test. It runs before any networking, so it stays reachable even when
+Hold **L + R + Start** while the app launches — or use the visible
+`SELECT: self-test` prompt, which is the way in if a shoulder button is worn
+out — to run the on-device conformance self-test. It runs before any networking, so it stays reachable even when
 everything else is broken. There is also a visible `SELECT: self-test` prompt.
 
 ---

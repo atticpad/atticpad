@@ -98,6 +98,7 @@
                           * shipped-profile check -- the filesystem half of
                           * the remapping editor's profile routes below */
 #include "profile_json.h"   /* apad_profile <-> JSON, for the same routes */
+#include "favicon_png.h"    /* the tab icon, embedded (GENERATED) */
 
 /* ---- limits (§8.5-style "cap it, don't try to be a general web server") -- */
 #define UI_MAX_REQUEST    8192u   /* request line + headers                 */
@@ -753,6 +754,21 @@ static void ui_dispatch(apad_socket_t fd, apad_server *server, uint32_t now_ms,
         sb_free(&sb);
         return;
     }
+    /* A browser asks for /favicon.ico unprompted on every visit, so without
+     * this each page load logged a 404 and the tab showed a generic glyph.
+     * Same mark as the launcher icons and the HOME menu entry -- it comes
+     * from render_mark() via make-assets.py, not a second drawing. Served at
+     * both paths: .ico is what a browser guesses at, .png is what the <link>
+     * in assets.h points to, and the Content-Type is what actually decides
+     * how the bytes are read. */
+    if (is_get && (strcmp(req->path, "/favicon.ico") == 0
+                || strcmp(req->path, "/favicon.png") == 0)) {
+        ui_send_response(fd, 200, "OK", "image/png",
+                         (const char *)kApadFaviconPng,
+                         sizeof kApadFaviconPng);
+        return;
+    }
+
     if (is_get && strcmp(req->path, "/api/pair/qr.svg") == 0) {
         /* §10.3 QR: renders one of the SAME URIs /api/state's
          * "pairing.uris" array carries, computed fresh here rather than

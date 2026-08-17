@@ -739,7 +739,67 @@ def make_brand_assets():
     mark, _ = fit_mark(S, 0.68)                      # its own corner rounding
     av.alpha_composite(mark)
     av.resize((A, A), Image.LANCZOS).save("docs/img/avatar.png")
-    print(f"  wrote docs/img/logo.png ({Ws//SSB}x{H}) and docs/img/avatar.png ({A}x{A})")
+
+    # ------------------------------------------------- web UI favicon
+    # The server's page had no favicon at all, so every visit was a 404 on
+    # /favicon.ico and a generic glyph in the tab. It is EMBEDDED in the
+    # binary rather than served from disk, for the same reason the shipped
+    # profiles are (see gen_profiles_builtin.py): a release is one file, and
+    # a downloaded server has no asset directory beside it.
+    #
+    # 48px because a browser downscales to 16 and this mark survives that
+    # (checked at 40px for the org avatar); the rounded plate is the 3DS
+    # icon's own, so a tab, a HOME menu entry and a launcher icon are
+    # visibly the same artwork.
+    F = 48
+    S = F * SSB
+    fav = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    ImageDraw.Draw(fav).rounded_rectangle([0, 0, S-1, S-1], radius=S*0.18,
+                                          fill=(38, 45, 58, 255))
+    fav_mark, _ = fit_mark(S, 0.74)
+    fav.alpha_composite(fav_mark)
+    fav = fav.resize((F, F), Image.LANCZOS)
+    # Encode ONCE and write the same bytes to both places. Saving the file
+    # separately produced a different (unoptimised) encoding of the same
+    # image, so the reference PNG and the embedded copy were not
+    # byte-identical -- harmless to look at, and exactly the drift that makes
+    # a later "does the header still match the file?" check fail for a reason
+    # nobody can see.
+    buf = io.BytesIO()
+    fav.save(buf, format="PNG", optimize=True)
+    png = buf.getvalue()
+    with io.open("docs/img/favicon.png", "wb") as fh:
+        fh.write(png)
+
+    rows = []
+    for i in range(0, len(png), 12):
+        rows.append("    " + " ".join(f"0x{b:02x}," for b in png[i:i+12]))
+    hdr = (
+        "/* server/host/common/favicon_png.h -- GENERATED, do not edit.\n"
+        " *\n"
+        " * Source: clients/3ds/meta/make-assets.py --brand (render_mark(), the\n"
+        " * one place the AtticPad mark is drawn -- see that file's header).\n"
+        " * Regenerate by rerunning it; the bytes below are a 48x48 PNG.\n"
+        " *\n"
+        " * Embedded rather than read from disk because a release is a single\n"
+        " * binary with no asset directory beside it, exactly as\n"
+        " * profiles_builtin.h is. Served at /favicon.ico and /favicon.png by\n"
+        " * webui.h; a browser accepts PNG bytes at the .ico path because the\n"
+        " * Content-Type header decides, not the extension.\n"
+        " */\n"
+        "#ifndef ATTICPAD_HOST_COMMON_FAVICON_PNG_H\n"
+        "#define ATTICPAD_HOST_COMMON_FAVICON_PNG_H\n"
+        "\n"
+        "static const unsigned char kApadFaviconPng[] = {\n"
+        + "\n".join(rows) + "\n"
+        "};\n"
+        "\n"
+        "#endif /* ATTICPAD_HOST_COMMON_FAVICON_PNG_H */\n"
+    )
+    io.open("server/host/common/favicon_png.h", "w", encoding="utf-8").write(hdr)
+    print(f"  wrote docs/img/logo.png ({Ws//SSB}x{H}), docs/img/avatar.png ({A}x{A}),"
+          f" docs/img/favicon.png ({F}x{F}) and server/host/common/favicon_png.h"
+          f" ({len(png)} bytes embedded)")
 
 if BRAND:
     # Mutually exclusive with the other modes, same as --windows: writes only
