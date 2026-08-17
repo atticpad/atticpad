@@ -36,6 +36,15 @@ import java.util.concurrent.Executors
  *
  * [REPORT_DESCRIPTOR] is frozen exactly as the hardware round proved it
  * working — changing it by even a byte re-opens every question above.
+ * It has moved exactly once since: on 2026-08-16 the four stick/trigger
+ * USAGE bytes were swapped from the DualShock layout (right stick on Z/Rz,
+ * triggers on Rx/Ry) to the Xbox one (right stick on Rx/Ry, triggers on
+ * Z/Rz), because a real Windows host read our trigger axes as stick axes:
+ * pulling the left trigger moved a stick Y axis, while the right stick's
+ * up/down landed on an axis nothing was bound to. No structural byte moved:
+ * same items, same order, same lengths, same nine-byte report, so
+ * [buildReport] is unchanged. Enumeration was re-verified on hardware after
+ * the change.
  * Rumble/LED are explicitly OUT OF SCOPE for this mode (see the "rumble"
  * note on [callback] below): the descriptor declares no OUTPUT report item
  * to receive them, and adding one is a deliberately deferred product
@@ -138,10 +147,14 @@ class BtHidController(private val context: Context, private val input: InputSnap
         //   byte 3    X  (left stick,  i8, signed, centre 0)
         //   byte 4    Y  (left stick,  i8, signed, centre 0, +DOWN — see
         //             [buildReport])
-        //   byte 5    Z  (right stick X, i8, signed, centre 0)
-        //   byte 6    Rz (right stick Y, i8, signed, centre 0, +DOWN)
-        //   byte 7    Rx (left trigger,  u8, 0=released .. 255=full pull)
-        //   byte 8    Ry (right trigger, u8, as above)
+        //   byte 5    Rx (right stick X, i8, signed, centre 0)
+        //   byte 6    Ry (right stick Y, i8, signed, centre 0, +DOWN)
+        //   byte 7    Z  (left trigger,  u8, 0=released .. 255=full pull)
+        //   byte 8    Rz (right trigger, u8, as above)
+        //
+        // The BYTE positions are unchanged from the original descriptor;
+        // only which USAGE each one is declared as moved (Z/Rz <-> Rx/Ry),
+        // so buildReport() below still fills them in the same order.
         //
         // 13 buttons, not 16: the wire's §5.1 mask has 20 defined bits, but
         // 4 of them (the D-pad) become the hat switch instead, and
@@ -193,18 +206,40 @@ class BtHidController(private val context: Context, private val input: InputSnap
             0x95.toByte(), 0x01,        //   Report Count (1)
             0x81.toByte(), 0x03,        //   Input (Const,Var,Abs)
 
-            0x09, 0x30,                 //   Usage (X)
-            0x09, 0x31,                 //   Usage (Y)
-            0x09, 0x32,                 //   Usage (Z)
-            0x09, 0x35,                 //   Usage (Rz)
+            // Right stick is Rx/Ry and the triggers are Z/Rz -- the XBOX
+            // layout, which is what Windows and essentially every game
+            // assume. This block originally declared the right stick on
+            // Z/Rz and the triggers on Rx/Ry (the DualShock layout), so a
+            // real host read our axes as different controls entirely.
+            //
+            // OBSERVED on Windows, 2026-08-16, exactly as reported: pulling
+            // the LEFT TRIGGER moved a stick Y axis, and the right stick's
+            // up/down landed on an axis nothing was bound to. Both follow
+            // from the same swap -- our trigger bytes arrived where the host
+            // looks for the right stick, and our right-stick bytes arrived
+            // where it looks for triggers, which that host had nothing
+            // mapped to.
+            //
+            // ONLY the four usage bytes below and in the next block change.
+            // Report length, item structure, ordering, logical ranges and
+            // buildReport() are all untouched -- the signed run is still
+            // four axes then the unsigned run is two, so the nine bytes on
+            // the wire keep their exact meaning positionally. That matters
+            // because of the freeze noted in this file's header: the fewer
+            // structural bytes move, the less of the hardware round has to
+            // be re-proven (re-pair and re-enumerate is still required).
+            0x09, 0x30,                 //   Usage (X)  -- left stick X
+            0x09, 0x31,                 //   Usage (Y)  -- left stick Y
+            0x09, 0x33,                 //   Usage (Rx) -- right stick X
+            0x09, 0x34,                 //   Usage (Ry) -- right stick Y
             0x15, 0x81.toByte(),        //   Logical Minimum (-127)
             0x25, 0x7F,                 //   Logical Maximum (127)
             0x75, 0x08,                 //   Report Size (8)
             0x95.toByte(), 0x04,        //   Report Count (4)
             0x81.toByte(), 0x02,        //   Input (Data,Var,Abs)
 
-            0x09, 0x33,                 //   Usage (Rx) -- left trigger
-            0x09, 0x34,                 //   Usage (Ry) -- right trigger
+            0x09, 0x32,                 //   Usage (Z)  -- left trigger
+            0x09, 0x35,                 //   Usage (Rz) -- right trigger
             0x15, 0x00,                 //   Logical Minimum (0)
             0x26.toByte(), 0xFF.toByte(), 0x00, // Logical Maximum (255)
             0x75, 0x08,                 //   Report Size (8)

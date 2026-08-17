@@ -42,7 +42,7 @@ android {
         // monotonic; it is deliberately NOT derived from the version string,
         // because a release candidate and its final release share a version
         // string suffix change but must still install over one another.
-        versionCode = 6
+        versionCode = 7
         versionName = apadVersionName()
 
         ndk {
@@ -89,8 +89,29 @@ android {
     }
 
     buildTypes {
+        // A debug build installs ALONGSIDE a release one rather than
+        // colliding with it. Without the suffix the two share an
+        // applicationId, so installing either over the other fails on the
+        // signature mismatch (debug key vs release key) and the only way
+        // through is to uninstall first -- which takes the app's data with
+        // it, and makes "test the fix against the shipped build" needlessly
+        // destructive. Distinct ids mean both can sit on the phone at once.
+        //
+        // Only the APPLICATION ID is suffixed, never `namespace`: the JNI
+        // entry points are named after the Java package (Java_net_atticpad_*
+        // in apad_jni.c), and moving that would silently unbind every native
+        // method at runtime.
+        debug {
+            applicationIdSuffix = ".debug"
+            // So the version on screen and in a bug report says which build
+            // it came from. The release build's name stays exactly
+            // version.h's string.
+            versionNameSuffix = "-debug"
+            manifestPlaceholders["appLabel"] = "AtticPad debug"
+        }
         release {
             isMinifyEnabled = false
+            manifestPlaceholders["appLabel"] = "AtticPad"
             // Signed only when the environment supplied a keystore above;
             // otherwise deliberately unsigned. Releases come from tagged CI
             // only (docs/DESIGN.md §8.5).

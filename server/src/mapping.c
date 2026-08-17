@@ -19,6 +19,7 @@
  * core/'s constraints do not apply.
  */
 
+#include <math.h>
 #include <string.h>
 
 #include "mapping.h"
@@ -61,6 +62,68 @@ static double shape_axis(double v, double deadzone, apad_curve_t curve)
     return (v < 0.0) ? -scaled : scaled;
 }
 
+/* Deadzone + curve for a STICK, applied to the VECTOR, not to each axis.
+ *
+ * This is the difference between a round stick and a diamond-shaped one, and
+ * it is not subtle. Shaping the axes independently means the curve acts on
+ * each component separately: feed a perfect circle of full-deflection inputs
+ * (cos t, sin t) through the quadratic curve and you get (cos^2 t, sin^2 t),
+ * whose components SUM to 1 -- the locus |x| + |y| = 1, which is exactly a
+ * diamond. Measured before this function existed: full deflection at 45 deg
+ * produced magnitude 0.657 where the cardinal directions produced 1.000, so
+ * every diagonal was a third slower than it should have been, on every
+ * client at once (both send a round stick; the squashing was here).
+ *
+ * Radial shaping instead takes the magnitude ONCE, applies the deadzone and
+ * the curve to that single number, and re-projects along the original
+ * direction. Direction is preserved exactly -- the shaped vector is always
+ * parallel to the input -- and the reachable set is a disc, so a diagonal
+ * reaches the same speed as a cardinal push.
+ *
+ * The deadzone becomes radial too, which is the behaviour a deadzone is
+ * supposed to have: a small dead DISC around centre rather than a dead
+ * cross, so a nearly-horizontal push no longer has its small Y component
+ * silently zeroed while X passes through.
+ *
+ * shape_axis() above is still right for triggers, touch axes and gyro: those
+ * are genuinely one-dimensional, and there is no second component whose
+ * magnitude could be distorted.
+ */
+static void shape_stick(double x, double y, double deadzone,
+                        apad_curve_t curve, double *out_x, double *out_y)
+{
+    double mag = sqrt(x * x + y * y);
+    double scaled;
+
+    /* Inputs can sit fractionally outside the unit circle: each axis is
+     * scaled independently by the client from hardware whose gate is only
+     * approximately round, so a diagonal can land at 1.0001. Clamp the
+     * MAGNITUDE rather than the components -- clamping components is what
+     * puts corners on the reachable set. */
+    if (mag > 1.0) {
+        x /= mag;
+        y /= mag;
+        mag = 1.0;
+    }
+
+    if (deadzone >= 1.0 || mag < deadzone) {
+        *out_x = 0.0;
+        *out_y = 0.0;
+        return;
+    }
+    scaled = (mag - deadzone) / (1.0 - deadzone);
+    if (scaled > 1.0) {
+        scaled = 1.0;
+    }
+    scaled = curve_apply(scaled, curve);
+
+    /* mag >= deadzone > 0 here, so this cannot divide by zero: the
+     * deadzone>=1.0 and mag<deadzone cases both returned above, and a
+     * profile with deadzone 0.0 still only reaches this line when mag > 0. */
+    *out_x = x * (scaled / mag);
+    *out_y = y * (scaled / mag);
+}
+
 static int16_t to_axis_i16(double v)
 {
     double out = v * 32767.0;
@@ -71,18 +134,6 @@ static int16_t to_axis_i16(double v)
         out = -32768.0;
     }
     return (int16_t)out;
-}
-
-/* Deadzone + curve for one stick axis. `raw` is the wire value,
- * -32768..32767, already +Y-up (§5.3) — no evdev concerns here. */
-static int16_t apply_stick_axis(int16_t raw, int invert, double deadzone,
-                                apad_curve_t curve)
-{
-    double v = (double)raw / 32768.0;   /* -1.0 .. ~0.99997 */
-    if (invert) {
-        v = -v;
-    }
-    return to_axis_i16(shape_axis(v, deadzone, curve));
 }
 
 /* Deadzone only for a trigger axis, 0..32767 (already clamped non-negative
@@ -313,8 +364,21 @@ static void compute_stick(int right_side, const apad_input_state *in, uint32_t c
     if (have_stick) {
         int axis_x = right_side ? APAD_AXIS_RX : APAD_AXIS_LX;
         int axis_y = right_side ? APAD_AXIS_RY : APAD_AXIS_LY;
-        phys_x = apply_stick_axis(in->axes[axis_x], st->invert_x, st->deadzone, st->curve);
-        phys_y = apply_stick_axis(in->axes[axis_y], st->invert_y, st->deadzone, st->curve);
+        {
+            /* Inversion is a per-axis mirror of the INPUT, applied before
+             * shaping: mirroring commutes with a radial shape (it maps the
+             * direction to another direction of equal magnitude), so the
+             * result is identical to inverting afterwards -- but doing it
+             * here keeps shape_stick() free of any profile concept. */
+            double ix = (double)in->axes[axis_x] / 32768.0;
+            double iy = (double)in->axes[axis_y] / 32768.0;
+            double ox, oy;
+            if (st->invert_x) { ix = -ix; }
+            if (st->invert_y) { iy = -iy; }
+            shape_stick(ix, iy, st->deadzone, st->curve, &ox, &oy);
+            phys_x = to_axis_i16(ox);
+            phys_y = to_axis_i16(oy);
+        }
 
         if (gyro_targets_this_stick && gp->mode == APAD_GYRO_MODE_AIM) {
             int16_t gx, gy;
