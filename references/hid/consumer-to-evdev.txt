@@ -1,0 +1,203 @@
+# HID Usage Page 0x0C (Consumer) -> Linux evdev KEY_* code
+#
+# Source:      Linux kernel, drivers/hid/hid-input.c, the `case HID_UP_CONSUMER:`
+#              switch inside hidinput_configure_usage() (the `switch (usage->hid
+#              & HID_USAGE)` block starting `case 0x000: goto ignore;`),
+#              cross-referenced against include/uapi/linux/input-event-codes.h
+#              for the KEY_* numeric codes and any comment attached to a name.
+# Pinned tag:  v6.6 (LTS) -- the exact same tag as usage-to-evdev.txt and
+#              usage-to-scancode-set1.txt in this directory.
+# Commit:      ffc253263a1375a65fa6c9f62a893e9767fbebfa (same commit those two
+#              files cite; resolved the same way, via GitHub's API:
+#              refs/tags/v6.6 -> tag object 5260836abb7056beed3f3f0d0e4262c11f36f0d0
+#              -> commit above).
+# Fetched from (GitHub read-only mirror of torvalds/linux, pinned to the tag,
+# not `master` -- the SAME two files usage-to-evdev.txt already cites, re-fetched
+# for this table rather than re-derived from memory):
+#   https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/hid/hid-input.c
+#   https://raw.githubusercontent.com/torvalds/linux/v6.6/include/uapi/linux/input-event-codes.h
+# Date fetched: 2026-08-25
+# Licence:     GPL-2.0 (drivers/hid/hid-input.c) and GPL-2.0 WITH Linux-syscall-note
+#              (the uapi header). Same treatment as usage-to-evdev.txt: this file
+#              is a DERIVED DATA TABLE -- (usage, KEY_* name, code) triples, one
+#              per line -- not a copy of the switch statement's C source. The
+#              `case 0x0b0: map_key_clear(KEY_PLAY); break;` lines themselves were
+#              not transcribed; only the (case value -> KEY_* argument) fact each
+#              one encodes was extracted. See references/hid/README.md's licence
+#              note on usage-to-evdev.txt for the same reasoning, which applies
+#              here unchanged.
+# SHA-256 of fetched files (identical files to usage-to-evdev.txt's, re-verified
+# for this fetch): hid-input.c: bc9babd1131947d56af67aa54b101fe22689ce2584a1f88af3edb78a399af7fe
+#   input-event-codes.h: 23b5be6927d40424e287ca5fdfb82f5d6dfd48b55e92f7e48c8848c4a0495493
+#
+# Why this table exists: docs/PROTOCOL.md §6.18 defines AtticPad's own 24-slot
+# media control vocabulary. It is not a HID usage page -- see §6.18's own text,
+# "this index... is AtticPad's own dense vocabulary, not a HID usage" -- but
+# every one of its 24 controls describes a function a real HID Consumer-page
+# device already reports, and hid-input.c's HID_UP_CONSUMER switch is what the
+# Linux kernel itself does with that report: translate a Consumer-page usage
+# straight into a KEY_* code before injecting the input event. That switch is
+# canonical ground truth for "what KEY_* code does the AtticPad server need to
+# inject on Linux to reproduce control X", the same way hid_keyboard[] is
+# canonical for the physical-keyboard table -- for exactly the same reason
+# usage-to-evdev.txt's header gives: it is not an independent implementation of
+# the mapping, it IS the mapping the kernel ships.
+#
+# SCOPE. The HID_UP_CONSUMER switch in hid-input.c covers roughly 150 usages
+# across the entire Consumer page (screen/TV controls, numeric keypad aliases,
+# GUI application controls, keyboard-input-assist usages, and more) -- most of
+# which no §6.18 control names. Per the task brief, this file stops at the
+# usages that could plausibly back one of §6.18's 24 controls: the transport
+# block (0x0b0-0x0b8, 0x0cd), volume (0x0e2, 0x0e9, 0x0ea), display brightness
+# (0x06f, 0x070), application launch (0x08a, 0x18a, 0x192, 0x196, 0x182), and
+# browser/"Application Control" navigation (0x21f, 0x221, 0x223-0x227, 0x22a).
+# One usage outside that list, 0x21f (AC Find), is included anyway because it
+# is the usage that resolves the PLAY/PAUSE/EJECT/SEARCH ambiguity flagged in
+# server/backends/uinput_keymap.h -- see the SEARCH row's note below. Nothing
+# else on the Consumer page was transcribed; nothing here was chosen to fill a
+# gap where the switch has none.
+#
+# Format: one row per usage, tab-separated:
+#   <usage hex>	<KEY_* name>	<evdev numeric code>	<input-event-codes.h comment on that KEY_*, or - for none>
+#
+# The 4th column is NOT a hid-input.c inline comment -- the HID_UP_CONSUMER
+# switch carries no per-case comments for any row in this file's scope (checked
+# directly against the fetched source; contrast HID_UP_GENDESK's "AC Pan" a few
+# hundred lines away, which this file's scope does not reach). The 4th column
+# is instead the comment already attached to that KEY_* symbol's own #define in
+# input-event-codes.h, e.g. "AC Stop", "AC Search", "AL Calculator" -- these are
+# the same USB HID Usage-Table-derived comments the kernel maintainers put on
+# the #define itself, read from the same pinned header usage-to-evdev.txt
+# already cites, not invented or looked up in a third source.
+#
+# A HID usage that maps to a KEY_* also produced by a DIFFERENT usage elsewhere
+# in this table's scope is listed on both rows, not collapsed -- see 0x08a and
+# 0x196 (both KEY_WWW) and 0x182 and 0x22a (both KEY_BOOKMARKS). That is the
+# kernel switch's own reuse, reproduced faithfully, the same way
+# usage-to-evdev.txt reproduces KEY_DELETE at three HID usages.
+#
+# No value in this file was inferred, guessed, or filled in from memory --
+# every row is a direct transcription of a `case <usage>: map_key_clear(KEY_*)`
+# line in the fetched hid-input.c followed by a direct lookup of that symbol's
+# numeric code and comment in the fetched input-event-codes.h, both at the
+# pinned tag above.
+0x06f	KEY_BRIGHTNESSUP	225	-
+0x070	KEY_BRIGHTNESSDOWN	224	-
+0x08a	KEY_WWW	150	AL Internet Browser
+0x0b0	KEY_PLAY	207	-
+0x0b1	KEY_PAUSE	119	-
+0x0b2	KEY_RECORD	167	-
+0x0b3	KEY_FASTFORWARD	208	-
+0x0b4	KEY_REWIND	168	-
+0x0b5	KEY_NEXTSONG	163	-
+0x0b6	KEY_PREVIOUSSONG	165	-
+0x0b7	KEY_STOPCD	166	-
+0x0b8	KEY_EJECTCD	161	-
+0x0cd	KEY_PLAYPAUSE	164	-
+0x0e2	KEY_MUTE	113	-
+0x0e9	KEY_VOLUMEUP	115	-
+0x0ea	KEY_VOLUMEDOWN	114	-
+0x182	KEY_BOOKMARKS	156	AC Bookmarks
+0x18a	KEY_MAIL	155	-
+0x192	KEY_CALC	140	AL Calculator
+0x196	KEY_WWW	150	AL Internet Browser
+0x21f	KEY_FIND	136	AC Search
+0x221	KEY_SEARCH	217	-
+0x223	KEY_HOMEPAGE	172	AC Home
+0x224	KEY_BACK	158	AC Back
+0x225	KEY_FORWARD	159	AC Forward
+0x226	KEY_STOP	128	AC Stop
+0x227	KEY_REFRESH	173	AC Refresh
+0x22a	KEY_BOOKMARKS	156	AC Bookmarks
+#
+# ---------------------------------------------------------------------------
+# §6.18 control -> consumer usage -> row above. This is the resolution table
+# scripts/support/check_kbm_tables.c (or a reader) uses to check
+# server/backends/uinput_keymap.h's apad_media_to_evdev[] against the rows
+# above -- see that header's comment for the reasoning behind each choice.
+#
+#   PLAY_PAUSE      0x0cd -> KEY_PLAYPAUSE (164)
+#   PLAY            0x0b0 -> KEY_PLAY (207)
+#   PAUSE           0x0b1 -> KEY_PAUSE (119)
+#   STOP            0x0b7 -> KEY_STOPCD (166)  -- NOT 0x226/KEY_STOP. 0x226 is
+#                   "AC Stop" (a browser/document navigation-cancel usage);
+#                   §6.18's STOP sits inside the PLAY_PAUSE/PLAY/PAUSE/STOP/
+#                   NEXT_TRACK/PREV_TRACK/FAST_FORWARD/REWIND block, which is
+#                   unambiguously the media-transport group, so the transport
+#                   Stop usage (0x0b7 -> KEY_STOPCD) is the right target, not
+#                   the browser-navigation Stop that happens to share the
+#                   English word "stop".
+#   NEXT_TRACK      0x0b5 -> KEY_NEXTSONG (163)
+#   PREV_TRACK      0x0b6 -> KEY_PREVIOUSSONG (165)
+#   FAST_FORWARD    0x0b3 -> KEY_FASTFORWARD (208)
+#   REWIND          0x0b4 -> KEY_REWIND (168)
+#   VOLUME_UP       0x0e9 -> KEY_VOLUMEUP (115)
+#   VOLUME_DOWN     0x0ea -> KEY_VOLUMEDOWN (114)
+#   MUTE            0x0e2 -> KEY_MUTE (113)
+#   EJECT           0x0b8 -> KEY_EJECTCD (161)  -- the switch has NO case at
+#                   all that produces KEY_EJECTCLOSECD; that symbol is
+#                   unreachable from HID_UP_CONSUMER in this kernel, so it was
+#                   never a live candidate, only a name that read plausibly
+#                   from input-event-codes.h alone.
+#   RECORD          0x0b2 -> KEY_RECORD (167)
+#   BRIGHTNESS_UP   0x06f -> KEY_BRIGHTNESSUP (225)
+#   BRIGHTNESS_DOWN 0x070 -> KEY_BRIGHTNESSDOWN (224)
+#   LAUNCH_BROWSER  0x08a or 0x196 -> KEY_WWW (150)
+#   LAUNCH_MAIL     0x18a -> KEY_MAIL (155)
+#   LAUNCH_CALC     0x192 -> KEY_CALC (140)
+#   SEARCH          0x221 -> KEY_SEARCH (217)  -- NOT KEY_FIND, even though
+#                   input-event-codes.h's own "/* AC Search */" comment sits on
+#                   KEY_FIND (136). The switch settles what the comment alone
+#                   could not: usage 0x221 (which a real hardware/software
+#                   Search button reports) maps to KEY_SEARCH; a DIFFERENT
+#                   usage, 0x21f, maps to KEY_FIND, and it is 0x21f -- not
+#                   0x221 -- that a fuller reading of the USB HID Usage Tables
+#                   names "AC Find". The header comment on KEY_FIND is at best
+#                   imprecise about which usage it describes; the switch's own
+#                   case values are not ambiguous about it.
+#   NAV_HOME        0x223 -> KEY_HOMEPAGE (172)
+#   NAV_BACK        0x224 -> KEY_BACK (158)
+#   NAV_FORWARD     0x225 -> KEY_FORWARD (159)
+#   REFRESH         0x227 -> KEY_REFRESH (173)
+#   BOOKMARKS       0x182 or 0x22a -> KEY_BOOKMARKS (156)
+#
+# All 24 §6.18 controls have a Consumer-page equivalent in this kernel's
+# switch -- none needed the "genuinely no mapping" fallback the task brief
+# allowed for.
+#
+# ---------------------------------------------------------------------------
+# Machine-readable form of the resolution table above, for
+# scripts/support/check_kbm_tables.c. One row per §6.18 control that has a
+# Consumer-page equivalent (all 24, per the prose above), tab-separated,
+# line prefixed with '@' so the reader can tell it apart from the raw usage
+# rows starting '0x' further up this file:
+#   @<§6.18 control name, matching the APAD_MEDIA_* suffix in
+#     server/backends/uinput_keymap.h>	<consumer usage hex used>	<KEY_* name>	<evdev numeric code>
+# Where a control has two equally valid source usages (LAUNCH_BROWSER,
+# BOOKMARKS), the first one listed in the prose above is repeated here --
+# both resolve to the same KEY_* target, so which usage hex is recorded does
+# not change what the guard checks.
+@PLAY_PAUSE	0x0cd	KEY_PLAYPAUSE	164
+@PLAY	0x0b0	KEY_PLAY	207
+@PAUSE	0x0b1	KEY_PAUSE	119
+@STOP	0x0b7	KEY_STOPCD	166
+@NEXT_TRACK	0x0b5	KEY_NEXTSONG	163
+@PREV_TRACK	0x0b6	KEY_PREVIOUSSONG	165
+@FAST_FORWARD	0x0b3	KEY_FASTFORWARD	208
+@REWIND	0x0b4	KEY_REWIND	168
+@VOLUME_UP	0x0e9	KEY_VOLUMEUP	115
+@VOLUME_DOWN	0x0ea	KEY_VOLUMEDOWN	114
+@MUTE	0x0e2	KEY_MUTE	113
+@EJECT	0x0b8	KEY_EJECTCD	161
+@RECORD	0x0b2	KEY_RECORD	167
+@BRIGHTNESS_UP	0x06f	KEY_BRIGHTNESSUP	225
+@BRIGHTNESS_DOWN	0x070	KEY_BRIGHTNESSDOWN	224
+@LAUNCH_BROWSER	0x08a	KEY_WWW	150
+@LAUNCH_MAIL	0x18a	KEY_MAIL	155
+@LAUNCH_CALC	0x192	KEY_CALC	140
+@SEARCH	0x221	KEY_SEARCH	217
+@NAV_HOME	0x223	KEY_HOMEPAGE	172
+@NAV_BACK	0x224	KEY_BACK	158
+@NAV_FORWARD	0x225	KEY_FORWARD	159
+@REFRESH	0x227	KEY_REFRESH	173
+@BOOKMARKS	0x182	KEY_BOOKMARKS	156

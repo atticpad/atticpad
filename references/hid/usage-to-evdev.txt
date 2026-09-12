@@ -1,0 +1,319 @@
+# HID Usage Page 0x07 (Keyboard/Keypad) -> Linux evdev KEY_* code
+#
+# Source:      Linux kernel, drivers/hid/hid-input.c, the `hid_keyboard[256]`
+#              array, cross-referenced against include/uapi/linux/input-event-codes.h
+#              for the KEY_* names.
+# Pinned tag:  v6.6 (LTS)
+# Commit:      ffc253263a1375a65fa6c9f62a893e9767fbebfa (the commit v6.6 points at,
+#              resolved via GitHub's API: refs/tags/v6.6 -> tag object
+#              5260836abb7056beed3f3f0d0e4262c11f36f0d0 -> commit above)
+# Fetched from (GitHub read-only mirror of torvalds/linux, pinned to the tag,
+# not `master`):
+#   https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/hid/hid-input.c
+#   https://raw.githubusercontent.com/torvalds/linux/v6.6/include/uapi/linux/input-event-codes.h
+# Date fetched: 2026-08-25
+# Licence:     GPL-2.0 (drivers/hid/hid-input.c) and GPL-2.0 WITH Linux-syscall-note
+#              (the uapi header). This file is a DERIVED DATA TABLE -- usage id,
+#              KEY_* name, numeric code, one triple per line -- not the kernel's
+#              C source. The `hid_keyboard[]` array itself (the C array literal
+#              with its surrounding code) was NOT copied into this repo; only the
+#              (index -> value) pairs it encodes were extracted and re-expressed
+#              here, with the value resolved to the symbolic name a reader
+#              will actually want. See references/hid/README.md for why this is
+#              judged to be on the "data extraction", not "GPL source copy", side
+#              of the line -- and why anyone extending it should still treat the two
+#              source files as the ground truth to re-derive from, not this file's
+#              header comment, if that line is ever contested.
+#
+# This is the exact table every real USB keyboard is translated through by the
+# Linux HID core: hid-input.c uses `hid_keyboard[usage->hid & HID_USAGE]` to map
+# an incoming HID usage straight to a KEY_* code before injecting the input
+# event. It is canonical for the uinput backend for exactly that reason -- it is
+# not an independent implementation of the mapping, it *is* the mapping the
+# kernel ships.
+#
+# Format: one row per usage, tab-separated:
+#   <usage hex>	<KEY_* name>	<evdev numeric code>
+#
+# Full 0x00-0xFF range of the array is listed, not just the printable/letter
+# keys, per the task brief. KEY_RESERVED (code 0) at 0x00-0x03 reflects that HID
+# defines those four usages as status conditions (no-event, ErrorRollOver,
+# POSTFail, ErrorUndefined), not physical keys -- consistent with
+# docs/PROTOCOL.md §6.15's own reservation of usages 0x00-0x03 in the KEYBOARD
+# message's `keys[]` bitmap. KEY_UNKNOWN (code 240) marks a slot the kernel
+# array itself leaves unmapped (`unk` in the source); it is not this file
+# inventing a fallback -- it is what the kernel does.
+#
+# One evdev value, KEY_DELETE (111), appears at THREE indices in the source
+# array -- 0x4C ("Delete Forward"), 0x9C, and 0xD8, both of the latter two
+# being HID-reserved indices in the 0x82-0xDF gap that the kernel
+# nonetheless assigns; see the data rows below for all three. That is the
+# kernel array's own choice, reproduced faithfully rather than "corrected".
+# (Corrected 2026-08-25: this comment previously said "0x9C appears twice",
+# citing only 0x4C and 0x9C and omitting 0xD8 -- the data rows were always
+# right, only this prose was stale. See references/hid/README.md for the
+# note on the correction.)
+#
+# No value in this file was inferred, guessed, or filled in from memory --
+# every row is a direct transcription of hid_keyboard[usage] followed by a
+# direct lookup of that numeric value's #define name in input-event-codes.h at
+# the same pinned tag. Where hid_keyboard[] and #define KEY_UNKNOWN disagreed
+# with the author's own recollection at any point during extraction, the
+# fetched source files won, per the blind-platform rule in docs/CONVENTIONS.md --
+# recollection was not used to fill anything here.
+0x00	KEY_RESERVED	0
+0x01	KEY_RESERVED	0
+0x02	KEY_RESERVED	0
+0x03	KEY_RESERVED	0
+0x04	KEY_A	30
+0x05	KEY_B	48
+0x06	KEY_C	46
+0x07	KEY_D	32
+0x08	KEY_E	18
+0x09	KEY_F	33
+0x0A	KEY_G	34
+0x0B	KEY_H	35
+0x0C	KEY_I	23
+0x0D	KEY_J	36
+0x0E	KEY_K	37
+0x0F	KEY_L	38
+0x10	KEY_M	50
+0x11	KEY_N	49
+0x12	KEY_O	24
+0x13	KEY_P	25
+0x14	KEY_Q	16
+0x15	KEY_R	19
+0x16	KEY_S	31
+0x17	KEY_T	20
+0x18	KEY_U	22
+0x19	KEY_V	47
+0x1A	KEY_W	17
+0x1B	KEY_X	45
+0x1C	KEY_Y	21
+0x1D	KEY_Z	44
+0x1E	KEY_1	2
+0x1F	KEY_2	3
+0x20	KEY_3	4
+0x21	KEY_4	5
+0x22	KEY_5	6
+0x23	KEY_6	7
+0x24	KEY_7	8
+0x25	KEY_8	9
+0x26	KEY_9	10
+0x27	KEY_0	11
+0x28	KEY_ENTER	28
+0x29	KEY_ESC	1
+0x2A	KEY_BACKSPACE	14
+0x2B	KEY_TAB	15
+0x2C	KEY_SPACE	57
+0x2D	KEY_MINUS	12
+0x2E	KEY_EQUAL	13
+0x2F	KEY_LEFTBRACE	26
+0x30	KEY_RIGHTBRACE	27
+0x31	KEY_BACKSLASH	43
+0x32	KEY_BACKSLASH	43
+0x33	KEY_SEMICOLON	39
+0x34	KEY_APOSTROPHE	40
+0x35	KEY_GRAVE	41
+0x36	KEY_COMMA	51
+0x37	KEY_DOT	52
+0x38	KEY_SLASH	53
+0x39	KEY_CAPSLOCK	58
+0x3A	KEY_F1	59
+0x3B	KEY_F2	60
+0x3C	KEY_F3	61
+0x3D	KEY_F4	62
+0x3E	KEY_F5	63
+0x3F	KEY_F6	64
+0x40	KEY_F7	65
+0x41	KEY_F8	66
+0x42	KEY_F9	67
+0x43	KEY_F10	68
+0x44	KEY_F11	87
+0x45	KEY_F12	88
+0x46	KEY_SYSRQ	99
+0x47	KEY_SCROLLLOCK	70
+0x48	KEY_PAUSE	119
+0x49	KEY_INSERT	110
+0x4A	KEY_HOME	102
+0x4B	KEY_PAGEUP	104
+0x4C	KEY_DELETE	111
+0x4D	KEY_END	107
+0x4E	KEY_PAGEDOWN	109
+0x4F	KEY_RIGHT	106
+0x50	KEY_LEFT	105
+0x51	KEY_DOWN	108
+0x52	KEY_UP	103
+0x53	KEY_NUMLOCK	69
+0x54	KEY_KPSLASH	98
+0x55	KEY_KPASTERISK	55
+0x56	KEY_KPMINUS	74
+0x57	KEY_KPPLUS	78
+0x58	KEY_KPENTER	96
+0x59	KEY_KP1	79
+0x5A	KEY_KP2	80
+0x5B	KEY_KP3	81
+0x5C	KEY_KP4	75
+0x5D	KEY_KP5	76
+0x5E	KEY_KP6	77
+0x5F	KEY_KP7	71
+0x60	KEY_KP8	72
+0x61	KEY_KP9	73
+0x62	KEY_KP0	82
+0x63	KEY_KPDOT	83
+0x64	KEY_102ND	86
+0x65	KEY_COMPOSE	127
+0x66	KEY_POWER	116
+0x67	KEY_KPEQUAL	117
+0x68	KEY_F13	183
+0x69	KEY_F14	184
+0x6A	KEY_F15	185
+0x6B	KEY_F16	186
+0x6C	KEY_F17	187
+0x6D	KEY_F18	188
+0x6E	KEY_F19	189
+0x6F	KEY_F20	190
+0x70	KEY_F21	191
+0x71	KEY_F22	192
+0x72	KEY_F23	193
+0x73	KEY_F24	194
+0x74	KEY_OPEN	134
+0x75	KEY_HELP	138
+0x76	KEY_PROPS	130
+0x77	KEY_FRONT	132
+0x78	KEY_STOP	128
+0x79	KEY_AGAIN	129
+0x7A	KEY_UNDO	131
+0x7B	KEY_CUT	137
+0x7C	KEY_COPY	133
+0x7D	KEY_PASTE	135
+0x7E	KEY_FIND	136
+0x7F	KEY_MUTE	113
+0x80	KEY_VOLUMEUP	115
+0x81	KEY_VOLUMEDOWN	114
+0x82	KEY_UNKNOWN	240
+0x83	KEY_UNKNOWN	240
+0x84	KEY_UNKNOWN	240
+0x85	KEY_KPCOMMA	121
+0x86	KEY_UNKNOWN	240
+0x87	KEY_RO	89
+0x88	KEY_KATAKANAHIRAGANA	93
+0x89	KEY_YEN	124
+0x8A	KEY_HENKAN	92
+0x8B	KEY_MUHENKAN	94
+0x8C	KEY_KPJPCOMMA	95
+0x8D	KEY_UNKNOWN	240
+0x8E	KEY_UNKNOWN	240
+0x8F	KEY_UNKNOWN	240
+0x90	KEY_HANGEUL	122
+0x91	KEY_HANJA	123
+0x92	KEY_KATAKANA	90
+0x93	KEY_HIRAGANA	91
+0x94	KEY_ZENKAKUHANKAKU	85
+0x95	KEY_UNKNOWN	240
+0x96	KEY_UNKNOWN	240
+0x97	KEY_UNKNOWN	240
+0x98	KEY_UNKNOWN	240
+0x99	KEY_UNKNOWN	240
+0x9A	KEY_UNKNOWN	240
+0x9B	KEY_UNKNOWN	240
+0x9C	KEY_DELETE	111
+0x9D	KEY_UNKNOWN	240
+0x9E	KEY_UNKNOWN	240
+0x9F	KEY_UNKNOWN	240
+0xA0	KEY_UNKNOWN	240
+0xA1	KEY_UNKNOWN	240
+0xA2	KEY_UNKNOWN	240
+0xA3	KEY_UNKNOWN	240
+0xA4	KEY_UNKNOWN	240
+0xA5	KEY_UNKNOWN	240
+0xA6	KEY_UNKNOWN	240
+0xA7	KEY_UNKNOWN	240
+0xA8	KEY_UNKNOWN	240
+0xA9	KEY_UNKNOWN	240
+0xAA	KEY_UNKNOWN	240
+0xAB	KEY_UNKNOWN	240
+0xAC	KEY_UNKNOWN	240
+0xAD	KEY_UNKNOWN	240
+0xAE	KEY_UNKNOWN	240
+0xAF	KEY_UNKNOWN	240
+0xB0	KEY_UNKNOWN	240
+0xB1	KEY_UNKNOWN	240
+0xB2	KEY_UNKNOWN	240
+0xB3	KEY_UNKNOWN	240
+0xB4	KEY_UNKNOWN	240
+0xB5	KEY_UNKNOWN	240
+0xB6	KEY_KPLEFTPAREN	179
+0xB7	KEY_KPRIGHTPAREN	180
+0xB8	KEY_UNKNOWN	240
+0xB9	KEY_UNKNOWN	240
+0xBA	KEY_UNKNOWN	240
+0xBB	KEY_UNKNOWN	240
+0xBC	KEY_UNKNOWN	240
+0xBD	KEY_UNKNOWN	240
+0xBE	KEY_UNKNOWN	240
+0xBF	KEY_UNKNOWN	240
+0xC0	KEY_UNKNOWN	240
+0xC1	KEY_UNKNOWN	240
+0xC2	KEY_UNKNOWN	240
+0xC3	KEY_UNKNOWN	240
+0xC4	KEY_UNKNOWN	240
+0xC5	KEY_UNKNOWN	240
+0xC6	KEY_UNKNOWN	240
+0xC7	KEY_UNKNOWN	240
+0xC8	KEY_UNKNOWN	240
+0xC9	KEY_UNKNOWN	240
+0xCA	KEY_UNKNOWN	240
+0xCB	KEY_UNKNOWN	240
+0xCC	KEY_UNKNOWN	240
+0xCD	KEY_UNKNOWN	240
+0xCE	KEY_UNKNOWN	240
+0xCF	KEY_UNKNOWN	240
+0xD0	KEY_UNKNOWN	240
+0xD1	KEY_UNKNOWN	240
+0xD2	KEY_UNKNOWN	240
+0xD3	KEY_UNKNOWN	240
+0xD4	KEY_UNKNOWN	240
+0xD5	KEY_UNKNOWN	240
+0xD6	KEY_UNKNOWN	240
+0xD7	KEY_UNKNOWN	240
+0xD8	KEY_DELETE	111
+0xD9	KEY_UNKNOWN	240
+0xDA	KEY_UNKNOWN	240
+0xDB	KEY_UNKNOWN	240
+0xDC	KEY_UNKNOWN	240
+0xDD	KEY_UNKNOWN	240
+0xDE	KEY_UNKNOWN	240
+0xDF	KEY_UNKNOWN	240
+0xE0	KEY_LEFTCTRL	29
+0xE1	KEY_LEFTSHIFT	42
+0xE2	KEY_LEFTALT	56
+0xE3	KEY_LEFTMETA	125
+0xE4	KEY_RIGHTCTRL	97
+0xE5	KEY_RIGHTSHIFT	54
+0xE6	KEY_RIGHTALT	100
+0xE7	KEY_RIGHTMETA	126
+0xE8	KEY_PLAYPAUSE	164
+0xE9	KEY_STOPCD	166
+0xEA	KEY_PREVIOUSSONG	165
+0xEB	KEY_NEXTSONG	163
+0xEC	KEY_EJECTCD	161
+0xED	KEY_VOLUMEUP	115
+0xEE	KEY_VOLUMEDOWN	114
+0xEF	KEY_MUTE	113
+0xF0	KEY_WWW	150
+0xF1	KEY_BACK	158
+0xF2	KEY_FORWARD	159
+0xF3	KEY_STOP	128
+0xF4	KEY_FIND	136
+0xF5	KEY_SCROLLUP	177
+0xF6	KEY_SCROLLDOWN	178
+0xF7	KEY_EDIT	176
+0xF8	KEY_SLEEP	142
+0xF9	KEY_COFFEE	152
+0xFA	KEY_REFRESH	173
+0xFB	KEY_CALC	140
+0xFC	KEY_UNKNOWN	240
+0xFD	KEY_UNKNOWN	240
+0xFE	KEY_UNKNOWN	240
+0xFF	KEY_UNKNOWN	240
