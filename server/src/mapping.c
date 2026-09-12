@@ -470,4 +470,41 @@ void apad_mapping_apply(const apad_input_state *in, uint32_t caps,
     if (caps & APAD_CAP_TOUCH) {
         apply_touch_regions(in, &p->touch, out);
     }
+
+    /*
+     * A wire button aimed at an analog trigger by the profile
+     * ("buttons": { "L": "LT" }, profiles.h's apad_btn_trigger_t): a held
+     * button is a full pull, digitally, exactly as §5.4's ZL/ZR fallback is.
+     *
+     * Runs LAST, after both the §5.4 block above and apply_touch_regions(),
+     * and combines by MAX rather than assignment -- which is what makes
+     * "the trigger is the largest of everything driving it" true no matter
+     * how many sources a profile wires up. Assigning here would let a
+     * released button stamp 0 over a real analog pull (a client WITH
+     * APAD_CAP_TRIGGERS that also maps a button to LT), and running before
+     * the §5.4 block would let that block overwrite this one. The touch
+     * region loop already takes a max into out->lt/rt for the same reason,
+     * so all three sources compose in any order of presence.
+     *
+     * Not gated on any capability bit: unlike touch and gyro substitution,
+     * the source here is a plain digital button the client already
+     * advertised by sending it, and §5.4's MUST-ignore rule is about the
+     * ZL/ZR bits specifically -- which profiles.h deliberately keeps out of
+     * the remappable set, so nothing here can contradict it.
+     */
+    for (i = 0; i < APAD_PROFILE_BTN_COUNT; i++) {
+        int16_t *dst;
+
+        if (p->btn_trigger[i] == (uint8_t)APAD_BTN_TRIGGER_NONE) {
+            continue;
+        }
+        if ((in->buttons & apad_profile_wire_btn_bits[i]) == 0u) {
+            continue;
+        }
+        dst = (p->btn_trigger[i] == (uint8_t)APAD_BTN_TRIGGER_LT) ? &out->lt
+                                                                  : &out->rt;
+        if ((int16_t)APAD_TRIGGER_MAX > *dst) {
+            *dst = (int16_t)APAD_TRIGGER_MAX;
+        }
+    }
 }

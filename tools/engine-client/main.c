@@ -54,6 +54,22 @@
  *                         same run measures §6.20's 10 Hz held-repeat floor
  *                         from the only side that can measure it.
  *
+ * --hold <BTN>           optional, default (target) mode only: ORs one wire
+ *                         button into EVERY frame this tool sends, held for
+ *                         the whole run. <BTN> is a wire (Nintendo-
+ *                         convention) button name -- A B X Y L R L3 R3
+ *                         START SELECT HOME ZL ZR -- matching the names a
+ *                         profile's "buttons" map uses (server/src/
+ *                         profiles.c's apad_profile_wire_btn_names, plus
+ *                         ZL/ZR which are not remappable but ARE the §5.4
+ *                         trigger fallback). Exists so a server-side
+ *                         mapping that only fires while a button is DOWN
+ *                         can be watched in evtest for as long as it takes
+ *                         to read it -- e.g. a profile with
+ *                         "buttons": { "L": "LT" }, whose ABS_Z should sit
+ *                         at max for the whole run. fill_input() below
+ *                         otherwise only ever sends A and B.
+ *
  * --device-name <name>   optional, default (target) mode only: overrides the
  *                         HELLO device_name this tool advertises, which is
  *                         otherwise hardcoded to "AtticPad 3DS engine-client"
@@ -104,6 +120,36 @@ static void sleep_ms(unsigned ms) {
     nanosleep(&ts, NULL);
 }
 
+/* --hold: ORed into every frame. 0 (the default) changes nothing. */
+static uint32_t g_hold_buttons;
+
+/* Wire button names, for --hold. Deliberately a local table rather than an
+ * include of server/src/profiles.h: this is a CLIENT tool and must not link
+ * server code. The 11 remappable names match that file's
+ * apad_profile_wire_btn_names[] exactly; ZL/ZR are here too because the
+ * "no APAD_CAP_TRIGGERS -> ZL/ZR drive LT/RT" fallback is worth being able
+ * to drive from the same flag. */
+static const struct { const char *name; uint32_t bit; } k_wire_buttons[] = {
+    { "A", APAD_BTN_A },       { "B", APAD_BTN_B },
+    { "X", APAD_BTN_X },       { "Y", APAD_BTN_Y },
+    { "L", APAD_BTN_L },       { "R", APAD_BTN_R },
+    { "ZL", APAD_BTN_ZL },     { "ZR", APAD_BTN_ZR },
+    { "L3", APAD_BTN_L3 },     { "R3", APAD_BTN_R3 },
+    { "START", APAD_BTN_START },
+    { "SELECT", APAD_BTN_SELECT },
+    { "HOME", APAD_BTN_HOME }
+};
+
+static uint32_t wire_button_from_name(const char *name) {
+    size_t i;
+    for (i = 0; i < sizeof k_wire_buttons / sizeof k_wire_buttons[0]; i++) {
+        if (strcmp(k_wire_buttons[i].name, name) == 0) {
+            return k_wire_buttons[i].bit;
+        }
+    }
+    return 0u;
+}
+
 /* Same idea as loopback-client's build_input_state: distinctive, varying
  * values so a human watching evtest (or the server log) can tell frames
  * apart — but built as the ENGINE'S CALLER would build it, and left to the
@@ -112,6 +158,7 @@ static void fill_input(apad_input_state *st, unsigned iter) {
     memset(st, 0, sizeof *st);
     st->buttons = (iter % 2u == 0u) ? (APAD_BTN_A | APAD_BTN_DPAD_RIGHT)
                                     : APAD_BTN_B;
+    st->buttons |= g_hold_buttons;
     /* Computed in int32 and subtracted in range: S9 warns off the
      * unsigned-wrap-then-narrow construct (C99 6.3.1.3p3). */
     st->axes[0] = (int16_t)((int32_t)((iter * 997u) % 65536u) - 32768); /* LX sweep */
@@ -879,7 +926,8 @@ int main(int argc, char **argv) {
     if (argc < 4 || strcmp(argv[1], "--target") != 0) {
         fprintf(stderr,
                 "usage: %s --target <ip> <port> [iters [--secret <pin>]] "
-                "[--kbm [attach_wait_ms]] [--device-name <name>]\n"
+                "[--kbm [attach_wait_ms]] [--device-name <name>] "
+                "[--hold <BTN>]\n"
                 "       %s --inputcaps-reorder [scratch_port]\n"
                 "       %s --release-on-clear [scratch_port]\n",
                 argv[0], argv[0], argv[0]);
@@ -893,6 +941,16 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[a], "--device-name") == 0 && a + 1 < argc) {
             device_name = argv[a + 1];
+            a++;
+        } else if (strcmp(argv[a], "--hold") == 0 && a + 1 < argc) {
+            g_hold_buttons = wire_button_from_name(argv[a + 1]);
+            if (g_hold_buttons == 0u) {
+                fprintf(stderr, "--hold: unknown wire button \"%s\"\n",
+                        argv[a + 1]);
+                return 2;
+            }
+            printf("holding wire button %s (0x%05lx) for the whole run\n",
+                   argv[a + 1], (unsigned long)g_hold_buttons);
             a++;
         }
     }

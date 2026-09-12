@@ -86,6 +86,20 @@ const char *apad_pad_btn_name(uint16_t bit)
     return "NONE";   /* an unrecognised bit has no name to give back */
 }
 
+const char *apad_profile_btn_target_name(const struct apad_profile *p, int index)
+{
+    if (p == NULL || index < 0 || index >= APAD_PROFILE_BTN_COUNT) {
+        return "NONE";
+    }
+    if (p->btn_trigger[index] == (uint8_t)APAD_BTN_TRIGGER_LT) {
+        return "LT";
+    }
+    if (p->btn_trigger[index] == (uint8_t)APAD_BTN_TRIGGER_RT) {
+        return "RT";
+    }
+    return apad_pad_btn_name(p->btn_pad_bit[index]);
+}
+
 /* ---- the built-in fallback ---------------------------------------------*/
 
 static void set_builtin_default(apad_profile *p)
@@ -100,6 +114,7 @@ static void set_builtin_default(apad_profile *p)
      * X(top)->Y, Y(left)->X. Identical to mapping.c's pre-profile table. */
     for (i = 0; i < APAD_PROFILE_BTN_COUNT; i++) {
         p->btn_pad_bit[i] = 0;
+        p->btn_trigger[i] = (uint8_t)APAD_BTN_TRIGGER_NONE;
     }
     p->btn_pad_bit[0] = APAD_PADBTN_B;      /* A */
     p->btn_pad_bit[1] = APAD_PADBTN_A;      /* B */
@@ -241,10 +256,22 @@ static void read_buttons(const json_value *buttons, apad_profile *p, const char 
         }
         if (strcmp(name, "NONE") == 0) {
             p->btn_pad_bit[i] = 0;
+            p->btn_trigger[i] = (uint8_t)APAD_BTN_TRIGGER_NONE;
+            continue;
+        }
+        /* The analog triggers are not pad BITS (see apad_btn_trigger_t in
+         * profiles.h), so they cannot come out of pad_bit_from_name() --
+         * they are their own target, held alongside btn_pad_bit and
+         * combined by mapping.c with every other source of that trigger. */
+        if (strcmp(name, "LT") == 0 || strcmp(name, "RT") == 0) {
+            p->btn_pad_bit[i] = 0;
+            p->btn_trigger[i] = (uint8_t)((name[0] == 'L') ? APAD_BTN_TRIGGER_LT
+                                                           : APAD_BTN_TRIGGER_RT);
             continue;
         }
         if (pad_bit_from_name(name, &bit)) {
             p->btn_pad_bit[i] = bit;
+            p->btn_trigger[i] = (uint8_t)APAD_BTN_TRIGGER_NONE;
         } else {
             apad_logf(g_log, APAD_LOG_WARN,
                                     "profiles: %s: unrecognised pad button "

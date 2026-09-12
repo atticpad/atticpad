@@ -225,6 +225,26 @@ build_server() {
       -lm -o "${BUILD_DIR}/server/stick-shape-test"
   "${BUILD_DIR}/server/stick-shape-test"
 
+  # A profile may aim a wire BUTTON at an analog trigger ("buttons": {"L":
+  # "LT"}), which is the only route to LT/RT on a device with no ZL/ZR and
+  # no touchscreen (a PSP). The failure this guards is silent in both
+  # directions: a trigger that never moves, or -- worse -- a released button
+  # stamping 0 over a real analog pull because the sources were assigned
+  # rather than combined by max.
+  log "server: trigger-button guard (scripts/support/trigger_button_test.c — a profile may map a button to LT/RT, max-combined with every other source)"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      -I"${REPO_ROOT}/server/include" -I"${REPO_ROOT}/server/src" \
+      "${HERE}/support/trigger_button_test.c" \
+      "${CORE_SRC}/codec.c" "${CORE_SRC}/hmac_sha256.c" \
+      "${CORE_SRC}/seq.c" "${CORE_SRC}/session.c" \
+      "${SHIM}/net_bsd.c" "${SHIM}/time_posix.c" \
+      "${REPO_ROOT}/server/src/server.c" "${REPO_ROOT}/server/src/mapping.c" \
+      "${REPO_ROOT}/server/src/jsonc.c" "${REPO_ROOT}/server/src/profiles.c" \
+      "${REPO_ROOT}/server/src/pairing.c" "${REPO_ROOT}/server/src/kbm.c" \
+      -lm -o "${BUILD_DIR}/server/trigger-button-test"
+  "${BUILD_DIR}/server/trigger-button-test"
+
   log "server: compiling libapadserver + linux host -> atticpad-server (-std=c11 -Wall -Wextra -Werror, uinput backend)"
   mkdir -p "${BUILD_DIR}/server"
   "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \

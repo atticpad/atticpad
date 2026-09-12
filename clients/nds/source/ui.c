@@ -756,16 +756,24 @@ static int line_box_px(float scale)
     return (h > 0) ? h : 1;
 }
 
+/* One character's advance at the given face. Split out of text_width() so a
+ * caller that has to stop PART WAY along a string (ui_header_ex()'s title
+ * shortening) can accumulate the same arithmetic in one forward pass instead
+ * of re-measuring a shrinking copy. */
+static int glyph_adv(unsigned char c, int px, int bold)
+{
+    int g = (c >= FONT_FIRST && c < FONT_FIRST + FONT_COUNT)
+            ? (c - FONT_FIRST) : ('?' - FONT_FIRST);
+
+    return s_adv[g] * px + bold;
+}
+
 static int text_width(const char *s, int px, int bold)
 {
     int w = 0;
 
     for (; *s != '\0'; s++) {
-        unsigned char c = (unsigned char)*s;
-        int g = (c >= FONT_FIRST && c < FONT_FIRST + FONT_COUNT)
-                ? (c - FONT_FIRST) : ('?' - FONT_FIRST);
-
-        w += s_adv[g] * px + bold;
+        w += glyph_adv((unsigned char)*s, px, bold);
     }
     return w;
 }
@@ -972,6 +980,29 @@ static void draw_scratch(float x, float y, float scale, uint32_t colour,
         dx -= w;
     }
     draw_string(dx, dy, s_scratch, px, bold, col);
+}
+
+/* draw_scratch() for a caller that already has a plain string AND has already
+ * worked out its width limit in DS pixels. ui_textf_fit() would take that
+ * limit in 3DS pixels and scale it back down, and a caller that MEASURED in
+ * DS pixels (ui_header_ex()) would then be handing its own numbers through a
+ * lossy round trip -- a one-pixel wider cap than the layout it just computed.
+ * Same "%s" copy ui_textf_fit()'s callers get from format_scratch(). */
+static void draw_text_ds(float x, float y, float scale, uint32_t colour,
+                         int align, int max_w_ds, const char *s)
+{
+    size_t n;
+
+    if (s == NULL) {
+        s = "(null)";
+    }
+    n = strlen(s);
+    if (n > sizeof s_scratch - 1u) {
+        n = sizeof s_scratch - 1u;
+    }
+    memcpy(s_scratch, s, n);
+    s_scratch[n] = '\0';
+    draw_scratch(x, y, scale, colour, align, max_w_ds);
 }
 
 /* Formats into s_scratch, with two fast paths that matter a great deal here.
@@ -1304,27 +1335,135 @@ void ui_button(const ui_box *b, const char *label, int pressed, int accent)
                  UI_S_BODY, ink, UI_ALIGN_CENTER, b->w - 8.0f, "%s", label);
 }
 
+/* ------------------------------------------------------------------------ */
+/* header                                                                   */
+/* ------------------------------------------------------------------------ */
+
+/* THE TITLE AND THE STATUS SHARE ONE 256px ROW, and until this pass they were
+ * placed by two fixed fractions of the width -- title 58%, status 40% -- that
+ * add up to 98%. That leaves three DS pixels between them at the top screen's
+ * widest, and reaches even that by truncating BOTH. On the self-test result
+ * screen it read as one collided line: "AtticPad -- self-tes" against a green
+ * "All checks pas" with no gap (melonDS 1.1, DSi mode, 2026-09-12).
+ *
+ * They are MEASURED against each other now. The status is the live field --
+ * the only part of the header that changes -- so it keeps the room it needs
+ * and stays right-aligned, and the TITLE gives way: first by dropping the
+ * constant "AtticPad -- " / "AtticPad " branding (every screen's header
+ * carries it), then by truncating with a ".." marker. Integer throughout,
+ * one forward pass per string, nothing allocated. */
+
+/* The clear space kept between title and status: one full glyph CELL of the
+ * header face, not the 4px advance of a space -- the point is that the eye
+ * reads two separate fields. */
+#define HEADER_GAP_CELLS 1
+
+/* Fits `title` into `budget_ds` DS pixels at the header face. Returns what to
+ * draw: `title` itself, a pointer INTO it past the branding, or `buf` holding
+ * a truncated copy. NULL means there is not room for even one character plus
+ * the ".." marker, and the title is dropped so the status keeps the row. */
+static const char *header_title_fit(const char *title, int budget_ds,
+                                    int px, int bold, char *buf, size_t cap)
+{
+    static const char *const kBrand[] = { "AtticPad -- ", "AtticPad " };
+    const char *src = title;
+    int dots, avail, w;
+    size_t i, n;
+
+    if (title == NULL || budget_ds <= 0) {
+        return NULL;
+    }
+    if (text_width(title, px, bold) <= budget_ds) {
+        return title;
+    }
+    for (i = 0u; i < sizeof kBrand / sizeof kBrand[0]; i++) {
+        size_t len = strlen(kBrand[i]);
+
+        if (strncmp(title, kBrand[i], len) == 0 && title[len] != '\0') {
+            src = title + len;
+            if (text_width(src, px, bold) <= budget_ds) {
+                return src;
+            }
+            break;   /* longest brand first; a shorter one cuts no further */
+        }
+    }
+
+    /* Still too wide: keep the leading characters that fit alongside "..".
+     * Accumulated forward with glyph_adv() rather than re-measuring a
+     * shrinking string, so this stays linear on a CPU that redraws the row
+     * every other frame. */
+    dots  = text_width("..", px, bold);
+    avail = budget_ds - dots;
+    if (avail <= 0) {
+        return NULL;
+    }
+    w = 0;
+    n = 0u;
+    while (src[n] != '\0' && n + 3u <= cap) {
+        int gw = glyph_adv((unsigned char)src[n], px, bold);
+
+        if (w + gw > avail) {
+            break;
+        }
+        w += gw;
+        n++;
+    }
+    while (n > 0u && src[n - 1u] == ' ') {
+        n--;   /* the marker sits against the last letter, not a space */
+    }
+    if (n == 0u) {
+        return NULL;
+    }
+    memcpy(buf, src, n);
+    buf[n]      = '.';
+    buf[n + 1u] = '.';
+    buf[n + 2u] = '\0';
+    return buf;
+}
+
 void ui_header_ex(float width, const char *title, const char *right,
                   uint32_t right_colour, float right_pad)
 {
     const float h = 22.0f;
-    float text_right = width - 6.0f - right_pad;
-    /* right_pad is already subtracted from text_right (it moves the right
-     * text's right edge left of the battery glyph). It must NOT also be
-     * subtracted from the width cap, or the state text gets squeezed twice:
-     * with BATT_RESERVE_PX=72 that cut "not connected" to "not con" even
-     * though there was room to its left. The cap only exists to keep the
-     * right text clear of the LEFT title, which right_pad has nothing to do
-     * with. right_pad==0 callers are unaffected (0.40*width either way). */
-    float text_max_w = width * 0.40f;
+    /* right_pad moves the status's right EDGE left of the battery glyph
+     * ui_widgets.c draws there. It is not a width cap: an earlier version
+     * subtracted it twice and cut "not connected" to "not con" with room to
+     * spare on its left. */
+    const float text_right = width - 6.0f - right_pad;
+    char        buf[64];
+    const char *draw_title;
+    int px, bold;
+    int left_ds, right_ds, room, right_w, gap, budget;
 
     ui_rect(0.0f, 0.0f, width, h, ui_c_panel());
     ui_rect(0.0f, h - 1.0f, width, 1.0f, ui_c_border());
-    ui_textf_fit(6.0f, 2.0f, UI_S_BODY, ui_c_text(), UI_ALIGN_LEFT,
-                 width * 0.58f - 6.0f, "%s", title);
-    if (right != NULL && text_max_w > 0.0f) {
-        ui_textf_fit(text_right, 2.0f, UI_S_BODY, right_colour,
-                     UI_ALIGN_RIGHT, text_max_w, "%s", right);
+
+    /* Everything below is DS pixels: the two strings are laid out against
+     * each other, not against the caller's 3DS width, so measuring in the
+     * space they are actually drawn in is the only way the gap is real. */
+    face_for(UI_S_BODY, &px, &bold);
+    left_ds  = sx(f2i(6.0f));
+    right_ds = sx(f2i(text_right));
+    room     = right_ds - left_ds;      /* the whole usable row */
+    if (room < 0) {
+        room = 0;
+    }
+
+    right_w = (right != NULL) ? text_width(right, px, bold) : 0;
+    if (right_w > room) {
+        right_w = room;   /* a pathological status truncates, never overruns */
+    }
+    gap    = (right_w > 0) ? (HEADER_GAP_CELLS * 8 * px) : 0;
+    budget = room - right_w - gap;
+
+    draw_title = header_title_fit(title, budget, px, bold, buf, sizeof buf);
+    if (draw_title != NULL) {
+        draw_text_ds(6.0f, 2.0f, UI_S_BODY, ui_c_text(), UI_ALIGN_LEFT,
+                     budget, draw_title);
+    }
+    if (right != NULL && room > 0) {
+        draw_text_ds(text_right, 2.0f, UI_S_BODY, right_colour,
+                     UI_ALIGN_RIGHT, room, right);
     }
 }
 

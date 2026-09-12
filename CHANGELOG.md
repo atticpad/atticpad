@@ -57,6 +57,11 @@ wire format is AtticPad protocol **v1, frozen** — see `docs/PROTOCOL.md`.
   `docs/SUPPORT-TIERS.md`, `docs/INSTALL.md` and `docs/SETUP-DS.md` for
   the open-or-WEP constraint of DS mode.
 
+- **A profile can map a button to a trigger.** `"L": "LT"` in a profile's
+  buttons map gives a device with no analog triggers, such as the PSP, a
+  full-pull LT while the button is held; the web editor offers LT and RT
+  in the button dropdown.
+
 ### Changed
 
 - **Discovery on the 3DS and DS prefers the server you last used.** When

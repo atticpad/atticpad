@@ -590,6 +590,8 @@ A DS has no analog stick and a touchscreen; a PSP has one stick; a Vita has two 
 }
 ```
 
+A `"buttons"` value is normally a digital pad button (`"A"`, `"LB"`, ..., or `"NONE"` to drop it), but `"LT"` and `"RT"` are also valid: a wire button aimed at one drives that analog trigger to a full digital pull while held, combined by max with any real analog value or touch region driving the same trigger — which is the only way to reach a trigger on a device that has neither ZL/ZR nor a touchscreen (a PSP).
+
 Supported modes: direct button mapping; touch regions to buttons with optional analog pressure from depth-into-region; touch delta to right stick with return-to-center; absolute touch to right stick; gyro to right stick (essential on Old 3DS, which has no second stick); chorded macros; per-axis deadzone, curve, and inversion.
 
 **Config format: JSON with comments (JSONC).** Reasoning:
