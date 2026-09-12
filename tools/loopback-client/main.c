@@ -1117,6 +1117,323 @@ static void target_bye(apad_session *sess, apad_sock *client_sock, const apad_ad
     }
     apad_session_close(sess, APAD_CLOSE_LOCAL);
 }
+/* ========================================================================
+ * --kbm mode: docs/PROTOCOL.md §6.15-§6.19 (KEYBOARD/MOUSE/MEDIA/INPUTCAPS)
+ * against a REAL, separately-run server process over a real UDP socket --
+ * the socket path tools/server-harness structurally cannot reach (it drives
+ * libapadserver in-process with a fake clock and no socket at all; see that
+ * tool's own header for exactly what IT reaches instead).
+ *
+ * Connects, waits for INPUTCAPS and prints its bits, sends a key down/up, a
+ * mouse move, a wheel detent, and a media press, then asserts no ERROR came
+ * back and the session is still alive (a final PING/PONG round trip).
+ *
+ * Whether INPUTCAPS ever arrives, and which features it advertises, depends
+ * entirely on the SERVER BACKEND under test (§6.19: "Skipped entirely when
+ * this backend has nothing to advertise" -- e.g. a uinput backend with no
+ * /dev/uinput access, or a backend that predates §6.15-§6.19 entirely). This
+ * mode does not fail the run over that alone -- it prints a NOTE and keeps
+ * going, because "no ERROR / session stayed alive" is meaningful and
+ * checkable independent of whether the facility is actually wired up on the
+ * far end. See main()'s summary line for exactly what was and was not
+ * verified on a given run.
+ * ======================================================================== */
+
+/* Set bit for HID usage `u` in a 32-byte §6.15 keys[] bitmap -- same rule as
+ * server-harness's own key_set(), duplicated rather than shared: the two
+ * tools are deliberately separate binaries (docs/DESIGN.md D7) with no shared
+ * source beyond core/. */
+static void kbm_key_set(uint8_t keys[APAD_KEY_BITMAP_BYTES], uint8_t usage) {
+    keys[APAD_KEY_BYTE(usage)] |= APAD_KEY_MASK(usage);
+}
+
+/* Send one §6.15-§6.17 datagram (KEYBOARD/MOUSE/MEDIA are all UNRELIABLE,
+ * S4 -- no retransmit loop needed, a single apad_session_next_header +
+ * apad_packet_build + apad_udp_send + apad_session_on_sent is the whole
+ * send side, same shape target_ping()'s PING already uses). */
+static int send_keyboard(apad_session *sess, apad_sock *sock, const apad_addr *target,
+                         const apad_keyboard *kb) {
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint8_t payload[APAD_LEN_KEYBOARD];
+    apad_header hdr;
+    int n;
+
+    if (apad_encode_keyboard(payload, sizeof payload, kb) != (int)APAD_LEN_KEYBOARD) {
+        return 0;
+    }
+    if (apad_session_next_header(sess, (uint8_t)APAD_MSG_KEYBOARD, &hdr) != APAD_OK) {
+        return 0;
+    }
+    n = apad_packet_build(buf, sizeof buf, &hdr, payload, (uint16_t)sizeof payload, NULL, 0);
+    if (n < 0) {
+        return 0;
+    }
+    (void)apad_udp_send(sock, target, buf, (size_t)n);
+    apad_session_on_sent(sess, &hdr, apad_ticks_ms());
+    return 1;
+}
+
+static int send_mouse(apad_session *sess, apad_sock *sock, const apad_addr *target,
+                      const apad_mouse *mo) {
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint8_t payload[APAD_LEN_MOUSE];
+    apad_header hdr;
+    int n;
+
+    if (apad_encode_mouse(payload, sizeof payload, mo) != (int)APAD_LEN_MOUSE) {
+        return 0;
+    }
+    if (apad_session_next_header(sess, (uint8_t)APAD_MSG_MOUSE, &hdr) != APAD_OK) {
+        return 0;
+    }
+    n = apad_packet_build(buf, sizeof buf, &hdr, payload, (uint16_t)sizeof payload, NULL, 0);
+    if (n < 0) {
+        return 0;
+    }
+    (void)apad_udp_send(sock, target, buf, (size_t)n);
+    apad_session_on_sent(sess, &hdr, apad_ticks_ms());
+    return 1;
+}
+
+static int send_media(apad_session *sess, apad_sock *sock, const apad_addr *target,
+                      const apad_media *me) {
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint8_t payload[APAD_LEN_MEDIA];
+    apad_header hdr;
+    int n;
+
+    if (apad_encode_media(payload, sizeof payload, me) != (int)APAD_LEN_MEDIA) {
+        return 0;
+    }
+    if (apad_session_next_header(sess, (uint8_t)APAD_MSG_MEDIA, &hdr) != APAD_OK) {
+        return 0;
+    }
+    n = apad_packet_build(buf, sizeof buf, &hdr, payload, (uint16_t)sizeof payload, NULL, 0);
+    if (n < 0) {
+        return 0;
+    }
+    (void)apad_udp_send(sock, target, buf, (size_t)n);
+    apad_session_on_sent(sess, &hdr, apad_ticks_ms());
+    return 1;
+}
+
+/* Drains whatever arrives for `window_ms`, answering any server-originated
+ * PING (S6.6) and flagging an ERROR if one comes back. Returns 1 iff no
+ * ERROR was seen. */
+static int drain_watching_for_error(apad_session *sess, apad_sock *sock,
+                                    const apad_addr *target, unsigned window_ms) {
+    uint32_t start = apad_ticks_ms();
+    int ok = 1;
+
+    for (;;) {
+        uint8_t rbuf[APAD_MAX_DATAGRAM];
+        apad_addr from;
+        int rn;
+
+        if (apad_time_since(apad_ticks_ms(), start) > window_ms) {
+            break;
+        }
+        rn = apad_udp_recv(sock, &from, rbuf, sizeof rbuf, 100);
+        if (rn <= 0) {
+            continue;
+        }
+        {
+            apad_packet pkt;
+            memset(&pkt, 0, sizeof pkt);
+            if (apad_packet_parse(rbuf, (size_t)rn, &pkt) < 0) {
+                continue;
+            }
+            answer_if_server_ping(sess, sock, target, &pkt);
+            (void)apad_session_on_recv(sess, &pkt, apad_ticks_ms());
+            if (pkt.header.type == (uint8_t)APAD_MSG_ERROR) {
+                uint16_t code = 0xFFFFu;
+                apad_error e;
+                memset(&e, 0, sizeof e);
+                if (apad_decode_error(pkt.payload, pkt.payload_len, &e) >= 0) {
+                    code = e.code;
+                }
+                printf("  [FAIL] unexpected ERROR (code=%u) received\n", (unsigned)code);
+                ok = 0;
+            }
+        }
+    }
+    return ok;
+}
+
+static int target_kbm_mode(const char *ip_text, const char *port_text) {
+    apad_sock *client_sock;
+    apad_addr target;
+    apad_session sess;
+    target_hello_result hello_result;
+    uint16_t port;
+    int pairing_required = 0;
+    int discover_ok, welcome_ok, no_error, pong_ok, success;
+    int have_inputcaps = 0;
+    apad_inputcaps ic;
+    uint32_t wait_start;
+
+    port = (uint16_t)atoi(port_text);
+    if (apad_addr_parse(&target, ip_text, port) != APAD_OK) {
+        printf("could not parse target address '%s'\n", ip_text);
+        return 1;
+    }
+
+    printf("== AtticPad loopback-client: --kbm mode, %s:%u ==\n", ip_text, (unsigned)port);
+    printf("(docs/PROTOCOL.md S6.15-S6.19: connect, wait for INPUTCAPS, send a key\n"
+           " down/up, a mouse move, a wheel detent, a media press -- assert no ERROR\n"
+           " came back and the session stayed alive. Real UDP socket throughout.)\n\n");
+
+    if (apad_net_init() != APAD_OK) {
+        printf("apad_net_init failed\n");
+        return 1;
+    }
+    client_sock = apad_udp_open(0);
+    check(client_sock != NULL, "apad_udp_open (client)");
+    if (client_sock == NULL) {
+        return 1;
+    }
+
+    g_server_ping_answered = 0;
+    apad_session_init(&sess, 0 /* is_server */, apad_ticks_ms());
+
+    printf("-- DISCOVER / ANNOUNCE (S7) --\n");
+    discover_ok = target_discover(client_sock, &target, &pairing_required);
+    check(discover_ok, "DISCOVER/ANNOUNCE");
+    if (pairing_required) {
+        printf("NOTE: server reports pairing_required=1. This tool has no PIN-entry "
+               "path; HELLO is still attempted, but on an AUTH_REQUIRED session "
+               "INPUTCAPS will not arm until a tagged datagram verifies (S6.19 "
+               "Delivery), which this client cannot produce without the PIN. If "
+               "INPUTCAPS never arrives below, this is why -- not a protocol "
+               "violation.\n");
+    }
+
+    printf("\n-- HELLO / WELCOME / ACK (S6.3/S6.4/S9) --\n");
+    memset(&hello_result, 0, sizeof hello_result);
+    welcome_ok = target_hello(&sess, client_sock, &target, &hello_result);
+    check(welcome_ok, "HELLO -> WELCOME (session established, ACK sent)");
+    if (!welcome_ok) {
+        apad_udp_close(client_sock);
+        printf("\n--kbm result: FAIL (welcome_ok=0)\n");
+        return 1;
+    }
+    printf("adopted session_id=%u pad_slot=%u\n",
+           (unsigned)sess.session_id, (unsigned)sess.pad_slot);
+
+    printf("\n-- waiting for INPUTCAPS (S6.19 Delivery: 'Not before the ACK that "
+           "discharges WELCOME', three copies ~250ms apart) --\n");
+    memset(&ic, 0, sizeof ic);
+    wait_start = apad_ticks_ms();
+    for (;;) {
+        uint8_t rbuf[APAD_MAX_DATAGRAM];
+        apad_addr from;
+        int rn;
+
+        if (apad_time_since(apad_ticks_ms(), wait_start) > 3000u) {
+            break;
+        }
+        rn = apad_udp_recv(client_sock, &from, rbuf, sizeof rbuf, 200);
+        if (rn <= 0) {
+            continue;
+        }
+        {
+            apad_packet pkt;
+            memset(&pkt, 0, sizeof pkt);
+            if (apad_packet_parse(rbuf, (size_t)rn, &pkt) < 0) {
+                continue;
+            }
+            answer_if_server_ping(&sess, client_sock, &target, &pkt);
+            (void)apad_session_on_recv(&sess, &pkt, apad_ticks_ms());
+            if (pkt.header.type == (uint8_t)APAD_MSG_INPUTCAPS
+                && apad_decode_inputcaps(pkt.payload, pkt.payload_len, &ic) >= 0) {
+                have_inputcaps = 1;
+                break;
+            }
+        }
+    }
+    if (have_inputcaps) {
+        printf("  [PASS] INPUTCAPS received: features=0x%08x status=0x%08x "
+               "media_mask=0x%08x mouse_rate_hz=%u\n",
+               (unsigned)ic.features, (unsigned)ic.status,
+               (unsigned)ic.media_mask, (unsigned)ic.mouse_rate_hz);
+        printf("         KEYBOARD=%s MOUSE=%s MEDIA=%s\n",
+               (ic.features & APAD_KBM_FEATURE_KEYBOARD) ? "yes" : "no",
+               (ic.features & APAD_KBM_FEATURE_MOUSE)    ? "yes" : "no",
+               (ic.features & APAD_KBM_FEATURE_MEDIA)    ? "yes" : "no");
+    } else {
+        printf("  NOTE: no INPUTCAPS arrived within 3000ms. Either this server's "
+               "backend advertises no KBM support at all (S6.19: 'Skipped entirely "
+               "when this backend has nothing to advertise'), or (see the "
+               "pairing_required NOTE above) this session never authenticated. "
+               "Continuing -- the datagrams below are sent regardless (a real "
+               "non-conforming client could do the same), and 'no ERROR / session "
+               "alive' is still meaningful without INPUTCAPS ever having arrived.\n");
+    }
+
+    printf("\n-- sending a key down/up, a mouse move + wheel detent, a media "
+           "press (S6.15-S6.17) --\n");
+    {
+        apad_keyboard kb;
+        apad_mouse mo;
+        apad_media me;
+
+        memset(&kb, 0, sizeof kb);
+        kbm_key_set(kb.keys, APAD_HID_KEY_A);
+        kb.event_seq = 1u;
+        kb.events[7].usage = APAD_HID_KEY_A;
+        kb.events[7].flags = APAD_KBM_EVENT_DOWN;
+        kb.client_ticks_ms = apad_ticks_ms();
+        check(send_keyboard(&sess, client_sock, &target, &kb), "sent KEYBOARD: A down");
+
+        memset(&kb, 0, sizeof kb);
+        kb.event_seq = 2u;
+        kb.events[7].usage = APAD_HID_KEY_A;
+        kb.events[7].flags = 0u;   /* release */
+        kb.client_ticks_ms = apad_ticks_ms();
+        check(send_keyboard(&sess, client_sock, &target, &kb), "sent KEYBOARD: A up");
+
+        memset(&mo, 0, sizeof mo);
+        mo.dx_accum = 50u;   /* first MOUSE of this session: baseline + a move request */
+        mo.client_ticks_ms = apad_ticks_ms();
+        check(send_mouse(&sess, client_sock, &target, &mo), "sent MOUSE: move (dx=+50)");
+
+        mo.wheel_accum = 1u;   /* one detent, dx unchanged from the packet above */
+        mo.client_ticks_ms = apad_ticks_ms();
+        check(send_mouse(&sess, client_sock, &target, &mo), "sent MOUSE: wheel detent");
+
+        memset(&me, 0, sizeof me);
+        me.held = APAD_MEDIA_BIT(APAD_MEDIA_PLAY_PAUSE);
+        me.event_seq = 1u;
+        me.events[3].control = (uint8_t)APAD_MEDIA_PLAY_PAUSE;
+        me.events[3].flags = APAD_KBM_EVENT_DOWN;
+        me.client_ticks_ms = apad_ticks_ms();
+        check(send_media(&sess, client_sock, &target, &me), "sent MEDIA: PLAY_PAUSE press");
+    }
+
+    printf("\n-- draining 500ms, watching for ERROR --\n");
+    no_error = drain_watching_for_error(&sess, client_sock, &target, 500u);
+    check(no_error, "no ERROR datagram came back for any of the five sends above");
+
+    printf("\n-- PING / PONG liveness probe (S6.6) --\n");
+    pong_ok = target_ping(&sess, client_sock, &target);
+    check(pong_ok, "PING -> PONG: the session is still alive after the KBM traffic");
+
+    printf("\n-- BYE (S6.5), best-effort --\n");
+    target_bye(&sess, client_sock, &target);
+
+    apad_udp_close(client_sock);
+
+    success = welcome_ok && no_error && pong_ok;
+    printf("\n--kbm result: %s (welcome_ok=%d no_error=%d pong_ok=%d "
+           "have_inputcaps=%d)\n",
+           success ? "PASS" : "FAIL", welcome_ok, no_error, pong_ok, have_inputcaps);
+    if (success && !have_inputcaps) {
+        printf("NOTE: PASS, but INPUTCAPS was never observed on this run -- feature "
+               "bits could not be checked against this particular server instance. "
+               "See the NOTE printed above for why.\n");
+    }
+    return success ? 0 : 1;
+}
 
 static int target_mode(const char *ip_text, const char *port_text) {
     apad_sock *client_sock;
@@ -1230,8 +1547,11 @@ int main(int argc, char **argv) {
     if (argc >= 4 && strcmp(argv[1], "--target") == 0) {
         return target_mode(argv[2], argv[3]);
     }
+    if (argc >= 4 && strcmp(argv[1], "--kbm") == 0) {
+        return target_kbm_mode(argv[2], argv[3]);
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--target <ip> <port>]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--target <ip> <port>] [--kbm <ip> <port>]\n", argv[0]);
         return 2;
     }
     return self_loopback_mode();

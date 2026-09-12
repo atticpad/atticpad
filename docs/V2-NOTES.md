@@ -26,7 +26,7 @@ cannot be added without one?"** — a much shorter list.
 
 | Space | Used | Free |
 |---|---|---|
-| Message types | 14 of 256 | ~230, in clearly-themed ranges |
+| Message types | 18 of 256 | ~230, in clearly-themed ranges |
 | Capability bits (`caps`, u32) | 0–13 | **18** (bits 14–31, reserved, MUST be zero) |
 | Button bits (§5.7 mask, u32) | 0–19 | **12** (bits 20–31, reserved, MUST be zero) |
 | Authenticated payload | 68 for TOUCHMAP | **236 bytes per datagram** |
@@ -37,31 +37,47 @@ Message-type ranges carry meaning worth preserving:
 ```
 0x01–0x0F  discovery          (2 used)
 0x10–0x1F  session lifecycle  (3 used)
-0x20–0x2F  client -> server input   (1 used: INPUT_STATE)
+0x20–0x2F  client -> server input   (4 used: INPUT_STATE, KEYBOARD,
+                                     MOUSE, MEDIA)
 0x30–0x3F  liveness           (2 used)
-0x40–0x4F  server -> client   (4 used, TOUCHMAP took 0x43)
+0x40–0x4F  server -> client   (5 used, TOUCHMAP 0x43, INPUTCAPS 0x44)
 0x50–0x5F  transport          (2 used)
 ```
 
-`0x21–0x2F` being empty is the interesting part: fourteen free slots in exactly
-the range a new *input kind* would live.
+`0x2x` was where a new *input kind* would live, and three of those slots have
+since been spent exactly as predicted — `KEYBOARD` 0x21, `MOUSE` 0x22 and
+`MEDIA` 0x23, specified in `docs/PROTOCOL.md` §6.15–§6.17 on 2026-08-25.
+Eleven remain, one of them (`0x24`) reserved rather than free — see §6.22.
 
 ## Candidates, classified by what they'd cost
 
 ### Additive — no v2 needed
 
-- **Keyboard.** New `0x21` client→server message plus a capability bit. A
-  256-key bitmap is 32 bytes, comfortably inside 236 — and a bitmap sidesteps
-  the 6-key-rollover limit real USB keyboards have. Modifier state rides in the
-  same message.
-- **Mouse.** New `0x22`: relative dx/dy, button mask, wheel. Relative motion
-  matters — absolute would fight the touchscreen conventions in §5.
-- **Media / remote keys.** Play, pause, volume, transport. Either consumer-page
-  keycodes inside the keyboard message, or its own type if it should work
-  without advertising a keyboard.
+- ~~**Keyboard.**~~ **Landed**, `docs/PROTOCOL.md` §6.15 (`0x21`). The 256-bit
+  page-0x07 bitmap went in as sketched. **The capability bit did not, and could
+  not** — §6.14 rules that widening `caps` is a v2 change, because a v1 server
+  scrubs a reserved capability bit rather than ignoring it. That is the one
+  prediction on this list that was wrong, and it is worth keeping visible:
+  negotiation went the other direction instead, as a server→client `INPUTCAPS`
+  (§6.19) that a client must hear before it may send anything.
+- ~~**Mouse.**~~ **Landed**, §6.16 (`0x22`). Relative, as argued — and the
+  deltas became wrapping accumulators diffed with §9's helper, so loss and
+  reordering both cost nothing.
+- ~~**Media / remote keys.**~~ **Landed**, §6.17 (`0x23`), as its own type
+  rather than folded into the keyboard message. The deciding reason was not on
+  this list: a host's keyboard API and its consumer-control API are often
+  different calls with incompatible arguments, so folding them puts a
+  two-operating-systems conditional inside one handler.
 - **Server→client config**, of which TOUCHMAP is the first: button-label hints,
   on-screen layout for a phone, "this profile is active" text (which `STATUS`
   can already carry today, unused).
+- **A Unicode text message.** `0x24` is now **reserved** for it —
+  `docs/PROTOCOL.md` §6.22, which records the reservation and the reasoning
+  without specifying a payload. Would remove the layout assumption §6.15
+  leaves on any client whose text comes from an IME. The wire half is small;
+  the cost is a server-side codepoint injector, which Windows `SendInput`
+  supplies natively and `uinput` does not supply at all. Establish the hard
+  half first.
 - **A stronger keying scheme.** Already reserved: `key_material` is 32 bytes of
   zeroes in `WELCOME` waiting for exactly this, gated behind a capability bit.
 
@@ -88,6 +104,13 @@ backend path on the platform whose driver situation is already the shakiest
 (see `DESIGN.md` §2.1: ViGEmBus is archived). Linux has no such problem —
 `uinput` creates keyboards and mice as readily as pads.
 
+*Resolved as predicted.* Windows took `SendInput`, in its own backend file
+composed with ViGEm behind a single `apad_backend` so the host still passes
+exactly one. That it is *injected* input rather than a device is a permanent
+property, not a fault, so it travels to the client as `INPUTCAPS`'s
+`SYNTHETIC` bit rather than as a health string. The driver-backed alternative
+remains a sibling file whenever someone wants it.
+
 So "add keyboard support" is mostly not a protocol question. The wire part is
 the easy half; the server-side platform work is where it actually costs.
 
@@ -107,7 +130,7 @@ not a wire one.
 3. **Treat the breaking list as the real v2 trigger.** A v2 becomes worth doing
    when one of those four items is genuinely needed — most plausibly the button
    space or the datagram cap — and then everything else pending rides along.
-4. **Before any of it: `APAD_PADBTN_*` must move into the protocol header.**
-   TOUCHMAP already exposed this — a wire field whose constants live in
-   `server/backends/backend.h` cannot be read by a client. Any future message
-   naming pad outputs hits the same wall.
+4. ~~**Before any of it: `APAD_PADBTN_*` must move into the protocol header.**~~
+   **Done** — `core/include/atticpad/protocol.h`. The rule generalised: any
+   vocabulary a wire field names belongs in core, which is why §6.18's media
+   control index was written there and not in a backend.

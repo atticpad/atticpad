@@ -52,6 +52,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>   /* stat() -- host_iface_medium()'s sysfs probes */
 #endif
 
 #define HOST_MAX_OWN_ADDRS 16
@@ -110,6 +111,27 @@ typedef enum {
     HOST_ADDR_VIRTUAL
 } host_addr_kind;
 
+/*
+ * The physical medium behind an address, which `kind` deliberately does not
+ * capture: every wired and wireless NIC on a home network classifies as
+ * HOST_ADDR_LAN, yet they are not equally useful to advertise.
+ *
+ * The client is a phone or a handheld, and it is on Wi-Fi. When a host has
+ * both a wired and a wireless address they are usually on the same subnet
+ * and either works -- but when they are NOT (a laptop docked to one network
+ * while its Wi-Fi sits on another), only the Wi-Fi address is reachable from
+ * the couch. Preferring Wi-Fi therefore costs nothing in the common case and
+ * is the difference between working and not in the uncommon one.
+ *
+ * Ordered by that preference: the enum's numeric order IS the ranking used
+ * by host_pick_default_addr().
+ */
+typedef enum {
+    HOST_MEDIUM_WIFI = 0,
+    HOST_MEDIUM_ETHERNET,
+    HOST_MEDIUM_OTHER
+} host_addr_medium;
+
 typedef struct {
     char           iface[HOST_IFACE_LEN];
     char           ip[16];        /* dotted quad + NUL, e.g. "255.255.255.255" */
@@ -117,6 +139,7 @@ typedef struct {
                                     * building an apad_addr directly, no
                                     * string round trip through inet_pton()  */
     host_addr_kind kind;
+    host_addr_medium medium;
 
     /* This interface's subnet-directed broadcast address (e.g.
      * 192.168.1.255 for a /24 on 192.168.1.0), network order -- feeds
@@ -132,6 +155,16 @@ typedef struct {
     uint8_t        bcast[4];
     int            has_bcast;
 } host_own_addr;
+
+static const char *host_addr_medium_name(host_addr_medium m)
+{
+    switch (m) {
+    case HOST_MEDIUM_WIFI:     return "wifi";
+    case HOST_MEDIUM_ETHERNET: return "ethernet";
+    case HOST_MEDIUM_OTHER:    /* fall through */
+    default:                   return "other";
+    }
+}
 
 static const char *host_addr_kind_name(host_addr_kind k)
 {
@@ -271,6 +304,13 @@ static size_t host_enumerate_own_ipv4(host_own_addr *out, size_t max)
             (void)snprintf(out[n].iface, sizeof out[n].iface, "%s",
                           host_iftype_label(ad->IfType));
             out[n].kind = host_classify_addr(ad->IfType, out[n].raw);
+            /* IfType is the OS's own answer, not a guess from a name --
+             * IF_TYPE_IEEE80211 and IF_TYPE_ETHERNET_CSMACD are exactly the
+             * distinction host_addr_medium wants. */
+            out[n].medium =
+                (ad->IfType == IF_TYPE_IEEE80211)       ? HOST_MEDIUM_WIFI :
+                (ad->IfType == IF_TYPE_ETHERNET_CSMACD) ? HOST_MEDIUM_ETHERNET :
+                                                          HOST_MEDIUM_OTHER;
             /* Not filled in yet -- see host_own_addr::has_bcast's doc
              * comment. GetAdaptersAddresses does not hand back a broadcast
              * address directly; deriving one needs the unicast entry's
@@ -293,6 +333,45 @@ static int host_str_starts_with(const char *s, const char *prefix)
 {
     size_t n = strlen(prefix);
     return strncmp(s, prefix, n) == 0;
+}
+
+/*
+ * The medium behind a Linux interface, read from sysfs rather than guessed
+ * from its name.
+ *
+ * /sys/class/net/<if>/phy80211 exists only for a wireless NIC -- this is the
+ * kernel's own answer, and it stays right for names the predictable-naming
+ * scheme produces (wlp2s0), classic ones (wlan0), and renamed-by-udev ones
+ * alike, none of which a prefix list covers reliably.
+ *
+ * /sys/class/net/<if>/device is a symlink to the backing hardware, so it is
+ * present for a real NIC and absent for the software interfaces that make up
+ * most of a developer machine's list (docker0, br-*, tailscale0, lo). Wired
+ * NIC = has hardware, is not wireless.
+ *
+ * Falls through to HOST_MEDIUM_OTHER when sysfs is unreadable, which is the
+ * correct conservative answer: an unknown medium simply ranks below a known
+ * Wi-Fi or Ethernet one rather than displacing it.
+ */
+static host_addr_medium host_iface_medium(const char *iface)
+{
+    char path[64];
+    struct stat st;
+
+    if (iface == NULL || iface[0] == '\0') {
+        return HOST_MEDIUM_OTHER;
+    }
+    if (snprintf(path, sizeof path, "/sys/class/net/%s/phy80211", iface)
+            < (int)sizeof path
+        && stat(path, &st) == 0) {
+        return HOST_MEDIUM_WIFI;
+    }
+    if (snprintf(path, sizeof path, "/sys/class/net/%s/device", iface)
+            < (int)sizeof path
+        && stat(path, &st) == 0) {
+        return HOST_MEDIUM_ETHERNET;
+    }
+    return HOST_MEDIUM_OTHER;
 }
 
 static host_addr_kind host_classify_addr(const char *iface,
@@ -358,6 +437,7 @@ static size_t host_enumerate_own_ipv4(host_own_addr *out, size_t max)
         out[n].raw[3] = b[3];
         (void)snprintf(out[n].iface, sizeof out[n].iface, "%s", p->ifa_name);
         out[n].kind = host_classify_addr(p->ifa_name, out[n].raw);
+        out[n].medium = host_iface_medium(p->ifa_name);
 
         /* ifa_broadaddr is a member of the SAME union as ifa_dstaddr
          * (point-to-point peer address) in <ifaddrs.h>; it is only meaningful
@@ -385,24 +465,44 @@ static size_t host_enumerate_own_ipv4(host_own_addr *out, size_t max)
 
 #endif /* _WIN32 */
 
-/* Picks the address a fresh QR/URI should default to: the first
- * HOST_ADDR_LAN entry, falling back to the first HOST_ADDR_TAILSCALE and
- * then the first HOST_ADDR_VIRTUAL entry, in that order, so SOME address is
- * always chosen when the list is non-empty. Identical on both platforms --
- * it only ever looks at `kind`. Returns the index into `addrs`, or
- * (size_t)-1 if naddr == 0. */
+/*
+ * Picks the address to advertise: the QR/URI default, the one the console
+ * banner leads with, and the one the web UI shows large.
+ *
+ * Ranked on (kind, medium) in that order of significance:
+ *
+ *   LAN + Wi-Fi     <- a phone is on Wi-Fi; if the host's wired and wireless
+ *   LAN + Ethernet     addresses are on different subnets, only this one is
+ *   LAN + other        reachable from the couch
+ *   Tailscale       <- works, but only for an already-enrolled device
+ *   Virtual         <- docker0 and friends; a phone can never reach these
+ *
+ * This used to return the FIRST HOST_ADDR_LAN entry, which is getifaddrs()/
+ * GetAdaptersAddresses() enumeration order -- i.e. arbitrary. On the machine
+ * this was written on that meant a wired address won purely by sorting
+ * ahead of the Wi-Fi one, with nothing about reachability involved.
+ *
+ * Returns the index into `addrs`, or (size_t)-1 if naddr == 0.
+ */
 static size_t host_pick_default_addr(const host_own_addr *addrs, size_t naddr)
 {
-    host_addr_kind want;
+    host_addr_kind want_kind;
 
-    for (want = HOST_ADDR_LAN; ; want = (host_addr_kind)(want + 1)) {
-        size_t i;
-        for (i = 0; i < naddr; i++) {
-            if (addrs[i].kind == want) {
-                return i;
+    for (want_kind = HOST_ADDR_LAN; ; want_kind = (host_addr_kind)(want_kind + 1)) {
+        host_addr_medium want_medium;
+        for (want_medium = HOST_MEDIUM_WIFI; ;
+             want_medium = (host_addr_medium)(want_medium + 1)) {
+            size_t i;
+            for (i = 0; i < naddr; i++) {
+                if (addrs[i].kind == want_kind && addrs[i].medium == want_medium) {
+                    return i;
+                }
+            }
+            if (want_medium == HOST_MEDIUM_OTHER) {
+                break;
             }
         }
-        if (want == HOST_ADDR_VIRTUAL) {
+        if (want_kind == HOST_ADDR_VIRTUAL) {
             break;
         }
     }

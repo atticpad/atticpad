@@ -12,13 +12,18 @@
  * through the same library.
  *
  * The one thing this file knows about backends is which one to pass in
- * (apad_backend_vigem). Nothing else here -- and nothing in the library --
- * knows ViGEmBus exists (docs/DESIGN.md §6.1).
+ * (apad_backend_win32, server/backends/win32.c's composite). Nothing else
+ * here -- and nothing in the library -- knows ViGEmBus or SendInput exist
+ * (docs/DESIGN.md §6.1). Until the keyboard/mouse/media task this token was
+ * apad_backend_vigem directly; see win32.c's own header for why a
+ * composite sits in front of it now instead of this file learning a
+ * second backend.
  *
  * Cross-compiled from Linux with x86_64-w64-mingw32-gcc; the Windows test
  * machine has no C toolchain at all (server/backends/vendor/README.md).
- * Linked -static together with libapadserver's TUs, server/backends/vigem.c,
- * the vendored ViGEmClient object, shim/net_winsock.c and shim/time_win32.c.
+ * Linked -static together with libapadserver's TUs, server/backends/
+ * vigem.c, server/backends/sendinput.c, server/backends/win32.c, the
+ * vendored ViGEmClient object, shim/net_winsock.c and shim/time_win32.c.
  * See this file's companion report for the exact link command.
  */
 
@@ -77,8 +82,12 @@
                           * apad_backend_vigem;` itself, worked around
                           * exactly like this because backend.h only ever
                           * forward-declared apad_backend_uinput. backends.h
-                          * now supplies the _WIN32-guarded extern for
-                          * apad_backend_vigem; nothing here redeclares it. */
+                          * now supplies the _WIN32-guarded extern -- as of
+                          * the keyboard/mouse/media task, for
+                          * apad_backend_win32 (server/backends/win32.c's
+                          * composite) rather than apad_backend_vigem
+                          * directly; nothing here redeclares it either
+                          * way. */
 
 #include "resource.h"   /* IDI_APPICON -- server/host/windows/atticpad.rc,
                           * shared between here and the .rc so the icon ID
@@ -328,12 +337,7 @@ typedef struct {
     HWND            hwnd;
     NOTIFYICONDATAW nid;
     int             added;        /* NIM_ADD succeeded -- gates NIM_DELETE
-                                    * on shutdown and gates whether the
-                                    * console gets hidden (see
-                                    * hide_console_if_owned's call site: a
-                                    * hidden console with no tray icon up
-                                    * would leave no visible surface at
-                                    * all) */
+                                    * on shutdown */
     apad_server    *server;       /* for the pairing/roster menu items and
                                     * the tooltip; set once in tray_init(),
                                     * never NULL after a successful call */
@@ -688,35 +692,56 @@ static void tray_shutdown(void)
 }
 
 /*
- * Hides the console window, but ONLY when this process is its sole owner --
- * i.e. it was double-clicked (or launched with no console of its own and
- * Windows allocated a fresh one) rather than started from an existing
- * cmd.exe/PowerShell/SSH session, where GetConsoleProcessList() returns
- * more than this one pid because the launching shell (and, over SSH,
- * sshd's own console client) shares the same console. This is EXACTLY the
- * distinction this task's brief asks for: hiding it unconditionally would
- * break the SSH-redirected verification path this binary is checked with.
+ * Console attachment.
  *
- * Called only after the tray icon is confirmed up (see the call site in
- * main()) -- hiding the console with no tray icon and no desktop surface
- * would leave a running process with nothing visible at all.
+ * This binary is linked for the WINDOWS (GUI) subsystem, so Windows never
+ * allocates a console for it -- double-clicking it from Explorer opens no
+ * black window at all, not even for a frame. That is the point: this is a
+ * tray application (docs/DESIGN.md 6.3), and a console flashing up on launch is
+ * the single most "unfinished" thing a Windows user can be shown.
+ *
+ * The previous approach linked for the CONSOLE subsystem and hid the window
+ * after the fact with ShowWindow(SW_HIDE). That could not win: the console
+ * is allocated and painted by the loader BEFORE main() gets control, so a
+ * visible flash was unavoidable, and the hide had to be suppressed whenever
+ * GetConsoleProcessList() showed a shell sharing the console or it would
+ * kill the output of a run started from cmd/PowerShell/SSH.
+ *
+ * A GUI-subsystem process launched FROM a console does not inherit its
+ * stdio, so this reattaches explicitly: AttachConsole(ATTACH_PARENT_PROCESS)
+ * succeeds exactly when a parent console exists (a shell, or an SSH session
+ * -- the verification path this project actually uses), and the freopen
+ * calls point the CRT's streams back at it. When there is no parent console
+ * this fails harmlessly and the process runs silently, which is correct for
+ * a double-click launch.
+ *
+ * [force] is --console: allocate a console even when launched from Explorer,
+ * for diagnosing a machine with no shell handy.
+ *
+ * Returns non-zero if stdio is now connected to a console.
  */
-static void hide_console_if_owned(void)
+static int attach_console(int force)
 {
-    DWORD pids[2];
-    DWORD n = GetConsoleProcessList(pids, 2);
+    int attached = AttachConsole(ATTACH_PARENT_PROCESS) ? 1 : 0;
 
-    if (n == 1) {
-        HWND console = GetConsoleWindow();
-        if (console != NULL) {
-            (void)fprintf(stderr,
-                          "[atticpad] console: hiding it now (this process "
-                          "is its sole owner) -- use the tray icon from "
-                          "here on, or relaunch with --console to keep "
-                          "this window\n");
-            (void)ShowWindow(console, SW_HIDE);
-        }
+    if (!attached && force) {
+        attached = AllocConsole() ? 1 : 0;
     }
+    if (!attached) {
+        return 0;
+    }
+
+    /* Reopen the CRT streams onto the console we just attached to. Without
+     * this the FILE* handles remain the GUI-subsystem's invalid ones and
+     * every printf goes nowhere. Return values deliberately ignored: if a
+     * stream cannot be reopened the process must still run. */
+    {
+        FILE *f;
+        (void)freopen_s(&f, "CONOUT$", "w", stdout);
+        (void)freopen_s(&f, "CONOUT$", "w", stderr);
+        (void)freopen_s(&f, "CONIN$", "r", stdin);
+    }
+    return 1;
 }
 
 /* ---- profile files: the host half of the profiles seam -------------------
@@ -782,8 +807,6 @@ int main(int argc, char **argv)
     int headless = 0;
     int no_browser = 0;    /* --no-browser: skip the startup ShellExecuteW,
                              * tray icon (if any) still opens it on request */
-    int force_console = 0; /* --console: never hide the console window,
-                             * even when this process is its sole owner */
     apad_socket_t ui_fd = APAD_INVALID_SOCKET;
     ui_mdns_status ui_mdns;
     apad_server_cfg cfg;
@@ -819,8 +842,68 @@ int main(int argc, char **argv)
      * nothing and stdout getting used later (e.g. a future `--json` machine
      * -readable mode) must not silently reintroduce this. setvbuf() itself
      * requires the stream not have had any I/O yet, hence "first thing". */
+    /* BEFORE setvbuf, because attach_console() freopens these very streams
+     * and setvbuf must be applied to the final FILE*, not one that is about
+     * to be replaced. --console is scanned here directly rather than waiting
+     * for the flag loop below: by then the first diagnostics have already
+     * been printed into nowhere. */
+    {
+        int i, want_console = 0;
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--console") == 0) {
+                want_console = 1;
+            }
+        }
+        (void)attach_console(want_console);
+    }
+
     (void)setvbuf(stdout, NULL, _IONBF, 0);
     (void)setvbuf(stderr, NULL, _IONBF, 0);
+
+    /* --help/-h and an unrecognised flag, BEFORE anything else this
+     * function does -- before the port is parsed, before any socket is
+     * opened. Same fix, same reason, as the Linux host's twin block (see
+     * its own comment): this binary used to fall an unrecognised argv
+     * entry straight through into normal startup, so
+     * `atticpad-server.exe --help` silently bound UDP :21100/:5353 and ran
+     * forever instead of printing usage and exiting. Scans every argv
+     * entry, same as the --headless/--no-browser/--console loop below
+     * (which this does not replace -- see that loop's own comment): a
+     * bare numeric port in argv[1] is not a flag and is left alone here. */
+    {
+        int i;
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+                (void)printf(
+                    "Usage: %s [port] [--headless] [--no-browser] "
+                    "[--console] [--help]\n"
+                    "\n"
+                    "  port          UDP port to listen on (default %u)\n"
+                    "  --headless    disable the local web UI and tray icon\n"
+                    "  --no-browser  do not open a browser tab at startup\n"
+                    "  --console     open a console window even when launched\n"
+                    "                from Explorer (diagnostics)\n"
+                    "  --help, -h    print this message and exit\n"
+                    "\n"
+                    "Environment: ATTICPAD_UI_PORT, ATTICPAD_PROFILES_DIR\n",
+                    (argc > 0) ? argv[0] : "atticpad-server.exe",
+                    (unsigned)APAD_DEFAULT_PORT);
+                return 0;
+            }
+            if (strcmp(argv[i], "--headless") != 0
+                && strcmp(argv[i], "--no-browser") != 0
+                && strcmp(argv[i], "--console") != 0
+                && argv[i][0] == '-') {
+                (void)fprintf(stderr,
+                              "%s: unrecognised option '%s'\n"
+                              "Try '%s --help' for usage.\n",
+                              (argc > 0) ? argv[0] : "atticpad-server.exe",
+                              argv[i],
+                              (argc > 0) ? argv[0] : "atticpad-server.exe");
+                return 1;
+            }
+        }
+    }
 
     if (argc > 1) {
         int p = atoi(argv[1]);
@@ -846,7 +929,11 @@ int main(int argc, char **argv)
             } else if (strcmp(argv[i], "--no-browser") == 0) {
                 no_browser = 1;
             } else if (strcmp(argv[i], "--console") == 0) {
-                force_console = 1;
+                /* Already acted on by the attach_console() scan at the top
+                 * of main() -- it has to happen before the first line of
+                 * output, which is long before this loop. Recognised here
+                 * only so the unknown-flag check above keeps accepting it. */
+                (void)0;
             }
         }
     }
@@ -955,10 +1042,14 @@ int main(int argc, char **argv)
      * the gap docs/PROTOCOL.md §7 already allows ("a subnet-directed
      * broadcast it can identify" -- this host cannot, yet). */
 
-    /* Parses the profiles and brings the backend up (ViGEmBus connect);
-     * logs why through host_log if it refuses -- most commonly "ViGEmBus
-     * not installed", see server/backends/vigem.c's init() codes. */
-    server = apad_server_create(&cfg, &apad_backend_vigem);
+    /* Parses the profiles and brings the backend up -- apad_backend_win32
+     * (server/backends/win32.c) starts both ViGEmBus (pads) and SendInput
+     * (KBM) and only fails outright if NEITHER works; logs why through
+     * host_log when it refuses, and separately when just the pad half is
+     * down (most commonly "ViGEmBus not installed", see
+     * server/backends/vigem.c's init() codes and win32.c's own
+     * backend_init()). */
+    server = apad_server_create(&cfg, &apad_backend_win32);
     /* The library copied what it keeps, so the file blobs are done. */
     profile_store_free_files(files, file_count);
     if (server == NULL) {
@@ -988,7 +1079,7 @@ int main(int argc, char **argv)
     (void)fprintf(stderr,
                   "[atticpad] server listening on UDP :%u, backend \"%s\", "
                   "%u pad slots\n",
-                  (unsigned)port, apad_backend_vigem.name,
+                  (unsigned)port, apad_backend_win32.name,
                   (unsigned)APAD_MAX_SESSIONS);
     (void)fprintf(stderr,
                   "[atticpad] connect a client to one of these addresses, "
@@ -1036,13 +1127,10 @@ int main(int argc, char **argv)
      * system tray" section above for the threading and console-ownership
      * reasoning behind each call here. */
     if (!headless) {
-        if (tray_init(server, ui_port) && !force_console) {
-            /* Only after the tray icon is confirmed up -- a hidden console
-             * with no tray icon (e.g. no interactive desktop) would leave
-             * this process with no visible surface at all. --console
-             * overrides unconditionally. */
-            hide_console_if_owned();
-        }
+        /* No console to hide any more: this binary is linked for the GUI
+         * subsystem, so a double-click never allocates one in the first
+         * place (see attach_console). The tray icon is the visible surface. */
+        (void)tray_init(server, ui_port);
         if (!no_browser) {
             if (apad_sock_valid(ui_fd)) {
                 open_browser(ui_port);

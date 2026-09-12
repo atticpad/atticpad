@@ -118,12 +118,18 @@ KNOWN_TYPES = [
     TYPE_DISCOVER, TYPE_ANNOUNCE, TYPE_HELLO, TYPE_WELCOME, TYPE_BYE,
     TYPE_INPUT_STATE, TYPE_PING, TYPE_PONG, TYPE_RUMBLE, TYPE_LED,
     TYPE_STATUS, TYPE_ACK, TYPE_ERROR,
+    # S4 gained four rows on 2026-08-25 (S6.15-S6.19). Their codes and sizes
+    # are declared with the rest of Sections K/L/M further down, next to the
+    # payload builders that use them; listed here too because this is the
+    # transcription of S4's table and leaving them out would make it wrong.
+    0x21, 0x22, 0x23, 0x44,
 ]
 
 TYPE_SIZE = {  # PROTOCOL.md S4 table, "Payload" column
     TYPE_DISCOVER: 0, TYPE_ANNOUNCE: 40, TYPE_HELLO: 76, TYPE_WELCOME: 60,
     TYPE_BYE: 4, TYPE_INPUT_STATE: 56, TYPE_PING: 8, TYPE_PONG: 8,
     TYPE_RUMBLE: 8, TYPE_LED: 4, TYPE_STATUS: 64, TYPE_ACK: 4, TYPE_ERROR: 64,
+    0x21: 56, 0x22: 24, 0x23: 20, 0x44: 16,   # S6.15, S6.16, S6.17, S6.19
 }
 
 # A type code deliberately absent from PROTOCOL.md S4's table.
@@ -2236,6 +2242,1615 @@ add_pair_uri_build_vector(
 
 
 # ---------------------------------------------------------------------------
+# Sections K / L / M: S6.15-S6.22 -- KEYBOARD (0x21), MOUSE (0x22),
+# MEDIA (0x23), INPUTCAPS (0x44), apad_seq_diff (S6.21) and the S6.20 event
+# ring.
+#
+# Derived, like everything else here, from docs/PROTOCOL.md alone. These four
+# types were specified on 2026-08-25 and S15 item 10 records that their
+# vectors are to be written independently BEFORE the codec is trusted -- the
+# opposite order to S6.12's TOUCHMAP (S15 item 9), which produced "agreement,
+# not verification".
+#
+# Three shapes, named by S13 so that this file does not have to invent one:
+#   Section K -- packet vectors  (wire bytes in, decoded structure out)
+#   Section L -- function vectors (input tuple, expected integer, no packet)
+#   Section M -- sequence vectors (ordered packets, expected receiver state
+#                after EVERY step, not only the last)
+#
+# Rules transcribed from the spec, each with the sentence it comes from:
+#
+#  * S6.15 keys[] is a 256-bit bitmap "in which the bit index IS the usage
+#    ID", byte u>>3, bit u&7, LSB first. keys[0] bits 0-3 are RESERVED (HID
+#    0x00-0x03 are conditions, not keys) and are scrubbed under S2.
+#  * S6.15 "An events[i] whose usage decodes to 0 -- either because it was
+#    sent as 0, or because it was sent as a reserved 0x01-0x03 and normalised
+#    -- MUST also have its flags forced to 0."
+#  * S6.15 "A decoder MUST pass [0xA5-0xAF, 0xDE-0xDF, 0xE8-0xFF] through
+#    unchanged." A vector asserting they are scrubbed would be WRONG.
+#  * S6.16 "button outside 0..5 normalises to 0 and forces flags to 0", and
+#    "The same 'no event decodes byte-identically' rule as S6.15 applies" --
+#    which is what settles button == 0 with a non-zero flags byte: flags 0.
+#  * S6.16 buttons bits 5-15 reserved -> masked. Accumulators are RAW: their
+#    absolute value carries no meaning, so nothing normalises them.
+#  * S6.17 control "outside 0..32, and any control index S6.18 leaves
+#    unassigned" -> 0 and flags 0. S6.18 assigns 1..24, so 25..32 normalise
+#    to 0 as well. "Bits of held for unassigned control indices are reserved
+#    and scrubbed" -> held & 0x00FFFFFF.
+#  * S6.19 features bits 3-31, status bits 4-31 reserved -> masked;
+#    media_mask names S6.18 indices, so bits 24-31 are scrubbed for the same
+#    reason S6.17's held is.
+#  * S6.20 "Reserved *bits* are different: they are masked on both sides."
+#    The event-CODE normalisations are receive-side only and an encoder
+#    "SHOULD NOT" apply them, so nothing here asserts an encoder rewriting
+#    an out-of-range usage/button/control.
+# ---------------------------------------------------------------------------
+
+TYPE_KEYBOARD = 0x21          # S4 / S6.15
+TYPE_MOUSE = 0x22             # S4 / S6.16
+TYPE_MEDIA = 0x23             # S4 / S6.17
+TYPE_INPUTCAPS = 0x44         # S4 / S6.19
+TYPE_TEXT_RESERVED = 0x24     # S6.22: reserved, MUST NOT be allocated
+
+KEYBOARD_LEN = 56             # S6.15
+MOUSE_LEN = 24                # S6.16
+MEDIA_LEN = 20                # S6.17
+INPUTCAPS_LEN = 16            # S6.19
+
+KEYBOARD_RING = 8             # S6.20 "Depth is 8 for KEYBOARD"
+MOUSE_RING = 4                # S6.20 "and 4 for MOUSE and MEDIA"
+MEDIA_RING = 4
+
+KEYS_BYTES = 32               # S6.15 keys[32]
+
+# S6.15: keys[0] bits 0-3 reserved (HID 0x00-0x03 are conditions, not keys).
+KEYS0_VALID_MASK = 0xF0
+# S6.15/S6.16/S6.17: event flags bit 0 is DOWN, bits 1-7 reserved.
+EVENT_FLAGS_MASK = 0x01
+EVENT_DOWN = 0x01
+# S6.16: buttons bits 5-15 reserved.
+MOUSE_BUTTONS_MASK = 0x001F
+# S6.17 + S6.18: control indices 1..24 assigned, 25..32 reserved, and `held`
+# bits for unassigned indices are scrubbed. Control c is bit c-1.
+MEDIA_HELD_MASK = 0x00FFFFFF
+MEDIA_ASSIGNED_MAX = 24
+MEDIA_INDEX_MAX = 32
+# S6.19
+FEATURE_MASK = 0x00000007
+STATUS_MASK = 0x0000000F
+MEDIA_MASK_MASK = 0x00FFFFFF
+
+FEATURE_KEYBOARD = 1 << 0
+FEATURE_MOUSE = 1 << 1
+FEATURE_MEDIA = 1 << 2
+STATUS_KEYBOARD_READY = 1 << 0
+STATUS_MOUSE_READY = 1 << 1
+STATUS_MEDIA_READY = 1 << 2
+STATUS_SYNTHETIC = 1 << 3
+
+# HID Usage Page 0x07 usage IDs used below (S6.15). Transcribed from the USB
+# HID usage tables, which S6.15 names as the vocabulary; the spec itself only
+# fixes 0x00-0x03 (reserved) and 0xE0-0xE7 (the eight modifiers).
+HID_A, HID_B, HID_C, HID_D = 0x04, 0x05, 0x06, 0x07
+HID_S, HID_W, HID_Z = 0x16, 0x1A, 0x1D
+HID_ENTER, HID_ESC, HID_SPACE = 0x28, 0x29, 0x2C
+HID_LCTRL, HID_LSHIFT, HID_LALT, HID_LGUI = 0xE0, 0xE1, 0xE2, 0xE3
+HID_RCTRL, HID_RSHIFT, HID_RALT, HID_RGUI = 0xE4, 0xE5, 0xE6, 0xE7
+
+
+def keys_bitmap(usages):
+    """S6.15: usage u is byte u>>3, bit u&7, LSB first within a byte."""
+    b = [0] * KEYS_BYTES
+    for u in usages:
+        b[u >> 3] |= 1 << (u & 7)
+    return b
+
+
+def keys_decode_ref(keys):
+    d = list(keys)
+    d[0] &= KEYS0_VALID_MASK      # S6.15 reserved, S2 scrub
+    return d
+
+
+def key_event_decode_ref(usage, flags):
+    """S6.15: usage 0x00-0x03 is "no event"; such a slot MUST decode with
+    flags forced to 0 as well. Everything else passes through, INCLUDING the
+    HID-reserved 0xA5-0xAF / 0xDE-0xDF / 0xE8-0xFF ranges."""
+    if usage <= 0x03:
+        return (0, 0)
+    return (usage, flags & EVENT_FLAGS_MASK)
+
+
+def mouse_event_decode_ref(button, flags):
+    """S6.16: a button outside 1..5 is "no event" -> 0, flags forced to 0."""
+    if button < 1 or button > 5:
+        return (0, 0)
+    return (button, flags & EVENT_FLAGS_MASK)
+
+
+def media_event_decode_ref(control, flags):
+    """S6.17 + S6.18: assigned indices are 1..24; anything else (0, 25..32,
+    and >32) is "no event" -> 0, flags forced to 0."""
+    if control < 1 or control > MEDIA_ASSIGNED_MAX:
+        return (0, 0)
+    return (control, flags & EVENT_FLAGS_MASK)
+
+
+def build_keyboard_payload(keys, event_seq, events, client_ticks_ms,
+                            reserved0=0xA5, reserved1=0x5A):
+    """S6.15 table: 0 keys[32] | 32 event_seq | 34 res0 | 35 res1 |
+    36 events[8] (2 bytes each, OLDEST at index 0) | 52 client_ticks_ms."""
+    assert len(keys) == KEYS_BYTES
+    assert len(events) == KEYBOARD_RING
+    p = bytes(bytearray(keys))
+    p += struct.pack('<H', u16(event_seq))
+    p += bytes(bytearray([reserved0 & 0xFF, reserved1 & 0xFF]))
+    for (usage, flags) in events:
+        p += bytes(bytearray([usage & 0xFF, flags & 0xFF]))
+    p += struct.pack('<I', u32(client_ticks_ms))
+    assert len(p) == KEYBOARD_LEN
+    return p
+
+
+def build_mouse_payload(dx, dy, wheel, hwheel, buttons, event_seq, events,
+                         client_ticks_ms):
+    """S6.16 table: 0 dx | 2 dy | 4 wheel | 6 hwheel | 8 buttons |
+    10 event_seq | 12 events[4] | 20 client_ticks_ms."""
+    assert len(events) == MOUSE_RING
+    p = struct.pack('<HHHHHH', u16(dx), u16(dy), u16(wheel), u16(hwheel),
+                     u16(buttons), u16(event_seq))
+    for (button, flags) in events:
+        p += bytes(bytearray([button & 0xFF, flags & 0xFF]))
+    p += struct.pack('<I', u32(client_ticks_ms))
+    assert len(p) == MOUSE_LEN
+    return p
+
+
+def build_media_payload(held, event_seq, events, client_ticks_ms,
+                         reserved0=0xA5, reserved1=0x5A):
+    """S6.17 table: 0 held | 4 event_seq | 6 res0 | 7 res1 | 8 events[4] |
+    16 client_ticks_ms."""
+    assert len(events) == MEDIA_RING
+    p = struct.pack('<IH', u32(held), u16(event_seq))
+    p += bytes(bytearray([reserved0 & 0xFF, reserved1 & 0xFF]))
+    for (control, flags) in events:
+        p += bytes(bytearray([control & 0xFF, flags & 0xFF]))
+    p += struct.pack('<I', u32(client_ticks_ms))
+    assert len(p) == MEDIA_LEN
+    return p
+
+
+def build_inputcaps_payload(features, status, media_mask, mouse_rate_hz,
+                             reserved0=0xA55A):
+    """S6.19 table: 0 features | 4 status | 8 media_mask | 12 mouse_rate_hz |
+    14 reserved0."""
+    p = struct.pack('<IIIHH', u32(features), u32(status), u32(media_mask),
+                     u16(mouse_rate_hz), u16(reserved0))
+    assert len(p) == INPUTCAPS_LEN
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Section K.1: KEYBOARD (0x21) packet vectors
+# ---------------------------------------------------------------------------
+
+keyboard_vectors = []
+
+
+def add_keyboard_vector(name, spec_ref, keys, event_seq, events,
+                         client_ticks_ms, header_kwargs=None,
+                         reserved0=0xA5, reserved1=0x5A):
+    hdr = dict(version=VERSION_1, type_=TYPE_KEYBOARD, session_id=0x0201,
+                sequence=0x0304, payload_len=KEYBOARD_LEN, flags=0)
+    if header_kwargs:
+        hdr.update(header_kwargs)
+    payload = build_keyboard_payload(keys, event_seq, events, client_ticks_ms,
+                                      reserved0, reserved1)
+    dec = [key_event_decode_ref(u, f) for (u, f) in events]
+    # S2/S6.20 encode side: reserved BYTES zero, reserved BITS masked. The
+    # canonical payload is what an encoder MUST emit when handed the decoded
+    # structure this vector expects -- reserved0/reserved1 zeroed, keys[0]
+    # low nibble cleared, event flags masked to bit 0.
+    canon = build_keyboard_payload(keys_decode_ref(keys), event_seq, dec,
+                                    client_ticks_ms, 0, 0)
+    keyboard_vectors.append(dict(
+        name=name, spec_ref=spec_ref,
+        packet=build_header(**hdr) + payload,
+        exp_encoded=canon, enc_same=(canon == payload),
+        exp_keys=keys_decode_ref(keys),
+        exp_event_seq=u16(event_seq),
+        exp_event_code=[d[0] for d in dec],
+        exp_event_flags=[d[1] for d in dec],
+        exp_client_ticks_ms=u32(client_ticks_ms),
+    ))
+
+
+_kb_baseline_keys = keys_bitmap([HID_A, HID_Z, HID_SPACE, HID_LCTRL, HID_RGUI])
+_kb_baseline_events = [
+    (HID_W, EVENT_DOWN), (HID_A, EVENT_DOWN), (HID_S, 0x00), (HID_D, EVENT_DOWN),
+    (HID_LSHIFT, EVENT_DOWN), (HID_SPACE, 0x00), (HID_ENTER, EVENT_DOWN),
+    (HID_ESC, 0x00),
+]
+
+add_keyboard_vector(
+    "keyboard_baseline",
+    "S6.15 field offsets 0/32/34/35/36/52; every field distinct so a decoder "
+    "reading the wrong offset cannot pass by coincidence",
+    _kb_baseline_keys, 0x1234, _kb_baseline_events, 0x89ABCDEF,
+)
+
+# S13: "every reserved field of each of the four types set to ones -- the
+# decoded structure MUST be byte-identical to the one decoded from the clean
+# packet". Same logical content as keyboard_baseline; identical expectations.
+add_keyboard_vector(
+    "keyboard_reserved_ones",
+    "S2/S6.15 reserved SCRUB: keys[0] bits 0-3, reserved0, reserved1, event "
+    "flags bits 1-7 and header flags bits 2-15 all ones; decodes identically "
+    "to keyboard_baseline (S13)",
+    [(_kb_baseline_keys[0] | 0x0F)] + _kb_baseline_keys[1:], 0x1234,
+    [(u, f | 0xFE) for (u, f) in _kb_baseline_events], 0x89ABCDEF,
+    header_kwargs=dict(flags=0xFFFC), reserved0=0xFF, reserved1=0xFF,
+)
+
+add_keyboard_vector(
+    "keyboard_seven_keys_held",
+    "S6.15 'It sidesteps the six-key rollover limit a real HID boot report "
+    "has, which a device holding W+A+Shift+Ctrl+Space+two more would "
+    "otherwise hit' (S13 requires exactly this case)",
+    keys_bitmap([HID_W, HID_A, HID_S, HID_D, HID_LSHIFT, HID_LCTRL, HID_SPACE]),
+    7,
+    [(0, 0), (HID_W, EVENT_DOWN), (HID_A, EVENT_DOWN), (HID_S, EVENT_DOWN),
+     (HID_D, EVENT_DOWN), (HID_LSHIFT, EVENT_DOWN), (HID_LCTRL, EVENT_DOWN),
+     (HID_SPACE, EVENT_DOWN)],
+    0x00010000,
+)
+
+add_keyboard_vector(
+    "keyboard_modifier_only_bitmap",
+    "S6.15 'Modifiers are usages 0xE0-0xE7, so they ride inside the same "
+    "bitmap and there is no second modifier byte' -- all eight set, which is "
+    "keys[28] == 0xFF and every other byte zero",
+    keys_bitmap([HID_LCTRL, HID_LSHIFT, HID_LALT, HID_LGUI,
+                  HID_RCTRL, HID_RSHIFT, HID_RALT, HID_RGUI]),
+    8,
+    [(u, EVENT_DOWN) for u in (HID_LCTRL, HID_LSHIFT, HID_LALT, HID_LGUI,
+                                HID_RCTRL, HID_RSHIFT, HID_RALT, HID_RGUI)],
+    0x0000FFFF,
+)
+
+add_keyboard_vector(
+    "keyboard_keys0_reserved_bits_scrubbed",
+    "S6.15 'keys[0] bits 0-3 [reserved]' + S2 scrub: wire byte 0xFF decodes "
+    "as 0xF0, keeping usages 0x04-0x07 (A,B,C,D) and dropping 0x00-0x03",
+    [0xFF] + [0] * (KEYS_BYTES - 1), 4,
+    [(0, 0)] * 4 + [(HID_A, EVENT_DOWN), (HID_B, EVENT_DOWN),
+                     (HID_C, EVENT_DOWN), (HID_D, EVENT_DOWN)], 0x11223344,
+)
+
+add_keyboard_vector(
+    "keyboard_all_bits_held",
+    "S6.15 256-bit bitmap fully set: every byte 0xFF decodes verbatim except "
+    "keys[0], which loses its reserved low nibble",
+    [0xFF] * KEYS_BYTES, 0xFFFF, [(0xFF, EVENT_DOWN)] * KEYBOARD_RING,
+    0xFFFFFFFF,
+)
+
+for _res_usage in (0x01, 0x02, 0x03):
+    add_keyboard_vector(
+        "keyboard_usage_%02X_normalised" % _res_usage,
+        "S6.15 '0x01-0x03 reserved' + 'An events[i] whose usage decodes to 0 "
+        "... MUST also have its flags forced to 0' (S13 names 0x01, 0x02 and "
+        "0x03 explicitly)",
+        keys_bitmap([HID_A]), 0x0100,
+        [(HID_A, EVENT_DOWN), (_res_usage, 0xFF), (HID_B, 0x00),
+         (_res_usage, EVENT_DOWN), (HID_C, EVENT_DOWN), (HID_D, 0x00),
+         (_res_usage, 0x00), (HID_S, EVENT_DOWN)],
+        0x00ABCDEF,
+    )
+
+add_keyboard_vector(
+    "keyboard_usage_00_flags_forced_zero",
+    "S6.15 'either because it was sent as 0' -- a slot sent as usage 0 with a "
+    "DOWN flag decodes as (0, 0), which is what makes two decoded structures "
+    "comparable for exact equality",
+    keys_bitmap([HID_B]), 0x0001,
+    [(0x00, EVENT_DOWN), (0x00, 0xFF), (HID_B, EVENT_DOWN)] + [(0, 0)] * 5,
+    0x00000001,
+)
+
+add_keyboard_vector(
+    "keyboard_usage_04_lowest_valid_kept",
+    "S6.15 boundary: 0x03 is the highest reserved usage, so 0x04 is the "
+    "lowest that MUST survive decode",
+    keys_bitmap([HID_A]), 0x0002,
+    [(0x03, EVENT_DOWN), (0x04, EVENT_DOWN), (0x04, 0x00), (0x05, EVENT_DOWN),
+     (0x03, 0x00), (0x06, EVENT_DOWN), (0x02, EVENT_DOWN), (0x07, 0x00)],
+    0x00000002,
+)
+
+add_keyboard_vector(
+    "keyboard_hid_reserved_a5_ac_passthrough",
+    "S6.15 'HID 1.12 leaves 0xA5-0xAF ... reserved. A decoder MUST pass them "
+    "through unchanged.' A vector asserting these are scrubbed would be wrong",
+    keys_bitmap([0xA5]), 0x0008,
+    [(u, EVENT_DOWN if (u & 1) else 0x00) for u in range(0xA5, 0xAD)],
+    0x000000A5,
+)
+
+add_keyboard_vector(
+    "keyboard_hid_reserved_ranges_passthrough",
+    "S6.15: the tail of 0xA5-0xAF, both of 0xDE-0xDF, and both ends of "
+    "0xE8-0xFF, all passed through unchanged",
+    keys_bitmap([0xFF]), 0x0009,
+    [(0xAD, EVENT_DOWN), (0xAE, 0x00), (0xAF, EVENT_DOWN), (0xDE, 0x00),
+     (0xDF, EVENT_DOWN), (0xE8, 0x00), (0xFE, EVENT_DOWN), (0xFF, 0x00)],
+    0x000000FF,
+)
+
+add_keyboard_vector(
+    "keyboard_event_flags_reserved_bits_masked",
+    "S6.20 'Reserved *bits* are different: they are masked on both sides' -- "
+    "flags 0xFF decodes as 0x01 (DOWN), flags 0xFE as 0x00 (release)",
+    keys_bitmap([HID_ENTER]), 0x0003,
+    [(HID_ENTER, 0xFF), (HID_ESC, 0xFE), (HID_A, 0x03), (HID_B, 0x80),
+     (HID_C, 0x02), (HID_D, 0x7F), (HID_W, 0x81), (HID_Z, 0xFC)],
+    0x00000003,
+)
+
+add_keyboard_vector(
+    "keyboard_ring_right_aligned_three_events",
+    "S6.20 'slot i carries the event with ordinal event_seq - (D - 1) + i ... "
+    "slots whose ordinal falls before the session's first event are "
+    "transmitted zeroed'. event_seq 3 with depth 8: slots 0-4 zeroed, the "
+    "three real events in slots 5,6,7 and the NEWEST at slot 7",
+    keys_bitmap([HID_C]), 3,
+    [(0, 0)] * 5 + [(HID_A, EVENT_DOWN), (HID_B, EVENT_DOWN), (HID_C, EVENT_DOWN)],
+    0x0000000C,
+)
+
+add_keyboard_vector(
+    "keyboard_released_all_keys",
+    "S6.15 'SHOULD send three copies about 50 ms apart after the last key "
+    "releases' -- the empty snapshot, with the release still in the ring",
+    [0] * KEYS_BYTES, 2,
+    [(0, 0)] * 6 + [(HID_LSHIFT, EVENT_DOWN), (HID_LSHIFT, 0x00)],
+    0x7FFFFFFF,
+)
+
+# ---------------------------------------------------------------------------
+# Section K.2: MOUSE (0x22) packet vectors
+# ---------------------------------------------------------------------------
+
+mouse_vectors = []
+
+
+def add_mouse_vector(name, spec_ref, dx, dy, wheel, hwheel, buttons,
+                      event_seq, events, client_ticks_ms, header_kwargs=None):
+    hdr = dict(version=VERSION_1, type_=TYPE_MOUSE, session_id=0x0201,
+                sequence=0x0305, payload_len=MOUSE_LEN, flags=0)
+    if header_kwargs:
+        hdr.update(header_kwargs)
+    payload = build_mouse_payload(dx, dy, wheel, hwheel, buttons, event_seq,
+                                   events, client_ticks_ms)
+    dec = [mouse_event_decode_ref(b, f) for (b, f) in events]
+    canon = build_mouse_payload(dx, dy, wheel, hwheel,
+                                 u16(buttons) & MOUSE_BUTTONS_MASK, event_seq,
+                                 dec, client_ticks_ms)
+    mouse_vectors.append(dict(
+        name=name, spec_ref=spec_ref,
+        packet=build_header(**hdr) + payload,
+        exp_encoded=canon, enc_same=(canon == payload),
+        exp_dx=u16(dx), exp_dy=u16(dy), exp_wheel=u16(wheel),
+        exp_hwheel=u16(hwheel),
+        exp_buttons=u16(buttons) & MOUSE_BUTTONS_MASK,
+        exp_event_seq=u16(event_seq),
+        exp_event_code=[d[0] for d in dec],
+        exp_event_flags=[d[1] for d in dec],
+        exp_client_ticks_ms=u32(client_ticks_ms),
+    ))
+
+
+MB_LEFT, MB_RIGHT, MB_MIDDLE, MB_BACK, MB_FORWARD = 1, 2, 3, 4, 5
+
+add_mouse_vector(
+    "mouse_baseline",
+    "S6.16 field offsets 0/2/4/6/8/10/12/20; the four accumulators carry four "
+    "different values so a decoder cannot swap them undetected",
+    0x1234, 0xFF9C, 0x0003, 0xFFFF, (1 << 0) | (1 << 2), 0x0102,
+    [(MB_LEFT, EVENT_DOWN), (MB_MIDDLE, EVENT_DOWN), (MB_LEFT, 0x00),
+     (MB_FORWARD, EVENT_DOWN)],
+    0x0BADF00D,
+)
+
+add_mouse_vector(
+    "mouse_reserved_ones",
+    "S2/S6.16 reserved SCRUB: buttons bits 5-15, event flags bits 1-7 and "
+    "header flags bits 2-15 all ones; decodes identically to mouse_baseline "
+    "(S13 byte-identity)",
+    0x1234, 0xFF9C, 0x0003, 0xFFFF, ((1 << 0) | (1 << 2)) | 0xFFE0, 0x0102,
+    [(MB_LEFT, EVENT_DOWN | 0xFE), (MB_MIDDLE, EVENT_DOWN | 0xFE),
+     (MB_LEFT, 0xFE), (MB_FORWARD, EVENT_DOWN | 0xFE)],
+    0x0BADF00D, header_kwargs=dict(flags=0xFFFC),
+)
+
+add_mouse_vector(
+    "mouse_buttons_reserved_bits_masked",
+    "S6.16 'Bit 5-15 reserved, MUST be zero' -- 0xFFFF decodes as 0x001F",
+    0, 0, 0, 0, 0xFFFF, 0x0000, [(0, 0)] * MOUSE_RING, 0x00000010,
+)
+
+add_mouse_vector(
+    "mouse_all_five_buttons_held",
+    "S6.16 button table: LEFT..FORWARD are bits 0..4, so all five held is "
+    "0x001F",
+    0, 0, 0, 0, 0x001F, 0x0005,
+    [(MB_RIGHT, EVENT_DOWN), (MB_MIDDLE, EVENT_DOWN), (MB_BACK, EVENT_DOWN),
+     (MB_FORWARD, EVENT_DOWN)], 0x00000011,
+)
+
+for _bad in (0x06, 0x20, 0xFF):
+    add_mouse_vector(
+        "mouse_button_%02X_normalised" % _bad,
+        "S6.16 'button outside 0..5 normalises to 0 and forces flags to 0' "
+        "(S13 requires a button above 5)",
+        0, 0, 0, 0, 0, 0x0006,
+        [(_bad, 0xFF), (MB_RIGHT, EVENT_DOWN), (_bad, EVENT_DOWN),
+         (MB_LEFT, 0x00)],
+        0x00000012,
+    )
+
+add_mouse_vector(
+    "mouse_button_00_flags_forced_zero",
+    "S6.16 'The same \"no event decodes byte-identically\" rule as S6.15 "
+    "applies' -- an empty slot with a DOWN flag decodes as (0, 0)",
+    0, 0, 0, 0, 0, 0x0007,
+    [(0x00, EVENT_DOWN), (0x00, 0xFF), (MB_MIDDLE, EVENT_DOWN), (0x00, 0x02)],
+    0x00000013,
+)
+
+add_mouse_vector(
+    "mouse_button_05_highest_valid_kept",
+    "S6.16 boundary: FORWARD is index 5, the highest defined, and MUST "
+    "survive decode while 6 does not",
+    0, 0, 0, 0, 1 << 4, 0x0008,
+    [(MB_FORWARD, EVENT_DOWN), (0x06, EVENT_DOWN), (MB_FORWARD, 0x00),
+     (0x07, 0x00)],
+    0x00000014,
+)
+
+add_mouse_vector(
+    "mouse_accumulators_raw_extremes",
+    "S6.16 'The absolute value of an accumulator carries no meaning' -- "
+    "nothing normalises them, so 0x8000/0x7FFF/0xFFFB decode verbatim; the "
+    "signed distance is Section L's and Section M's job",
+    0x8000, 0x7FFF, 0xFFFB, 0x0005, 0, 0x0000, [(0, 0)] * MOUSE_RING,
+    0xFFFFFFFF,
+)
+
+add_mouse_vector(
+    "mouse_ring_right_aligned_two_events",
+    "S6.20 right-alignment at depth 4: event_seq 2 means slots 0,1 are before "
+    "the session's first event and are zeroed, the newest sits at slot 3",
+    0x0064, 0x0064, 0, 0, 1 << 0, 2,
+    [(0, 0), (0, 0), (MB_LEFT, EVENT_DOWN), (MB_LEFT, 0x00)],
+    0x00000015,
+)
+
+# ---------------------------------------------------------------------------
+# Section K.3: MEDIA (0x23) packet vectors
+# ---------------------------------------------------------------------------
+
+media_vectors = []
+
+
+def add_media_vector(name, spec_ref, held, event_seq, events,
+                      client_ticks_ms, header_kwargs=None,
+                      reserved0=0xA5, reserved1=0x5A):
+    hdr = dict(version=VERSION_1, type_=TYPE_MEDIA, session_id=0x0201,
+                sequence=0x0306, payload_len=MEDIA_LEN, flags=0)
+    if header_kwargs:
+        hdr.update(header_kwargs)
+    payload = build_media_payload(held, event_seq, events, client_ticks_ms,
+                                   reserved0, reserved1)
+    dec = [media_event_decode_ref(cc, f) for (cc, f) in events]
+    canon = build_media_payload(u32(held) & MEDIA_HELD_MASK, event_seq, dec,
+                                 client_ticks_ms, 0, 0)
+    media_vectors.append(dict(
+        name=name, spec_ref=spec_ref,
+        packet=build_header(**hdr) + payload,
+        exp_encoded=canon, enc_same=(canon == payload),
+        exp_held=u32(held) & MEDIA_HELD_MASK,
+        exp_event_seq=u16(event_seq),
+        exp_event_code=[d[0] for d in dec],
+        exp_event_flags=[d[1] for d in dec],
+        exp_client_ticks_ms=u32(client_ticks_ms),
+    ))
+
+
+def media_bit(c):
+    """S6.17: control c (1..32) is bit c-1."""
+    return 1 << (c - 1)
+
+
+MC_PLAY_PAUSE, MC_NEXT_TRACK = 1, 5
+MC_VOLUME_UP, MC_VOLUME_DOWN, MC_MUTE = 9, 10, 11
+MC_BOOKMARKS = 24
+
+add_media_vector(
+    "media_baseline",
+    "S6.17 field offsets 0/4/6/7/8/16, with `held` naming VOLUME_UP (bit 8) "
+    "and MUTE (bit 10) per 'control c (1..32) is bit c-1'",
+    media_bit(MC_VOLUME_UP) | media_bit(MC_MUTE), 0x0304,
+    [(MC_VOLUME_UP, EVENT_DOWN), (MC_NEXT_TRACK, EVENT_DOWN),
+     (MC_NEXT_TRACK, 0x00), (MC_MUTE, EVENT_DOWN)],
+    0xCAFEBABE,
+)
+
+add_media_vector(
+    "media_reserved_ones",
+    "S2/S6.17 reserved SCRUB: held bits 24-31, reserved0, reserved1, event "
+    "flags bits 1-7 and header flags bits 2-15 all ones; decodes identically "
+    "to media_baseline (S13 byte-identity)",
+    media_bit(MC_VOLUME_UP) | media_bit(MC_MUTE) | 0xFF000000, 0x0304,
+    [(MC_VOLUME_UP, EVENT_DOWN | 0xFE), (MC_NEXT_TRACK, EVENT_DOWN | 0xFE),
+     (MC_NEXT_TRACK, 0xFE), (MC_MUTE, EVENT_DOWN | 0xFE)],
+    0xCAFEBABE, header_kwargs=dict(flags=0xFFFC),
+    reserved0=0xFF, reserved1=0xFF,
+)
+
+add_media_vector(
+    "media_held_reserved_bits_scrubbed",
+    "S6.17 'Bits of `held` for unassigned control indices are reserved and "
+    "scrubbed' + S6.18 (25-32 reserved): 0xFFFFFFFF decodes as 0x00FFFFFF",
+    0xFFFFFFFF, 0x0000, [(0, 0)] * MEDIA_RING, 0x00000020,
+)
+
+add_media_vector(
+    "media_held_index_25_only_scrubbed_to_zero",
+    "S6.18 'a control index assigned in a future revision MUST NOT be sent "
+    "unless the server has set that index's bit' -- index 25 alone (bit 24) "
+    "scrubs to an empty held mask",
+    media_bit(25), 0x0000, [(0, 0)] * MEDIA_RING, 0x00000021,
+)
+
+add_media_vector(
+    "media_all_assigned_held",
+    "S6.18: 24 assigned indices, so every legal bit of `held` set is "
+    "0x00FFFFFF",
+    MEDIA_HELD_MASK, 3,
+    [(0, 0), (MC_PLAY_PAUSE, EVENT_DOWN), (MC_BOOKMARKS, EVENT_DOWN),
+     (MC_VOLUME_UP, EVENT_DOWN)],
+    0x00000022,
+)
+
+for _bad in (25, 32, 33, 255):
+    add_media_vector(
+        "media_control_%d_normalised" % _bad,
+        "S6.17 'control outside 0..32, and any control index S6.18 leaves "
+        "unassigned, normalises to 0 and forces flags to 0' (S13 requires a "
+        "control above 24)",
+        media_bit(MC_MUTE), 0x0004,
+        [(_bad, 0xFF), (MC_MUTE, EVENT_DOWN), (_bad, EVENT_DOWN),
+         (MC_PLAY_PAUSE, 0x00)],
+        0x00000023,
+    )
+
+add_media_vector(
+    "media_control_00_flags_forced_zero",
+    "S6.17 'A slot whose usage, button or control decodes to 0 is \"no "
+    "event\"' -- and S6.15's byte-identity rule forces flags to 0 with it",
+    0, 0x0005,
+    [(0x00, EVENT_DOWN), (0x00, 0xFF), (MC_PLAY_PAUSE, EVENT_DOWN), (0x00, 0x02)],
+    0x00000024,
+)
+
+add_media_vector(
+    "media_control_24_highest_assigned_kept",
+    "S6.18 boundary: BOOKMARKS is 24, the highest assigned index, and MUST "
+    "survive decode while 25 does not",
+    media_bit(MC_BOOKMARKS), 0x0006,
+    [(MC_BOOKMARKS, EVENT_DOWN), (25, EVENT_DOWN), (MC_BOOKMARKS, 0x00),
+     (26, 0x00)],
+    0x00000025,
+)
+
+add_media_vector(
+    "media_control_01_lowest_assigned_kept",
+    "S6.18 boundary: PLAY_PAUSE is 1, the lowest assigned index; 0 next to it "
+    "is 'no event', not a control",
+    media_bit(MC_PLAY_PAUSE), 2,
+    [(0, 0), (0, 0), (0x00, EVENT_DOWN), (MC_PLAY_PAUSE, EVENT_DOWN)],
+    0x00000026,
+)
+
+add_media_vector(
+    "media_event_flags_reserved_bits_masked",
+    "S6.20 'Reserved *bits* ... are masked on both sides': flags 0xFF is DOWN, "
+    "0xFE is a release",
+    media_bit(MC_VOLUME_DOWN), 0x0008,
+    [(MC_VOLUME_DOWN, 0xFF), (MC_VOLUME_DOWN, 0xFE), (MC_MUTE, 0x03),
+     (MC_MUTE, 0x80)], 0x00000027,
+)
+
+add_media_vector(
+    "media_ring_right_aligned_one_event",
+    "S6.20 right-alignment: event_seq 1 is the session's first event ever, so "
+    "slots 0,1,2 are zeroed and the only event sits at slot D-1",
+    0, 1, [(0, 0), (0, 0), (0, 0), (MC_NEXT_TRACK, EVENT_DOWN)],
+    0x00000028,
+)
+
+# ---------------------------------------------------------------------------
+# Section K.4: INPUTCAPS (0x44) packet vectors
+# ---------------------------------------------------------------------------
+
+inputcaps_vectors = []
+
+
+def add_inputcaps_vector(name, spec_ref, features, status, media_mask,
+                          mouse_rate_hz, header_kwargs=None,
+                          reserved0=0xA55A):
+    hdr = dict(version=VERSION_1, type_=TYPE_INPUTCAPS, session_id=0x0201,
+                sequence=0x0307, payload_len=INPUTCAPS_LEN, flags=0)
+    if header_kwargs:
+        hdr.update(header_kwargs)
+    payload = build_inputcaps_payload(features, status, media_mask,
+                                       mouse_rate_hz, reserved0)
+    canon = build_inputcaps_payload(u32(features) & FEATURE_MASK,
+                                     u32(status) & STATUS_MASK,
+                                     u32(media_mask) & MEDIA_MASK_MASK,
+                                     mouse_rate_hz, 0)
+    inputcaps_vectors.append(dict(
+        name=name, spec_ref=spec_ref,
+        packet=build_header(**hdr) + payload,
+        exp_encoded=canon, enc_same=(canon == payload),
+        exp_features=u32(features) & FEATURE_MASK,
+        exp_status=u32(status) & STATUS_MASK,
+        exp_media_mask=u32(media_mask) & MEDIA_MASK_MASK,
+        exp_mouse_rate_hz=u16(mouse_rate_hz),
+    ))
+
+
+add_inputcaps_vector(
+    "inputcaps_baseline",
+    "S6.19 field offsets 0/4/8/12/14, with features and status deliberately "
+    "DIFFERENT values -- they answer different questions and a decoder that "
+    "read one for the other would pass an all-equal vector",
+    FEATURE_KEYBOARD | FEATURE_MEDIA,
+    STATUS_KEYBOARD_READY | STATUS_SYNTHETIC,
+    media_bit(MC_PLAY_PAUSE) | media_bit(MC_VOLUME_UP) | media_bit(MC_BOOKMARKS),
+    60,
+)
+
+add_inputcaps_vector(
+    "inputcaps_reserved_ones",
+    "S2/S6.19 reserved SCRUB: features bits 3-31, status bits 4-31, "
+    "media_mask bits 24-31, reserved0 and header flags bits 2-15 all ones; "
+    "decodes identically to inputcaps_baseline (S13 byte-identity)",
+    (FEATURE_KEYBOARD | FEATURE_MEDIA) | 0xFFFFFFF8,
+    (STATUS_KEYBOARD_READY | STATUS_SYNTHETIC) | 0xFFFFFFF0,
+    (media_bit(MC_PLAY_PAUSE) | media_bit(MC_VOLUME_UP)
+     | media_bit(MC_BOOKMARKS)) | 0xFF000000,
+    60, header_kwargs=dict(flags=0xFFFC), reserved0=0xFFFF,
+)
+
+add_inputcaps_vector(
+    "inputcaps_all_features_and_status",
+    "S6.19: all three feature bits and all four status bits, the maximum a "
+    "conforming server can advertise",
+    FEATURE_KEYBOARD | FEATURE_MOUSE | FEATURE_MEDIA,
+    (STATUS_KEYBOARD_READY | STATUS_MOUSE_READY | STATUS_MEDIA_READY
+     | STATUS_SYNTHETIC),
+    MEDIA_MASK_MASK, 125,
+)
+
+add_inputcaps_vector(
+    "inputcaps_features_cleared",
+    "S6.19 'If a `features` bit clears, the client MUST stop sending that "
+    "type' -- the withdrawal packet: nothing offered, nothing ready",
+    0, 0, 0, 0,
+)
+
+add_inputcaps_vector(
+    "inputcaps_mouse_rate_zero_means_session_rate",
+    "S6.19 '0 = use the session's input_rate_hz' -- 0 is a defined value and "
+    "MUST survive decode as 0, not be turned into a default here",
+    FEATURE_MOUSE, STATUS_MOUSE_READY, 0, 0,
+)
+
+add_inputcaps_vector(
+    "inputcaps_mouse_rate_above_ceiling_preserved",
+    "S6.19 'a value above that ceiling MUST be treated as the ceiling' read "
+    "as a rule on the CLIENT'S SENDING RATE, not a decoder normalisation: "
+    "S6.0 lists the receive-side normalisations and mouse_rate_hz is not one, "
+    "and the field has no reserved range for S2 to scrub. 1000 decodes as "
+    "1000; the S11 clamp belongs where the rate is chosen. See the report -- "
+    "this is the one genuinely two-way reading in S6.15-S6.22",
+    FEATURE_MOUSE, STATUS_MOUSE_READY, 0, 1000,
+)
+
+add_inputcaps_vector(
+    "inputcaps_media_mask_reserved_scrubbed",
+    "S6.18/S6.14: a receiver scrubs media_mask bits for indices 25-32 exactly "
+    "as it scrubs the same indices in MEDIA.held",
+    FEATURE_MEDIA, STATUS_MEDIA_READY, 0xFFFFFFFF, 0,
+)
+
+add_inputcaps_vector(
+    "inputcaps_single_feature_no_status",
+    "S6.19 'features is what the server will accept ... status is what exists "
+    "at this instant' -- the state between the advertisement and first use",
+    FEATURE_KEYBOARD, 0, 0, 0,
+)
+
+# ---------------------------------------------------------------------------
+# Section K.5: the S13 byte-identity property, as its own table
+#
+# "every reserved field of each of the four types set to ones -- the decoded
+# structure MUST be byte-identical to the one decoded from the clean packet".
+# The per-type tables above already assert the FIELDS they enumerate; this
+# table asserts the whole decoded object, which additionally covers any field
+# a vector author did not think to enumerate.
+# ---------------------------------------------------------------------------
+
+kbm_identity_vectors = []
+
+
+def add_kbm_identity_vector(name, spec_ref, msg_type, clean_name, dirty_name,
+                             table):
+    clean = [v for v in table if v['name'] == clean_name][0]
+    dirty = [v for v in table if v['name'] == dirty_name][0]
+    assert clean['packet'] != dirty['packet'], "identity pair must differ on the wire"
+    kbm_identity_vectors.append(dict(
+        name=name, spec_ref=spec_ref, msg_type=msg_type,
+        clean_name=clean_name, clean_len=len(clean['packet']),
+        dirty_name=dirty_name, dirty_len=len(dirty['packet']),
+    ))
+
+
+add_kbm_identity_vector(
+    "identity_keyboard", "S6.15 / S13 byte-identity", TYPE_KEYBOARD,
+    "keyboard_baseline", "keyboard_reserved_ones", keyboard_vectors)
+add_kbm_identity_vector(
+    "identity_mouse", "S6.16 / S13 byte-identity", TYPE_MOUSE,
+    "mouse_baseline", "mouse_reserved_ones", mouse_vectors)
+add_kbm_identity_vector(
+    "identity_media", "S6.17 / S13 byte-identity", TYPE_MEDIA,
+    "media_baseline", "media_reserved_ones", media_vectors)
+add_kbm_identity_vector(
+    "identity_inputcaps", "S6.19 / S13 byte-identity", TYPE_INPUTCAPS,
+    "inputcaps_baseline", "inputcaps_reserved_ones", inputcaps_vectors)
+
+# ---------------------------------------------------------------------------
+# Section L: function vectors -- S6.21 apad_seq_diff and the S6.20 event-ring
+# gap. S13 shape 2: "an input tuple and an expected integer result, no packet
+# involved. Required for apad_seq_diff (S6.21) and for the event-ring gap
+# computation of S6.20, both of which are pure arithmetic whose wrap behaviour
+# is the entire point."
+# ---------------------------------------------------------------------------
+
+seq_diff_vectors = []
+
+
+def seq_diff_ref(a, b):
+    """S6.21, transcribed from the normative C in the spec."""
+    d = u16(a - b)
+    if d < 0x8000:
+        return d
+    return -(0x10000 - d)
+
+
+def add_seq_diff_vector(name, spec_ref, a, b, exp=None):
+    computed = seq_diff_ref(a, b)
+    if exp is not None:
+        assert computed == exp, (name, computed, exp)
+    seq_diff_vectors.append(dict(name=name, spec_ref=spec_ref,
+                                  a=u16(a), b=u16(b), exp=computed))
+
+
+# The five worked values S6.21 prints and S13 requires as vectors.
+add_seq_diff_vector("seq_diff_worked_plus_10",
+                     "S6.21 worked value: (0x0005, 0xFFFB) is +10",
+                     0x0005, 0xFFFB, 10)
+add_seq_diff_vector("seq_diff_worked_minus_10",
+                     "S6.21 worked value: (0xFFFB, 0x0005) is -10",
+                     0xFFFB, 0x0005, -10)
+add_seq_diff_vector("seq_diff_worked_min",
+                     "S6.21 worked value: (0x8000, 0x0000) is -32768",
+                     0x8000, 0x0000, -32768)
+add_seq_diff_vector("seq_diff_worked_max",
+                     "S6.21 worked value: (0x7FFF, 0x0000) is +32767",
+                     0x7FFF, 0x0000, 32767)
+add_seq_diff_vector("seq_diff_worked_zero",
+                     "S6.21 worked value: (0x0000, 0x0000) is 0",
+                     0x0000, 0x0000, 0)
+
+# Both wrap directions, which is what S13 asks for beyond the worked values
+# and what a naive (int)a - (int)b gets catastrophically wrong.
+add_seq_diff_vector("seq_diff_wrap_forward_by_one",
+                     "S6.21 across the 0xFFFF wrap: +1, not -65535",
+                     0x0000, 0xFFFF, 1)
+add_seq_diff_vector("seq_diff_wrap_backward_by_one",
+                     "S6.21 across the 0xFFFF wrap: -1, not +65535",
+                     0xFFFF, 0x0000, -1)
+add_seq_diff_vector("seq_diff_wrap_forward_by_six",
+                     "S6.21: 0xFFFD -> 0x0003 is +6", 0x0003, 0xFFFD, 6)
+add_seq_diff_vector("seq_diff_wrap_backward_by_six",
+                     "S6.21: 0x0003 -> 0xFFFD is -6", 0xFFFD, 0x0003, -6)
+add_seq_diff_vector("seq_diff_adjacent_forward",
+                     "S6.21: the smallest positive step", 0xFFFF, 0xFFFE, 1)
+add_seq_diff_vector("seq_diff_adjacent_backward",
+                     "S6.21: the smallest negative step", 0x0000, 0x0001, -1)
+
+# The half-space boundary. S6.21's function is not antisymmetric there: a
+# distance of exactly 0x8000 reads as -32768 whichever way it is written,
+# because [-32768, 32767] cannot hold +32768. Pinning it is the only way two
+# implementations agree on the boundary case rather than on the easy ones.
+add_seq_diff_vector("seq_diff_half_space_is_negative",
+                     "S6.21: d == 0x8000 is not < 0x8000, so the result is "
+                     "-32768 -- (0x0000, 0x8000) as well as (0x8000, 0x0000)",
+                     0x0000, 0x8000, -32768)
+add_seq_diff_vector("seq_diff_half_space_mid_range",
+                     "S6.21: the same boundary away from zero", 0x4000, 0xC000,
+                     -32768)
+add_seq_diff_vector("seq_diff_one_inside_half_space",
+                     "S6.21: one less than the boundary is the most negative "
+                     "value that is not -32768", 0x0001, 0x8000, -32767)
+add_seq_diff_vector("seq_diff_max_positive_across_wrap",
+                     "S6.21: +32767 measured across the wrap, not from zero",
+                     0x7FFE, 0xFFFF, 32767)
+add_seq_diff_vector("seq_diff_min_negative_across_wrap",
+                     "S6.21: -32768 measured across the wrap", 0xFFFF, 0x7FFF,
+                     -32768)
+
+# ---- L.2: the S6.20 event-ring gap ---------------------------------------
+#
+# S6.20 step 2, normative: g = apad_seq_diff(event_seq, last_applied);
+#   g <= 0        -> replay nothing
+#   1 <= g <= D   -> replay slots D-g .. D-1
+#   g > D         -> replay all D slots AND surface the overflow
+# The vector records the NUMBER of trailing slots to replay (0..D) and whether
+# the overflow must be surfaced, which is exactly the pair of facts the rest
+# of the algorithm needs.
+
+event_ring_vectors = []
+
+
+def add_event_ring_vector(name, spec_ref, event_seq, last_seq, ring_len,
+                           exp_replay=None, exp_overflow=None):
+    g = seq_diff_ref(event_seq, last_seq)
+    if g <= 0:
+        replay, overflow = 0, 0
+    elif g <= ring_len:
+        replay, overflow = g, 0
+    else:
+        replay, overflow = ring_len, 1
+    if exp_replay is not None:
+        assert replay == exp_replay, (name, replay, exp_replay)
+    if exp_overflow is not None:
+        assert overflow == exp_overflow, (name, overflow, exp_overflow)
+    event_ring_vectors.append(dict(
+        name=name, spec_ref=spec_ref, event_seq=u16(event_seq),
+        last_seq=u16(last_seq), ring_len=ring_len, gap=g,
+        exp_replay=replay, exp_overflow=overflow))
+
+
+add_event_ring_vector("ring_gap_zero_kb",
+                       "S6.20 'g <= 0 -- nothing new, or a duplicate. Replay "
+                       "no events.' (S13: 'one of zero')",
+                       100, 100, KEYBOARD_RING, 0, 0)
+add_event_ring_vector("ring_gap_one_kb",
+                       "S6.20 '1 <= g <= D -- replay slots D - g through "
+                       "D - 1' (S13: 'one of one')",
+                       101, 100, KEYBOARD_RING, 1, 0)
+add_event_ring_vector("ring_gap_exactly_depth_kb",
+                       "S6.20: g == D is still the non-overflow branch -- the "
+                       "ring carries exactly what was missed (S13: 'one of "
+                       "exactly the ring depth')",
+                       108, 100, KEYBOARD_RING, 8, 0)
+add_event_ring_vector("ring_gap_depth_plus_one_kb",
+                       "S6.20 'g > D -- events have been lost that the ring "
+                       "cannot carry ... surface the overflow' (S13: 'a gap "
+                       "larger than the ring')",
+                       109, 100, KEYBOARD_RING, 8, 1)
+add_event_ring_vector("ring_gap_not_newer_kb",
+                       "S6.20: an event_seq older than last_applied replays "
+                       "nothing and is NOT an overflow (S13: 'one that is not "
+                       "newer than what was last applied')",
+                       99, 100, KEYBOARD_RING, 0, 0)
+add_event_ring_vector("ring_gap_far_older_kb",
+                       "S6.20: far older, still just 'replay nothing'",
+                       100, 200, KEYBOARD_RING, 0, 0)
+add_event_ring_vector("ring_gap_huge_kb",
+                       "S6.20: the largest positive gap S6.21 can express",
+                       0x7FFF, 0x0000, KEYBOARD_RING, 8, 1)
+add_event_ring_vector("ring_gap_half_space_reads_as_older_kb",
+                       "S6.21 + S6.20: a gap of exactly 0x8000 is -32768, so "
+                       "it replays nothing rather than overflowing. This is a "
+                       "consequence of the normative helper, not a separate "
+                       "rule, and it is the boundary two implementations "
+                       "otherwise disagree on",
+                       0x8000, 0x0000, KEYBOARD_RING, 0, 0)
+add_event_ring_vector("ring_gap_wrap_while_full_kb",
+                       "S6.20 + S6.21: last_applied 0xFFFF, event_seq 0x0007 "
+                       "-- a gap of exactly the depth measured across the wrap "
+                       "(S13: 'a wrap while full')",
+                       0x0007, 0xFFFF, KEYBOARD_RING, 8, 0)
+add_event_ring_vector("ring_gap_wrap_overflow_kb",
+                       "S6.20 + S6.21: one more across the wrap overflows",
+                       0x0008, 0xFFFF, KEYBOARD_RING, 8, 1)
+
+add_event_ring_vector("ring_gap_zero_depth4",
+                       "S6.20: 'Depth is ... 4 for MOUSE and MEDIA'",
+                       0x0100, 0x0100, MOUSE_RING, 0, 0)
+add_event_ring_vector("ring_gap_one_depth4",
+                       "S6.20 at depth 4: replay slot 3 only",
+                       0x0101, 0x0100, MOUSE_RING, 1, 0)
+add_event_ring_vector("ring_gap_exactly_depth4",
+                       "S6.20 at depth 4: g == 4 replays the whole ring "
+                       "without overflow",
+                       0x0104, 0x0100, MOUSE_RING, 4, 0)
+add_event_ring_vector("ring_gap_depth4_plus_one",
+                       "S6.20 at depth 4: g == 5 overflows",
+                       0x0105, 0x0100, MOUSE_RING, 4, 1)
+add_event_ring_vector("ring_gap_wrap_while_full_depth4",
+                       "S6.20 + S6.21 at depth 4: 0xFFFE -> 0x0002 is a gap of "
+                       "exactly 4 across the wrap",
+                       0x0002, 0xFFFE, MOUSE_RING, 4, 0)
+add_event_ring_vector("ring_gap_wrap_overflow_depth4",
+                       "S6.20 + S6.21 at depth 4: 0xFFFE -> 0x0003 overflows",
+                       0x0003, 0xFFFE, MOUSE_RING, 4, 1)
+add_event_ring_vector("ring_gap_not_newer_across_wrap_depth4",
+                       "S6.20 + S6.21: 0x0002 -> 0xFFFE is -4, so nothing is "
+                       "replayed and nothing overflows",
+                       0xFFFE, 0x0002, MOUSE_RING, 0, 0)
+
+# ---------------------------------------------------------------------------
+# Section M: sequence vectors -- S13 shape 3. "An ordered list of packets with
+# the expected receiver state after EACH one. Required for anything that is
+# only wrong across two or more datagrams: the S6.16 baseline rule, a stale
+# packet not advancing the baseline, gap replay, overflow, and the S6.20
+# step-3 reconcile that must run even when no events are replayed. A sequence
+# vector asserts after every step, not only at the end, or a design that
+# converges by accident passes."
+#
+# The receiver modelled here is exactly S6.20's, and nothing more:
+#
+#   window   S6.20 'MUST discard a datagram ... whose header `sequence` is not
+#            apad_seq_newer() than the newest datagram of the SAME TYPE it has
+#            already accepted'. One window per type; INPUT_STATE's is a
+#            different window and is not touched here.
+#   step 1   first accepted message of a type: last_applied = event_seq, apply
+#            NO events, apply the snapshot as state.
+#   step 2   g = apad_seq_diff(event_seq, last_applied); replay the trailing
+#            g slots (capped at D, overflow surfaced), ascending, skipping
+#            "no event" slots.
+#   step 3   ALWAYS reconcile held state against the snapshot -- including
+#            when g <= 0 and including on overflow.
+#   step 4   last_applied = event_seq.
+#   S6.16    motion is apad_seq_diff against the last ACCEPTED sample; the
+#            first accepted sample produces ZERO motion; a stale datagram MUST
+#            NOT advance the baseline.
+#
+# INPUTCAPS has no sequence vectors here even though S6.20 gives it a window
+# too: it is server->client, so its window belongs to the client's session
+# state and core exposes no slot for it. Flagged in the report rather than
+# invented.
+# ---------------------------------------------------------------------------
+
+CLS_KEYBOARD, CLS_MOUSE, CLS_MEDIA = 0, 1, 2
+
+
+def seq_newer_ref(a, b):
+    """S9, transcribed from the normative C in the spec."""
+    d = u16(a - b)
+    return d != 0 and d < 0x8000
+
+
+class KbmRef(object):
+    """A receiver built from S6.20's four numbered steps and nothing else."""
+
+    def __init__(self, cls):
+        self.cls = cls
+        self.depth = KEYBOARD_RING if cls == CLS_KEYBOARD else MOUSE_RING
+        self.win_valid = False
+        self.win_seq = 0
+        self.have_first = False
+        self.last_applied = 0
+        self.keys = [0] * KEYS_BYTES
+        self.buttons = 0
+        self.held = 0
+        self.base_valid = False
+        self.base = (0, 0, 0, 0)
+
+    def state(self):
+        return dict(exp_keys=list(self.keys), exp_buttons=self.buttons,
+                     exp_held=self.held, exp_last_applied=self.last_applied)
+
+    def feed(self, hdr_seq, dec):
+        """`dec` is the DECODED (scrubbed and normalised) payload."""
+        if self.win_valid and not seq_newer_ref(hdr_seq, self.win_seq):
+            r = dict(exp_accepted=0, exp_overflow=0, exp_replay=[],
+                      exp_motion=(0, 0, 0, 0))
+            r.update(self.state())
+            return r
+        self.win_valid = True
+        self.win_seq = u16(hdr_seq)
+
+        # S6.16 rule 1/2: the baseline follows ACCEPTANCE, never mere receipt.
+        motion = (0, 0, 0, 0)
+        if self.cls == CLS_MOUSE:
+            now = (dec['dx'], dec['dy'], dec['wheel'], dec['hwheel'])
+            if self.base_valid:
+                motion = tuple(seq_diff_ref(now[i], self.base[i])
+                                for i in range(4))
+            self.base_valid = True
+            self.base = now
+
+        # S6.20 steps 1 and 2.
+        if not self.have_first:
+            self.have_first = True
+            n, overflow = 0, 0
+        else:
+            g = seq_diff_ref(dec['event_seq'], self.last_applied)
+            if g <= 0:
+                n, overflow = 0, 0
+            elif g <= self.depth:
+                n, overflow = g, 0
+            else:
+                n, overflow = self.depth, 1
+
+        replay = []
+        for slot in range(self.depth - n, self.depth):
+            code, flags = dec['events'][slot]
+            if code != 0:                      # S6.20: skip "no event" slots
+                replay.append((code, flags))
+
+        # S6.20 step 3: reconcile, unconditionally. The snapshot is always the
+        # authority; the ring only adds back what a snapshot cannot express.
+        if self.cls == CLS_KEYBOARD:
+            self.keys = list(dec['keys'])
+        elif self.cls == CLS_MOUSE:
+            self.buttons = dec['buttons']
+        else:
+            self.held = dec['held']
+
+        self.last_applied = dec['event_seq']   # S6.20 step 4
+
+        r = dict(exp_accepted=1, exp_overflow=overflow, exp_replay=replay,
+                  exp_motion=motion)
+        r.update(self.state())
+        return r
+
+
+kbm_sequence_vectors = []
+
+
+def _kb_step(ref, seq, keys, event_seq, events, ticks=0x00001000):
+    payload = build_keyboard_payload(keys, event_seq, events, ticks)
+    hdr = build_header(VERSION_1, TYPE_KEYBOARD, session_id=0x0201,
+                        sequence=seq, payload_len=KEYBOARD_LEN, flags=0)
+    dec = dict(keys=keys_decode_ref(keys), event_seq=u16(event_seq),
+                events=[key_event_decode_ref(u, f) for (u, f) in events])
+    step = ref.feed(seq, dec)
+    step['packet'] = hdr + payload
+    return step
+
+
+def _mouse_step(ref, seq, dx, dy, wheel, hwheel, buttons, event_seq, events,
+                 ticks=0x00002000):
+    payload = build_mouse_payload(dx, dy, wheel, hwheel, buttons, event_seq,
+                                   events, ticks)
+    hdr = build_header(VERSION_1, TYPE_MOUSE, session_id=0x0201,
+                        sequence=seq, payload_len=MOUSE_LEN, flags=0)
+    dec = dict(dx=u16(dx), dy=u16(dy), wheel=u16(wheel), hwheel=u16(hwheel),
+                buttons=u16(buttons) & MOUSE_BUTTONS_MASK,
+                event_seq=u16(event_seq),
+                events=[mouse_event_decode_ref(b, f) for (b, f) in events])
+    step = ref.feed(seq, dec)
+    step['packet'] = hdr + payload
+    return step
+
+
+def _media_step(ref, seq, held, event_seq, events, ticks=0x00003000):
+    payload = build_media_payload(held, event_seq, events, ticks)
+    hdr = build_header(VERSION_1, TYPE_MEDIA, session_id=0x0201,
+                        sequence=seq, payload_len=MEDIA_LEN, flags=0)
+    dec = dict(held=u32(held) & MEDIA_HELD_MASK, event_seq=u16(event_seq),
+                events=[media_event_decode_ref(c, f) for (c, f) in events])
+    step = ref.feed(seq, dec)
+    step['packet'] = hdr + payload
+    return step
+
+
+def add_kbm_sequence(name, spec_ref, cls, msg_type, steps):
+    depth = KEYBOARD_RING if cls == CLS_KEYBOARD else MOUSE_RING
+    kbm_sequence_vectors.append(dict(name=name, spec_ref=spec_ref, cls=cls,
+                                      msg_type=msg_type, ring_depth=depth,
+                                      steps=steps))
+
+
+# ---- M.1: first accepted far from zero, gap replay, duplicate, reconcile,
+#           overflow. S13 names every one of these. -------------------------
+_r = KbmRef(CLS_KEYBOARD)
+_kb1_keys = keys_bitmap([HID_A, HID_LSHIFT])
+_kb1_ring = [(HID_W, EVENT_DOWN), (HID_W, 0x00), (HID_S, EVENT_DOWN),
+              (HID_S, 0x00), (HID_D, EVENT_DOWN), (HID_D, 0x00),
+              (HID_A, EVENT_DOWN), (HID_LSHIFT, EVENT_DOWN)]
+_steps = []
+_steps.append(_kb_step(
+    _r, 1000, _kb1_keys, 0x4000, _kb1_ring))
+# Two new events (B down, B up) arrive; the ring shifts left by two.
+_kb1_ring2 = _kb1_ring[2:] + [(HID_B, EVENT_DOWN), (HID_B, 0x00)]
+_steps.append(_kb_step(_r, 1001, _kb1_keys, 0x4002, _kb1_ring2))
+_steps.append(_kb_step(_r, 1001, _kb1_keys, 0x4002, _kb1_ring2))   # duplicate
+# Snapshot disagrees while event_seq is UNCHANGED: step 3 must still converge.
+_kb1_keys3 = keys_bitmap([HID_A, HID_LSHIFT, HID_C])
+_steps.append(_kb_step(_r, 1002, _kb1_keys3, 0x4002, _kb1_ring2))
+# Nine events generated, eight slots: overflow MUST be surfaced.
+_kb1_ring4 = [(HID_Z, EVENT_DOWN), (HID_Z, 0x00), (HID_A, 0x00),
+               (HID_LSHIFT, 0x00), (HID_ENTER, EVENT_DOWN), (HID_ENTER, 0x00),
+               (HID_ESC, EVENT_DOWN), (HID_ESC, 0x00)]
+_steps.append(_kb_step(_r, 1003, keys_bitmap([HID_C]), 0x400B, _kb1_ring4))
+_steps.append(_kb_step(_r, 999, _kb1_keys, 0x4000, _kb1_ring))     # reordered
+_steps.append(_kb_step(_r, 1004, [0] * KEYS_BYTES, 0x400B, _kb1_ring4))
+add_kbm_sequence(
+    "seq_kb_far_first_gap_dup_reconcile_overflow",
+    "S6.20 steps 1-4 end to end: a first accepted message whose event_seq is "
+    "far from zero replays nothing and surfaces no overflow (S13); a gap of 2 "
+    "replays the two trailing slots; a duplicate header sequence is discarded "
+    "by the per-type window; an UNCHANGED event_seq with a disagreeing "
+    "snapshot still converges in one packet (S13, S6.20 step 3); a gap of 9 "
+    "on a ring of 8 replays all 8 AND surfaces the overflow",
+    CLS_KEYBOARD, TYPE_KEYBOARD, _steps)
+
+# ---- M.2: right-alignment, proved by replaying ---------------------------
+_r = KbmRef(CLS_KEYBOARD)
+_steps = []
+_steps.append(_kb_step(_r, 0, [0] * KEYS_BYTES, 0, [(0, 0)] * KEYBOARD_RING))
+_steps.append(_kb_step(
+    _r, 1, keys_bitmap([HID_A]), 3,
+    [(0, 0)] * 5 + [(HID_W, EVENT_DOWN), (HID_A, EVENT_DOWN), (HID_W, 0x00)]))
+_steps.append(_kb_step(
+    _r, 2, keys_bitmap([HID_A, HID_S]), 4,
+    [(0, 0)] * 4 + [(HID_W, EVENT_DOWN), (HID_A, EVENT_DOWN), (HID_W, 0x00),
+                     (HID_S, EVENT_DOWN)]))
+add_kbm_sequence(
+    "seq_kb_right_alignment",
+    "S6.20 'The ring is right-aligned, and this is normative because both "
+    "alignments satisfy \"oldest first\" and they disagree byte for byte.' "
+    "Three events on a ring of 8 sit in slots 5,6,7 with the leading slots "
+    "zeroed; a front-packing receiver replays three zeroed slots here and "
+    "loses every event (S13: 'proving the newest sits at slot D-1')",
+    CLS_KEYBOARD, TYPE_KEYBOARD, _steps)
+
+# ---- M.3: "no event" slots inside the replay range are SKIPPED -----------
+_r = KbmRef(CLS_KEYBOARD)
+_steps = []
+_m3_ring0 = [(HID_A, EVENT_DOWN), (HID_A, 0x00)] * 4
+_steps.append(_kb_step(_r, 20, [0] * KEYS_BYTES, 0x0010, _m3_ring0))
+_steps.append(_kb_step(
+    _r, 21, keys_bitmap([HID_A, HID_B, HID_C, HID_Z]), 0x0018,
+    [(HID_A, EVENT_DOWN), (0x00, 0x00), (HID_B, EVENT_DOWN), (0x02, EVENT_DOWN),
+     (HID_C, EVENT_DOWN), (HID_D, 0x00), (0x00, EVENT_DOWN),
+     (HID_Z, EVENT_DOWN)]))
+add_kbm_sequence(
+    "seq_kb_replay_skips_no_event_slots",
+    "S6.20 'A slot whose usage, button or control decodes to 0 is \"no event\" "
+    "and MUST be skipped during replay. It is not an event with code zero.' "
+    "The gap is exactly the ring depth, so all 8 slots are replayed and 3 of "
+    "them are skipped -- including one sent as the reserved usage 0x02 and one "
+    "sent as code 0 with a DOWN flag. A sender that emitted this ring is "
+    "non-conforming (S6.20 'Encoding an out-of-range value'), which is "
+    "precisely the case the receive-side rule exists for",
+    CLS_KEYBOARD, TYPE_KEYBOARD, _steps)
+
+# ---- M.4: S6.16's three accumulator rules -------------------------------
+_r = KbmRef(CLS_MOUSE)
+_zr = [(0, 0)] * MOUSE_RING
+_steps = []
+_steps.append(_mouse_step(_r, 10, 0xFFF0, 0x0100, 0x0002, 0xFFFE, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 11, 0x0005, 0x00A0, 0x0000, 0x0002, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 11, 0x0005, 0x00A0, 0x0000, 0x0002, 0, 0, _zr))
+# The reordered original. Its dx differs from the accepted baseline, so if a
+# receiver let it advance the baseline the NEXT step's motion would be +11
+# instead of -10 -- which is the "backwards jerk then a compensating forward
+# one" S6.16 rule 2 exists to prevent.
+_steps.append(_mouse_step(_r, 10, 0xFFF0, 0x0100, 0x0002, 0xFFFE, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 12, 0xFFFB, 0x00A0, 0x8000, 0x0002, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 13, 0x0005, 0x00A0, 0x8000, 0x0002, 0, 0, _zr))
+_steps.append(_mouse_step(
+    _r, 14, 0x0005, 0x00A0, 0x8000, 0x0002, (1 << 0) | (1 << 1), 2,
+    [(0, 0), (0, 0), (MB_LEFT, EVENT_DOWN), (MB_RIGHT, EVENT_DOWN)]))
+_steps.append(_mouse_step(
+    _r, 15, 0x0005, 0x00A0, 0x8000, 0x0002, 0, 4,
+    [(MB_LEFT, EVENT_DOWN), (MB_RIGHT, EVENT_DOWN), (MB_LEFT, 0x00),
+     (MB_RIGHT, 0x00)]))
+add_kbm_sequence(
+    "seq_mouse_baseline_stale_wrap",
+    "S6.16 'Accumulator semantics -- normative': rule 1 (the first accepted "
+    "MOUSE establishes the baseline and MUST produce zero motion), rule 2 (a "
+    "packet discarded as stale MUST NOT advance the baseline -- step 5 here "
+    "re-sends the ORIGINAL, whose accumulators differ, so a receiver that "
+    "advanced the baseline reports +11 where the vector requires -10), and "
+    "rule 3 via S6.21 in both wrap directions (+21 across 0xFFF0->0x0005, "
+    "-10 across 0x0005->0xFFFB) plus the -32768 extreme on the wheel",
+    CLS_MOUSE, TYPE_MOUSE, _steps)
+
+# ---- M.5: the per-type window wraps across 0xFFFF ------------------------
+_r = KbmRef(CLS_MOUSE)
+_steps = []
+_steps.append(_mouse_step(_r, 0xFFFE, 0x0000, 0, 0, 0, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 0xFFFF, 0x000A, 0, 0, 0, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 0x0000, 0x0014, 0, 0, 0, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 0xFFFF, 0x000A, 0, 0, 0, 0, 0, _zr))
+_steps.append(_mouse_step(_r, 0x0001, 0x001E, 0, 0, 0, 0, 0, _zr))
+add_kbm_sequence(
+    "seq_mouse_window_wraps",
+    "S6.20's per-type window uses apad_seq_newer (S9), so 0x0000 is newer than "
+    "0xFFFF and 0xFFFF is then stale. A naive `>` accepts steps 1-2, then "
+    "freezes the pointer forever at the wrap -- and every test shorter than "
+    "nine minutes passes",
+    CLS_MOUSE, TYPE_MOUSE, _steps)
+
+# ---- M.6: MEDIA -- a wrap while full, overflow, and two reconciles -------
+_r = KbmRef(CLS_MEDIA)
+_m6_ring0 = [(MC_VOLUME_UP, EVENT_DOWN), (MC_VOLUME_UP, 0x00),
+              (MC_VOLUME_DOWN, EVENT_DOWN), (MC_VOLUME_DOWN, 0x00)]
+_steps = []
+_steps.append(_media_step(_r, 5, 0, 0xFFFE, _m6_ring0))
+_m6_ring1 = [(MC_NEXT_TRACK, EVENT_DOWN), (MC_NEXT_TRACK, 0x00),
+              (MC_MUTE, EVENT_DOWN), (MC_PLAY_PAUSE, EVENT_DOWN)]
+_steps.append(_media_step(_r, 6, media_bit(MC_MUTE) | media_bit(MC_PLAY_PAUSE),
+                           0x0002, _m6_ring1))
+_m6_ring2 = [(MC_MUTE, 0x00), (MC_PLAY_PAUSE, 0x00), (MC_BOOKMARKS, EVENT_DOWN),
+              (MC_BOOKMARKS, 0x00)]
+_steps.append(_media_step(_r, 7, 0, 0x0007, _m6_ring2))
+_steps.append(_media_step(_r, 7, 0, 0x0007, _m6_ring2))            # duplicate
+_steps.append(_media_step(_r, 8, media_bit(MC_VOLUME_UP), 0x0007, _m6_ring2))
+_steps.append(_media_step(_r, 9, media_bit(MC_MUTE), 0x0006, _m6_ring2))
+add_kbm_sequence(
+    "seq_media_wrap_full_overflow_reconcile",
+    "S6.20 at depth 4: a gap of exactly the depth measured ACROSS the "
+    "event_seq wrap (0xFFFE -> 0x0002) replays all four slots without "
+    "surfacing an overflow (S13: 'a wrap while full'); one more than the depth "
+    "does surface it; and the last two steps show step 3 running with no "
+    "replay at all -- once at an unchanged event_seq and once at an event_seq "
+    "that went BACKWARDS while the header sequence went forwards, which the "
+    "per-type window accepts because the two counters are different spaces",
+    CLS_MEDIA, TYPE_MEDIA, _steps)
+
+
+# ---------------------------------------------------------------------------
+# Section N: encode vectors for S6.15-S6.19.
+#
+# Added after the decode sections, once S6.20's "Encoding an out-of-range
+# value" had settled what an encoder actually owes. It owes exactly two
+# things, both from S2 and both testable:
+#
+#   * reserved BYTES are zero on send -- KEYBOARD's reserved0/reserved1,
+#     MEDIA's reserved0/reserved1, INPUTCAPS's reserved0. None of these exist
+#     in the in-memory structs at all, so an encoder has to write the zeroes
+#     deliberately rather than copy them from a caller.
+#   * reserved BITS are masked on send -- keys[0] bits 0-3, every event's
+#     flags bits 1-7, MOUSE.buttons bits 5-15, MEDIA.held bits 24-31,
+#     INPUTCAPS features bits 3-31 / status bits 4-31 / media_mask bits 24-31.
+#     S6.20: "Reserved *bits* are different: they are masked on both sides."
+#
+# And what it does NOT owe: S6.20 says an encoder "is not required to
+# normalise [an out-of-range event code], and SHOULD NOT". A SHOULD is not a
+# vector, so no input below carries an out-of-range usage/button/control, and
+# nothing here asserts what an encoder does with one.
+#
+# One inference, and it is small: INPUTCAPS.mouse_rate_hz is emitted verbatim
+# even above S11's ceiling. S6.19 (revised) says the ceiling is "an obligation
+# on the client's send rate, not a decode normalisation" and that a decoder
+# MUST preserve the value; the field has no reserved numeric range, so on the
+# encode side there is simply nothing for S2 to mask. An encoder that clamped
+# would be inventing a rule.
+# ---------------------------------------------------------------------------
+
+kbm_encode_vectors = []
+
+
+def add_kbm_encode_vector(name, spec_ref, msg_type, **f):
+    """`f` carries the caller's IN-MEMORY struct values -- deliberately
+    including reserved bits set to ones. exp_payload is derived by applying
+    S2's masking and zeroing, and nothing else."""
+    keys = f.get('keys', [0] * KEYS_BYTES)
+    events = f.get('events', [(0, 0)] * 8)
+    seq = f.get('event_seq', 0)
+    ticks = f.get('client_ticks_ms', 0)
+    for (code, flags) in events:
+        # Guard the "SHOULD NOT normalise" boundary at generation time: an
+        # out-of-range code must never reach an encode vector, because the
+        # spec declines to say what happens to it.
+        if msg_type == TYPE_KEYBOARD:
+            assert code == 0 or code > 0x03, name
+        elif msg_type == TYPE_MOUSE:
+            assert code == 0 or 1 <= code <= 5, name
+        elif msg_type == TYPE_MEDIA:
+            assert code == 0 or 1 <= code <= MEDIA_ASSIGNED_MAX, name
+        if code == 0:
+            assert (flags & EVENT_FLAGS_MASK) == 0, name
+
+    if msg_type == TYPE_KEYBOARD:
+        masked = [(c, f_ & EVENT_FLAGS_MASK) for (c, f_) in events]
+        payload = build_keyboard_payload(keys_decode_ref(keys), seq, masked,
+                                          ticks, 0, 0)
+    elif msg_type == TYPE_MOUSE:
+        masked = [(c, f_ & EVENT_FLAGS_MASK) for (c, f_) in events[:MOUSE_RING]]
+        payload = build_mouse_payload(
+            f.get('dx', 0), f.get('dy', 0), f.get('wheel', 0),
+            f.get('hwheel', 0), f.get('buttons', 0) & MOUSE_BUTTONS_MASK,
+            seq, masked, ticks)
+    elif msg_type == TYPE_MEDIA:
+        masked = [(c, f_ & EVENT_FLAGS_MASK) for (c, f_) in events[:MEDIA_RING]]
+        payload = build_media_payload(f.get('held', 0) & MEDIA_HELD_MASK, seq,
+                                       masked, ticks, 0, 0)
+    else:
+        payload = build_inputcaps_payload(
+            f.get('features', 0) & FEATURE_MASK,
+            f.get('status', 0) & STATUS_MASK,
+            f.get('media_mask', 0) & MEDIA_MASK_MASK,
+            f.get('mouse_rate_hz', 0), 0)
+
+    kbm_encode_vectors.append(dict(
+        name=name, spec_ref=spec_ref, msg_type=msg_type,
+        in_keys=list(keys),
+        in_dx=u16(f.get('dx', 0)), in_dy=u16(f.get('dy', 0)),
+        in_wheel=u16(f.get('wheel', 0)), in_hwheel=u16(f.get('hwheel', 0)),
+        in_buttons=u16(f.get('buttons', 0)),
+        in_held=u32(f.get('held', 0)),
+        in_features=u32(f.get('features', 0)), in_status=u32(f.get('status', 0)),
+        in_media_mask=u32(f.get('media_mask', 0)),
+        in_mouse_rate_hz=u16(f.get('mouse_rate_hz', 0)),
+        in_event_seq=u16(seq),
+        in_event_code=[c & 0xFF for (c, _f) in events] + [0] * (8 - len(events)),
+        in_event_flags=[x & 0xFF for (_c, x) in events] + [0] * (8 - len(events)),
+        in_client_ticks_ms=u32(ticks),
+        exp_payload=payload,
+    ))
+
+
+# ---- N.1 KEYBOARD --------------------------------------------------------
+_enc_kb_keys = keys_bitmap([HID_A, HID_Z, HID_SPACE, HID_LCTRL, HID_RGUI])
+_enc_kb_events = _kb_baseline_events
+
+add_kbm_encode_vector(
+    "encode_keyboard_clean",
+    "S6.15 encode: every field at its stated offset, reserved0/reserved1 "
+    "written as zero by the encoder (they do not exist in the struct)",
+    TYPE_KEYBOARD, keys=_enc_kb_keys, event_seq=0x1234,
+    events=_enc_kb_events, client_ticks_ms=0x89ABCDEF)
+
+add_kbm_encode_vector(
+    "encode_keyboard_reserved_ones",
+    "S2 'MUST be zero on send' + S6.20 'Reserved *bits* ... are masked on "
+    "both sides': a caller hands in keys[0] bits 0-3 set and every event's "
+    "flags bits 1-7 set, and the emitted bytes MUST be identical to "
+    "encode_keyboard_clean's. This is the encode-side mirror of S6.15's "
+    "byte-identity property, and it is the check that catches an encoder "
+    "trusting its caller",
+    TYPE_KEYBOARD, keys=[_enc_kb_keys[0] | 0x0F] + _enc_kb_keys[1:],
+    event_seq=0x1234,
+    events=[(u, f | 0xFE) for (u, f) in _enc_kb_events],
+    client_ticks_ms=0x89ABCDEF)
+
+add_kbm_encode_vector(
+    "encode_keyboard_empty",
+    "S6.15 'SHOULD send three copies about 50 ms apart after the last key "
+    "releases': the all-zero KEYBOARD is 56 zero bytes, which also pins that "
+    "an encoder leaves no stale data in the reserved bytes",
+    TYPE_KEYBOARD)
+
+add_kbm_encode_vector(
+    "encode_keyboard_modifiers_only",
+    "S6.15: the eight modifiers ride inside keys[] like any other usage, so "
+    "the encoder writes keys[28] = 0xFF and nothing else",
+    TYPE_KEYBOARD,
+    keys=keys_bitmap([HID_LCTRL, HID_LSHIFT, HID_LALT, HID_LGUI,
+                       HID_RCTRL, HID_RSHIFT, HID_RALT, HID_RGUI]),
+    event_seq=8,
+    events=[(u, EVENT_DOWN) for u in (HID_LCTRL, HID_LSHIFT, HID_LALT,
+                                       HID_LGUI, HID_RCTRL, HID_RSHIFT,
+                                       HID_RALT, HID_RGUI)],
+    client_ticks_ms=0x0000FFFF)
+
+# ---- N.2 MOUSE -----------------------------------------------------------
+_enc_mo_events = [(MB_LEFT, EVENT_DOWN), (MB_MIDDLE, EVENT_DOWN),
+                   (MB_LEFT, 0x00), (MB_FORWARD, EVENT_DOWN)]
+
+add_kbm_encode_vector(
+    "encode_mouse_clean",
+    "S6.16 encode: four different accumulator values so a swapped pair cannot "
+    "pass, plus the buttons mask and the ring",
+    TYPE_MOUSE, dx=0x1234, dy=0xFF9C, wheel=0x0003, hwheel=0xFFFF,
+    buttons=(1 << 0) | (1 << 2), event_seq=0x0102, events=_enc_mo_events,
+    client_ticks_ms=0x0BADF00D)
+
+add_kbm_encode_vector(
+    "encode_mouse_reserved_ones",
+    "S2/S6.16 encode: buttons bits 5-15 and every event's flags bits 1-7 set "
+    "by the caller MUST NOT reach the wire; the bytes MUST equal "
+    "encode_mouse_clean's",
+    TYPE_MOUSE, dx=0x1234, dy=0xFF9C, wheel=0x0003, hwheel=0xFFFF,
+    buttons=((1 << 0) | (1 << 2)) | 0xFFE0, event_seq=0x0102,
+    events=[(b, f | 0xFE) for (b, f) in _enc_mo_events],
+    client_ticks_ms=0x0BADF00D)
+
+add_kbm_encode_vector(
+    "encode_mouse_accumulator_extremes",
+    "S6.16 'The absolute value of an accumulator carries no meaning' -- an "
+    "encoder passes 0x8000/0x7FFF/0xFFFB through untouched, exactly as the "
+    "decoder does",
+    TYPE_MOUSE, dx=0x8000, dy=0x7FFF, wheel=0xFFFB, hwheel=0x0005,
+    client_ticks_ms=0xFFFFFFFF)
+
+# ---- N.3 MEDIA -----------------------------------------------------------
+_enc_me_events = [(MC_VOLUME_UP, EVENT_DOWN), (MC_NEXT_TRACK, EVENT_DOWN),
+                   (MC_NEXT_TRACK, 0x00), (MC_MUTE, EVENT_DOWN)]
+
+add_kbm_encode_vector(
+    "encode_media_clean",
+    "S6.17 encode: held, event_seq, the two reserved bytes the struct does "
+    "not carry, the ring at wire offset 8 (in-memory offset 6 -- the "
+    "divergence that makes casting a struct onto a packet buffer fatal), and "
+    "client_ticks_ms",
+    TYPE_MEDIA, held=media_bit(MC_VOLUME_UP) | media_bit(MC_MUTE),
+    event_seq=0x0304, events=_enc_me_events, client_ticks_ms=0xCAFEBABE)
+
+add_kbm_encode_vector(
+    "encode_media_reserved_ones",
+    "S2/S6.17/S6.18 encode: held bits 24-31 (indices 25-32, unassigned) and "
+    "event flags bits 1-7 set by the caller MUST NOT reach the wire",
+    TYPE_MEDIA,
+    held=media_bit(MC_VOLUME_UP) | media_bit(MC_MUTE) | 0xFF000000,
+    event_seq=0x0304,
+    events=[(c, f | 0xFE) for (c, f) in _enc_me_events],
+    client_ticks_ms=0xCAFEBABE)
+
+add_kbm_encode_vector(
+    "encode_media_all_assigned_held",
+    "S6.18: all 24 assigned indices held is 0x00FFFFFF on the wire",
+    TYPE_MEDIA, held=MEDIA_HELD_MASK, event_seq=3,
+    events=[(0, 0), (MC_PLAY_PAUSE, EVENT_DOWN), (MC_BOOKMARKS, EVENT_DOWN),
+             (MC_VOLUME_UP, EVENT_DOWN)],
+    client_ticks_ms=0x00000022)
+
+# ---- N.4 INPUTCAPS -------------------------------------------------------
+add_kbm_encode_vector(
+    "encode_inputcaps_clean",
+    "S6.19 encode: features and status deliberately different values, plus "
+    "the reserved0 the struct does not carry",
+    TYPE_INPUTCAPS, features=FEATURE_KEYBOARD | FEATURE_MEDIA,
+    status=STATUS_KEYBOARD_READY | STATUS_SYNTHETIC,
+    media_mask=(media_bit(MC_PLAY_PAUSE) | media_bit(MC_VOLUME_UP)
+                 | media_bit(MC_BOOKMARKS)),
+    mouse_rate_hz=60)
+
+add_kbm_encode_vector(
+    "encode_inputcaps_reserved_ones",
+    "S2/S6.19 encode: features bits 3-31, status bits 4-31 and media_mask "
+    "bits 24-31 set by the caller MUST NOT reach the wire; the bytes MUST "
+    "equal encode_inputcaps_clean's",
+    TYPE_INPUTCAPS, features=(FEATURE_KEYBOARD | FEATURE_MEDIA) | 0xFFFFFFF8,
+    status=(STATUS_KEYBOARD_READY | STATUS_SYNTHETIC) | 0xFFFFFFF0,
+    media_mask=((media_bit(MC_PLAY_PAUSE) | media_bit(MC_VOLUME_UP)
+                  | media_bit(MC_BOOKMARKS)) | 0xFF000000),
+    mouse_rate_hz=60)
+
+add_kbm_encode_vector(
+    "encode_inputcaps_rate_above_ceiling_verbatim",
+    "S6.19 (revised) 'This is an obligation on the client's send rate, not a "
+    "decode normalisation.' mouse_rate_hz has no reserved numeric range, so "
+    "S2 gives an encoder nothing to mask and 1000 goes out as 1000. See the "
+    "section header: this is the one inference in Section N",
+    TYPE_INPUTCAPS, features=FEATURE_MOUSE, status=STATUS_MOUSE_READY,
+    mouse_rate_hz=1000)
+
+# Every "reserved ones" input must emit the same bytes as its clean twin --
+# asserted here at generation time as well as by the self-test, so a mistake
+# in this file cannot quietly weaken the property the vectors exist to pin.
+for _a, _b in (("encode_keyboard_clean", "encode_keyboard_reserved_ones"),
+                ("encode_mouse_clean", "encode_mouse_reserved_ones"),
+                ("encode_media_clean", "encode_media_reserved_ones"),
+                ("encode_inputcaps_clean", "encode_inputcaps_reserved_ones")):
+    _va = [v for v in kbm_encode_vectors if v['name'] == _a][0]
+    _vb = [v for v in kbm_encode_vectors if v['name'] == _b][0]
+    assert _va['exp_payload'] == _vb['exp_payload'], (_a, _b)
+
+# ---------------------------------------------------------------------------
+# Section A additions: S3.1 framing for the four new types.
+#
+# S13 requires "`payload_len` disagreeing with the fixed size for each of the
+# four types (S3.1 check 6)". These go into the EXISTING frame vector table
+# because the decision they assert is the same one Section A already asserts:
+# the ordered seven checks, stopping at the first failure. What is new is only
+# that S4's table now has four more rows.
+#
+# Note S6.20's "What a v1 peer actually does with one": a peer that PREDATES
+# these types fails check 5 and discards SILENTLY, never reaching check 6's
+# reject-with-ERROR-6. That is the behaviour of an older peer, not of a
+# receiver implementing this revision, so the vectors below expect check 5 to
+# PASS for 0x21/0x22/0x23/0x44 -- they are in S4's table now.
+# ---------------------------------------------------------------------------
+
+_new_types = [
+    ("keyboard", TYPE_KEYBOARD, KEYBOARD_LEN, "S6.15"),
+    ("mouse", TYPE_MOUSE, MOUSE_LEN, "S6.16"),
+    ("media", TYPE_MEDIA, MEDIA_LEN, "S6.17"),
+    ("inputcaps", TYPE_INPUTCAPS, INPUTCAPS_LEN, "S6.19"),
+]
+
+for _i, (_nm, _ty, _sz, _ref) in enumerate(_new_types):
+    _sid, _sq = 0x0201, 0x1000 + _i
+
+    # Accepted: every check passes.
+    add_frame_vector(
+        "%s_frame_accepted" % _nm,
+        "S4 (%s row) + %s: payload_len equals the type's fixed size, so "
+        "checks 4, 5 and 6 all pass" % (hex(_ty), _ref),
+        build_header(VERSION_1, _ty, _sid, _sq, _sz, 0) + rand_filler(_sz, _i),
+        0, exp_version=VERSION_1, exp_type=_ty, exp_session_id=_sid,
+        exp_sequence=_sq, exp_payload_len=_sz, exp_flags=0,
+    )
+
+    # Check 6: internally consistent (check 4 passes) but the wrong size for
+    # the type. One byte short, which is the case S3.1 says drives an overread
+    # in a decoder that trusts the type's size instead of the declared one.
+    add_frame_vector(
+        "%s_payload_len_short_by_one" % _nm,
+        "S3.1 check 6 for %s: the datagram is internally length-consistent "
+        "(check 4 passes) but declares %d where %s fixes %d -- reject, ERROR "
+        "code 6" % (hex(_ty), _sz - 1, _ref, _sz),
+        build_header(VERSION_1, _ty, _sid, _sq, _sz - 1, 0)
+        + rand_filler(_sz - 1, _i + 40),
+        CHECK_PAYLOAD_SIZE,
+    )
+
+    # Check 6 again, with the fixed size of a DIFFERENT one of the four. The
+    # confusable pair is deliberate: KEYBOARD is 56 bytes, the same as
+    # INPUT_STATE, so only the declared-vs-type check separates them.
+    _other = _new_types[(_i + 1) % len(_new_types)][2]
+    add_frame_vector(
+        "%s_payload_len_of_another_kbm_type" % _nm,
+        "S3.1 check 6 for %s: declares %d, which is a VALID fixed size -- for "
+        "a different type. Check 6 compares against the size for THIS type, "
+        "not against the set of legal sizes" % (hex(_ty), _other),
+        build_header(VERSION_1, _ty, _sid, _sq, _other, 0)
+        + rand_filler(_other, _i + 80),
+        CHECK_PAYLOAD_SIZE,
+    )
+
+    # Check 4: the declared payload_len is right for the type, but the
+    # datagram is one byte short of the formula.
+    add_frame_vector(
+        "%s_length_formula_short" % _nm,
+        "S3.1 check 4 for %s: payload_len is correct for the type but the "
+        "datagram is one byte shorter than 12 + payload_len, so check 4 "
+        "fails BEFORE check 6 ever runs" % hex(_ty),
+        build_header(VERSION_1, _ty, _sid, _sq, _sz, 0)
+        + rand_filler(_sz - 1, _i + 120),
+        CHECK_LENGTH_FORMULA,
+    )
+
+# S6.22: 0x24 is RESERVED for TEXT and "Nothing is specified here beyond the
+# reservation", so it is not in S4's table and a receiver MUST discard it at
+# check 5 -- silently, with no ERROR. This vector pins the boundary of the
+# 0x2x client->server range at the last allocated slot (0x23 MEDIA). It is
+# expected to change the day TEXT is specified, and that is the point: the
+# vector fails loudly rather than a half-built TEXT decoder shipping unnoticed.
+add_frame_vector(
+    "text_0x24_reserved_type_discarded",
+    "S6.22 '0x24 is reserved for TEXT and MUST NOT be allocated to anything "
+    "else' + S3.1 check 5 (unknown type -> discard, no ERROR)",
+    build_header(VERSION_1, TYPE_TEXT_RESERVED, 0x0201, 0x1010, 20, 0)
+    + rand_filler(20, 160),
+    CHECK_TYPE,
+)
+
+# ---------------------------------------------------------------------------
 # C emission
 # ---------------------------------------------------------------------------
 
@@ -3081,6 +4696,426 @@ def emit():
     out.append("#define APAD_PAIR_URI_BUILD_VECTOR_COUNT %dU" % len(pair_uri_build_vectors))
     out.append("")
 
+    # ---- Sections K / L / M: S6.15-S6.22 ----
+    out.append("/* ----------------------------------------------------------------------")
+    out.append(" * Section K: S6.15-S6.19 payload vectors -- KEYBOARD (0x21), MOUSE")
+    out.append(" * (0x22), MEDIA (0x23), INPUTCAPS (0x44).")
+    out.append(" *")
+    out.append(" * S15 item 10: these four types were specified on 2026-08-25 and their")
+    out.append(" * vectors are derived independently BEFORE the codec is trusted -- the")
+    out.append(" * opposite order to S6.12's TOUCHMAP, which S15 item 9 records as having")
+    out.append(" * produced \"agreement, not verification\".")
+    out.append(" *")
+    out.append(" * Decode rules asserted here, each with its sentence:")
+    out.append(" *  - keys[0] bits 0-3, reserved0/reserved1, event flags bits 1-7,")
+    out.append(" *    MOUSE.buttons bits 5-15, MEDIA.held bits 24-31, INPUTCAPS features")
+    out.append(" *    bits 3-31 / status bits 4-31 / media_mask bits 24-31: reserved, so")
+    out.append(" *    SCRUBBED on decode (S2, S6.20 \"Reserved *bits* ... are masked on")
+    out.append(" *    both sides\").")
+    out.append(" *  - an events[] slot whose usage is 0x00-0x03 (S6.15), whose button is")
+    out.append(" *    outside 1..5 (S6.16), or whose control is outside S6.18's assigned")
+    out.append(" *    1..24 (S6.17) decodes as code 0 AND flags 0. The forced flags is what")
+    out.append(" *    makes two decoded structures comparable for exact equality.")
+    out.append(" *  - HID usages 0xA5-0xAF, 0xDE-0xDF and 0xE8-0xFF are passed through")
+    out.append(" *    UNCHANGED (S6.15). A vector asserting they are scrubbed would be a")
+    out.append(" *    spec violation, not a stricter test.")
+    out.append(" *  - accumulators (S6.16) are raw: \"the absolute value of an accumulator")
+    out.append(" *    carries no meaning\", so nothing normalises them and the signed")
+    out.append(" *    distance is Section L's and Section M's job.")
+    out.append(" *")
+    out.append(" * Most rings below are RIGHT-ALIGNED as S6.20 requires. The exceptions are")
+    out.append(" * deliberate and named in each vector's comment: a ring carrying an")
+    out.append(" * out-of-range code, or a \"no event\" slot in the middle, could not have")
+    out.append(" * been produced by a conforming sender -- and those are exactly the inputs")
+    out.append(" * the receive-side normalisation exists for.")
+    out.append(" * ---------------------------------------------------------------------- */")
+    out.append("")
+
+    # The canonical payload an encoder MUST produce from each vector's
+    # expected decoded structure (S2 encode side). Where the vector's own
+    # payload is already canonical the table just points into it at
+    # HEADER_LEN, which costs no extra rodata and makes "these bytes ARE the
+    # golden bytes" visible in the generated source rather than asserted in a
+    # comment.
+    def enc_ref(v):
+        if v['enc_same']:
+            return "%s_packet + %d" % (c_ident(v['name']), HEADER_LEN)
+        return "%s_exp_encoded" % c_ident(v['name'])
+
+    def emit_encoded_arrays(vectors):
+        for v in vectors:
+            if v['enc_same']:
+                continue
+            out.append("/* %s: encode side -- differs from the vector's own" % v['name'])
+            out.append(" * payload, because that payload deliberately carries non-zero")
+            out.append(" * reserved fields, out-of-range codes, or both. */")
+            out.append("static const uint8_t %s_exp_encoded[] = {" % c_ident(v['name']))
+            out.append(c_bytes_literal(v['exp_encoded']))
+            out.append("};")
+            out.append("")
+
+    # -- K.1 KEYBOARD --
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    const uint8_t *packet;")
+    out.append("    uint32_t packet_len;")
+    out.append("    uint8_t  exp_keys[32];          /* keys[0] bits 0-3 scrubbed */")
+    out.append("    uint16_t exp_event_seq;")
+    out.append("    uint8_t  exp_event_code[8];     /* 0 = no event (S6.20) */")
+    out.append("    uint8_t  exp_event_flags[8];    /* bit 0 DOWN; 0 whenever code is 0 */")
+    out.append("    uint32_t exp_client_ticks_ms;")
+    out.append("    const uint8_t *exp_encoded;    /* S2: the canonical payload an")
+    out.append("                                    * encoder MUST emit from the")
+    out.append("                                    * expected decoded structure */")
+    out.append("} apad_vec_keyboard;")
+    out.append("")
+    emit_packet_arrays(keyboard_vectors)
+    emit_encoded_arrays(keyboard_vectors)
+    out.append("static const apad_vec_keyboard apad_keyboard_vectors[] = {")
+    for v in keyboard_vectors:
+        ident = c_ident(v['name'])
+        out.append("    { \"%s\", %s_packet, %dU," % (v['name'], ident, len(v['packet'])))
+        out.append("      %s," % u8_inline(v['exp_keys']))
+        out.append("      %dU, %s, %s, %dUL," % (
+            v['exp_event_seq'], u8_inline(v['exp_event_code']),
+            u8_inline(v['exp_event_flags']), v['exp_client_ticks_ms']))
+        out.append("      %s }," % enc_ref(v))
+    out.append("};")
+    out.append("#define APAD_KEYBOARD_VECTOR_COUNT %dU" % len(keyboard_vectors))
+    out.append("")
+
+    # -- K.2 MOUSE --
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    const uint8_t *packet;")
+    out.append("    uint32_t packet_len;")
+    out.append("    uint16_t exp_dx_accum;          /* raw; S6.16 forbids interpreting */")
+    out.append("    uint16_t exp_dy_accum;          /* it other than via apad_seq_diff  */")
+    out.append("    uint16_t exp_wheel_accum;")
+    out.append("    uint16_t exp_hwheel_accum;")
+    out.append("    uint16_t exp_buttons;           /* bits 5-15 scrubbed */")
+    out.append("    uint16_t exp_event_seq;")
+    out.append("    uint8_t  exp_event_code[4];")
+    out.append("    uint8_t  exp_event_flags[4];")
+    out.append("    uint32_t exp_client_ticks_ms;")
+    out.append("    const uint8_t *exp_encoded;    /* S2: the canonical payload an")
+    out.append("                                    * encoder MUST emit from the")
+    out.append("                                    * expected decoded structure */")
+    out.append("} apad_vec_mouse;")
+    out.append("")
+    emit_packet_arrays(mouse_vectors)
+    emit_encoded_arrays(mouse_vectors)
+    out.append("static const apad_vec_mouse apad_mouse_vectors[] = {")
+    for v in mouse_vectors:
+        ident = c_ident(v['name'])
+        out.append("    { \"%s\", %s_packet, %dU," % (v['name'], ident, len(v['packet'])))
+        out.append("      0x%04XU, 0x%04XU, 0x%04XU, 0x%04XU, 0x%04XU, %dU," % (
+            v['exp_dx'], v['exp_dy'], v['exp_wheel'], v['exp_hwheel'],
+            v['exp_buttons'], v['exp_event_seq']))
+        out.append("      %s, %s, %dUL," % (
+            u8_inline(v['exp_event_code']), u8_inline(v['exp_event_flags']),
+            v['exp_client_ticks_ms']))
+        out.append("      %s }," % enc_ref(v))
+    out.append("};")
+    out.append("#define APAD_MOUSE_VECTOR_COUNT %dU" % len(mouse_vectors))
+    out.append("")
+
+    # -- K.3 MEDIA --
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    const uint8_t *packet;")
+    out.append("    uint32_t packet_len;")
+    out.append("    uint32_t exp_held;              /* bits 24-31 scrubbed (S6.18) */")
+    out.append("    uint16_t exp_event_seq;")
+    out.append("    uint8_t  exp_event_code[4];")
+    out.append("    uint8_t  exp_event_flags[4];")
+    out.append("    uint32_t exp_client_ticks_ms;")
+    out.append("    const uint8_t *exp_encoded;    /* S2: the canonical payload an")
+    out.append("                                    * encoder MUST emit from the")
+    out.append("                                    * expected decoded structure */")
+    out.append("} apad_vec_media;")
+    out.append("")
+    emit_packet_arrays(media_vectors)
+    emit_encoded_arrays(media_vectors)
+    out.append("static const apad_vec_media apad_media_vectors[] = {")
+    for v in media_vectors:
+        ident = c_ident(v['name'])
+        out.append("    { \"%s\", %s_packet, %dU," % (v['name'], ident, len(v['packet'])))
+        out.append("      0x%08XUL, %dU," % (v['exp_held'], v['exp_event_seq']))
+        out.append("      %s, %s, %dUL," % (
+            u8_inline(v['exp_event_code']), u8_inline(v['exp_event_flags']),
+            v['exp_client_ticks_ms']))
+        out.append("      %s }," % enc_ref(v))
+    out.append("};")
+    out.append("#define APAD_MEDIA_VECTOR_COUNT %dU" % len(media_vectors))
+    out.append("")
+
+    # -- K.4 INPUTCAPS --
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    const uint8_t *packet;")
+    out.append("    uint32_t packet_len;")
+    out.append("    uint32_t exp_features;          /* bits 3-31 scrubbed */")
+    out.append("    uint32_t exp_status;            /* bits 4-31 scrubbed */")
+    out.append("    uint32_t exp_media_mask;        /* bits 24-31 scrubbed */")
+    out.append("    uint16_t exp_mouse_rate_hz;     /* NOT clamped -- S6.19 (revised):")
+    out.append("                                     * a decoder MUST preserve it verbatim */")
+    out.append("    const uint8_t *exp_encoded;     /* S2 encode side, as above */")
+    out.append("} apad_vec_inputcaps;")
+    out.append("")
+    emit_packet_arrays(inputcaps_vectors)
+    emit_encoded_arrays(inputcaps_vectors)
+    out.append("static const apad_vec_inputcaps apad_inputcaps_vectors[] = {")
+    for v in inputcaps_vectors:
+        ident = c_ident(v['name'])
+        out.append("    { \"%s\", %s_packet, %dU," % (v['name'], ident, len(v['packet'])))
+        out.append("      0x%08XUL, 0x%08XUL, 0x%08XUL, %dU, %s }," % (
+            v['exp_features'], v['exp_status'], v['exp_media_mask'],
+            v['exp_mouse_rate_hz'], enc_ref(v)))
+    out.append("};")
+    out.append("#define APAD_INPUTCAPS_VECTOR_COUNT %dU" % len(inputcaps_vectors))
+    out.append("")
+
+    # -- K.5 byte identity --
+    out.append("/* S13: \"every reserved field of each of the four types set to ones -- the")
+    out.append(" * decoded structure MUST be byte-identical to the one decoded from the")
+    out.append(" * clean packet\". The per-type tables above pin the fields a vector author")
+    out.append(" * thought to enumerate; this one pins the WHOLE decoded object, which is")
+    out.append(" * the property S6.15 actually states and the only one that also covers a")
+    out.append(" * field nobody listed. Both packets carry identical logical content and")
+    out.append(" * differ only in reserved bits, reserved bytes and header flags 2-15. */")
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    uint8_t  msg_type;")
+    out.append("    const uint8_t *clean;")
+    out.append("    uint32_t clean_len;")
+    out.append("    const uint8_t *dirty;      /* every reserved field/bit set to ones */")
+    out.append("    uint32_t dirty_len;")
+    out.append("} apad_vec_kbm_identity;")
+    out.append("")
+    out.append("static const apad_vec_kbm_identity apad_kbm_identity_vectors[] = {")
+    for v in kbm_identity_vectors:
+        out.append("    /* %s */" % v['spec_ref'])
+        out.append("    { \"%s\", 0x%02XU, %s_packet, %dU, %s_packet, %dU }," % (
+            v['name'], v['msg_type'],
+            c_ident(v['clean_name']), v['clean_len'],
+            c_ident(v['dirty_name']), v['dirty_len']))
+    out.append("};")
+    out.append("#define APAD_KBM_IDENTITY_VECTOR_COUNT %dU" % len(kbm_identity_vectors))
+    out.append("")
+
+    # ---- Section L: function vectors ----
+    out.append("/* ----------------------------------------------------------------------")
+    out.append(" * Section L: function vectors (S13 shape 2) -- S6.21 apad_seq_diff and")
+    out.append(" * the S6.20 event-ring gap. No packet is involved: an input tuple and an")
+    out.append(" * expected integer, because the wrap behaviour IS the specification.")
+    out.append(" * ---------------------------------------------------------------------- */")
+    out.append("")
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    uint16_t a;")
+    out.append("    uint16_t b;")
+    out.append("    int32_t  exp;              /* signed distance, [-32768, 32767] */")
+    out.append("} apad_vec_seq_diff;")
+    out.append("")
+    out.append("static const apad_vec_seq_diff apad_seq_diff_vectors[] = {")
+    for v in seq_diff_vectors:
+        out.append("    /* %s */" % v['spec_ref'])
+        out.append("    { \"%s\", 0x%04XU, 0x%04XU, %d }," % (
+            v['name'], v['a'], v['b'], v['exp']))
+    out.append("};")
+    out.append("#define APAD_SEQ_DIFF_VECTOR_COUNT %dU" % len(seq_diff_vectors))
+    out.append("")
+    out.append("/* S6.20 step 2. exp_replay is the number of TRAILING slots to replay,")
+    out.append(" * i.e. slots (ring_len - exp_replay) .. (ring_len - 1) ascending;")
+    out.append(" * exp_overflow is S6.20's \"surface the overflow rather than swallowing")
+    out.append(" * it\". A gap of zero or less replays nothing and is NOT an overflow --")
+    out.append(" * and the caller still reconciles, which is step 3's business. */")
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    uint16_t event_seq;")
+    out.append("    uint16_t last_seq;")
+    out.append("    int32_t  ring_len;")
+    out.append("    int32_t  gap;              /* apad_seq_diff(event_seq, last_seq) */")
+    out.append("    int32_t  exp_replay;")
+    out.append("    uint8_t  exp_overflow;")
+    out.append("} apad_vec_event_ring;")
+    out.append("")
+    out.append("static const apad_vec_event_ring apad_event_ring_vectors[] = {")
+    for v in event_ring_vectors:
+        out.append("    /* %s */" % v['spec_ref'])
+        out.append("    { \"%s\", 0x%04XU, 0x%04XU, %d, %d, %d, %dU }," % (
+            v['name'], v['event_seq'], v['last_seq'], v['ring_len'],
+            v['gap'], v['exp_replay'], v['exp_overflow']))
+    out.append("};")
+    out.append("#define APAD_EVENT_RING_VECTOR_COUNT %dU" % len(event_ring_vectors))
+    out.append("")
+
+    # ---- Section M: sequence vectors ----
+    out.append("/* ----------------------------------------------------------------------")
+    out.append(" * Section M: sequence vectors (S13 shape 3) -- an ordered list of packets")
+    out.append(" * with the expected receiver state after EVERY step. S13: \"A sequence")
+    out.append(" * vector asserts after every step, not only at the end, or a design that")
+    out.append(" * converges by accident passes.\"")
+    out.append(" *")
+    out.append(" * The receiver is S6.20's and nothing more: a per-type sliding window on")
+    out.append(" * the HEADER sequence, then steps 1-4 on the payload's event_seq, plus")
+    out.append(" * S6.16's three accumulator rules for MOUSE. Every field below is the")
+    out.append(" * state AFTER the step, including after a step the window discards -- in")
+    out.append(" * which case it MUST equal the state before it, motion included.")
+    out.append(" *")
+    out.append(" * exp_replay_code/flags list the events replayed by THIS step, in the")
+    out.append(" * ascending slot order S6.20 mandates, with \"no event\" slots already")
+    out.append(" * skipped. exp_keys/exp_buttons/exp_held are the reconciled held state")
+    out.append(" * (step 3), which is always the datagram's snapshot -- the ring only adds")
+    out.append(" * back what a snapshot cannot express.")
+    out.append(" *")
+    out.append(" * INPUTCAPS has no sequence here: S6.20 gives it a per-type window too,")
+    out.append(" * but it is server->client, so that window lives in the client's session")
+    out.append(" * state rather than in core. Named rather than invented.")
+    out.append(" * ---------------------------------------------------------------------- */")
+    out.append("")
+    out.append("#define APAD_VEC_KBM_CLS_KEYBOARD 0")
+    out.append("#define APAD_VEC_KBM_CLS_MOUSE    1")
+    out.append("#define APAD_VEC_KBM_CLS_MEDIA    2")
+    out.append("")
+    out.append("typedef struct {")
+    out.append("    const uint8_t *packet;")
+    out.append("    uint32_t packet_len;")
+    out.append("    uint8_t  exp_accepted;       /* 0 = S6.20 window discards it */")
+    out.append("    uint8_t  exp_overflow;       /* S6.20 step 2, g > D */")
+    out.append("    uint8_t  exp_replay_len;     /* events replayed by this step */")
+    out.append("    uint8_t  exp_replay_code[8];")
+    out.append("    uint8_t  exp_replay_flags[8];")
+    out.append("    uint8_t  exp_keys[32];       /* KEYBOARD held state after the step */")
+    out.append("    uint16_t exp_buttons;        /* MOUSE held state after the step   */")
+    out.append("    uint32_t exp_held;           /* MEDIA held state after the step   */")
+    out.append("    int32_t  exp_dx;             /* S6.16 motion attributed to this   */")
+    out.append("    int32_t  exp_dy;             /* step; zero for the first accepted */")
+    out.append("    int32_t  exp_wheel;          /* sample and for a discarded one    */")
+    out.append("    int32_t  exp_hwheel;")
+    out.append("    uint16_t exp_last_applied;   /* S6.20 step 4 */")
+    out.append("} apad_vec_kbm_step;")
+    out.append("")
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    uint8_t  cls;                /* APAD_VEC_KBM_CLS_* */")
+    out.append("    uint8_t  msg_type;")
+    out.append("    uint8_t  ring_depth;         /* 8 for KEYBOARD, 4 otherwise (S6.20) */")
+    out.append("    const apad_vec_kbm_step *steps;")
+    out.append("    uint32_t step_count;")
+    out.append("} apad_vec_kbm_sequence;")
+    out.append("")
+    for v in kbm_sequence_vectors:
+        ident = c_ident(v['name'])
+        out.append("/* %s */" % v['spec_ref'])
+        for si, st in enumerate(v['steps']):
+            out.append("static const uint8_t %s_s%d_packet[] = {" % (ident, si))
+            out.append(c_bytes_literal(st['packet']))
+            out.append("};")
+        out.append("static const apad_vec_kbm_step %s_steps[] = {" % ident)
+        for si, st in enumerate(v['steps']):
+            codes = [c for (c, f) in st['exp_replay']] + [0] * (8 - len(st['exp_replay']))
+            flags = [f for (c, f) in st['exp_replay']] + [0] * (8 - len(st['exp_replay']))
+            out.append("    { %s_s%d_packet, %dU, %dU, %dU, %dU," % (
+                ident, si, len(st['packet']), st['exp_accepted'],
+                st['exp_overflow'], len(st['exp_replay'])))
+            out.append("      %s," % u8_inline(codes))
+            out.append("      %s," % u8_inline(flags))
+            out.append("      %s," % u8_inline(st['exp_keys']))
+            out.append("      0x%04XU, 0x%08XUL, %d, %d, %d, %d, 0x%04XU }," % (
+                st['exp_buttons'], st['exp_held'],
+                st['exp_motion'][0], st['exp_motion'][1], st['exp_motion'][2],
+                st['exp_motion'][3], st['exp_last_applied']))
+        out.append("};")
+        out.append("")
+    out.append("static const apad_vec_kbm_sequence apad_kbm_sequence_vectors[] = {")
+    for v in kbm_sequence_vectors:
+        ident = c_ident(v['name'])
+        out.append("    { \"%s\", %d, 0x%02XU, %dU, %s_steps, %dU }," % (
+            v['name'], v['cls'], v['msg_type'], v['ring_depth'], ident,
+            len(v['steps'])))
+    out.append("};")
+    out.append("#define APAD_KBM_SEQUENCE_VECTOR_COUNT %dU" % len(kbm_sequence_vectors))
+    out.append("")
+    # ---- Section N: encode vectors ----
+    out.append("/* ----------------------------------------------------------------------")
+    out.append(" * Section N: encode vectors for S6.15-S6.19.")
+    out.append(" *")
+    out.append(" * An encoder owes exactly two things here, both from S2, both testable:")
+    out.append(" * reserved BYTES zero on send (KEYBOARD's and MEDIA's reserved0/reserved1,")
+    out.append(" * INPUTCAPS's reserved0 -- none of which exist in the in-memory structs, so")
+    out.append(" * they have to be written deliberately rather than copied), and reserved")
+    out.append(" * BITS masked on send (S6.20: \"Reserved *bits* ... are masked on both")
+    out.append(" * sides\").")
+    out.append(" *")
+    out.append(" * Each *_reserved_ones vector hands the encoder a struct with every")
+    out.append(" * maskable reserved bit set and requires byte-identical output to its")
+    out.append(" * *_clean twin -- the encode-side mirror of S6.15's byte-identity property,")
+    out.append(" * and the check that catches an encoder trusting its caller.")
+    out.append(" *")
+    out.append(" * What is deliberately NOT here: any out-of-range event code. S6.20 says an")
+    out.append(" * encoder \"is not required to normalise them, and SHOULD NOT\", and a SHOULD")
+    out.append(" * is not a vector. The generator asserts no such code reaches this table.")
+    out.append(" *")
+    out.append(" * The round-trip property -- encode(expected decoded structure) reproduces")
+    out.append(" * the golden bytes -- is carried by exp_encoded on the Section K tables")
+    out.append(" * instead, so that every packet vector contributes one. That is the check")
+    out.append(" * a decode-only suite cannot make: an offset that is self-consistently")
+    out.append(" * wrong in both directions decodes and re-encodes perfectly and is visible")
+    out.append(" * only against bytes fixed by the spec.")
+    out.append(" * ---------------------------------------------------------------------- */")
+    out.append("")
+    out.append("typedef struct {")
+    out.append("    const char *name;")
+    out.append("    uint8_t  msg_type;          /* which of the four structs to build */")
+    out.append("    /* Caller-supplied IN-MEMORY values, reserved bits included. Only the")
+    out.append("     * fields belonging to msg_type's struct are meaningful. */")
+    out.append("    uint8_t  in_keys[32];")
+    out.append("    uint16_t in_dx;")
+    out.append("    uint16_t in_dy;")
+    out.append("    uint16_t in_wheel;")
+    out.append("    uint16_t in_hwheel;")
+    out.append("    uint16_t in_buttons;")
+    out.append("    uint32_t in_held;")
+    out.append("    uint32_t in_features;")
+    out.append("    uint32_t in_status;")
+    out.append("    uint32_t in_media_mask;")
+    out.append("    uint16_t in_mouse_rate_hz;")
+    out.append("    uint16_t in_event_seq;")
+    out.append("    uint8_t  in_event_code[8];")
+    out.append("    uint8_t  in_event_flags[8];")
+    out.append("    uint32_t in_client_ticks_ms;")
+    out.append("    const uint8_t *exp_payload; /* the exact bytes that MUST be emitted */")
+    out.append("    uint32_t exp_payload_len;")
+    out.append("} apad_vec_kbm_encode;")
+    out.append("")
+    for v in kbm_encode_vectors:
+        ident = c_ident(v['name'])
+        out.append("/* %s */" % v['spec_ref'])
+        out.append("static const uint8_t %s_exp_payload[] = {" % ident)
+        out.append(c_bytes_literal(v['exp_payload']))
+        out.append("};")
+        out.append("")
+    out.append("static const apad_vec_kbm_encode apad_kbm_encode_vectors[] = {")
+    for v in kbm_encode_vectors:
+        ident = c_ident(v['name'])
+        out.append("    { \"%s\", 0x%02XU," % (v['name'], v['msg_type']))
+        out.append("      %s," % u8_inline(v['in_keys']))
+        out.append("      0x%04XU, 0x%04XU, 0x%04XU, 0x%04XU, 0x%04XU," % (
+            v['in_dx'], v['in_dy'], v['in_wheel'], v['in_hwheel'],
+            v['in_buttons']))
+        out.append("      0x%08XUL, 0x%08XUL, 0x%08XUL, 0x%08XUL, %dU," % (
+            v['in_held'], v['in_features'], v['in_status'], v['in_media_mask'],
+            v['in_mouse_rate_hz']))
+        out.append("      %dU, %s, %s," % (
+            v['in_event_seq'], u8_inline(v['in_event_code']),
+            u8_inline(v['in_event_flags'])))
+        out.append("      %dUL, %s_exp_payload, %dU }," % (
+            v['in_client_ticks_ms'], ident, len(v['exp_payload'])))
+    out.append("};")
+    out.append("#define APAD_KBM_ENCODE_VECTOR_COUNT %dU" % len(kbm_encode_vectors))
+    out.append("")
     out.append("#endif /* ATTICPAD_TESTDATA_VECTORS_H */")
     out.append("")
     return "\n".join(out)
@@ -3127,10 +5162,37 @@ def main():
     print("pair_uri build vectors:   %d" % len(pair_uri_build_vectors))
     section_j_total = len(pair_uri_parse_vectors) + len(pair_uri_build_vectors)
     print("Section J total:          %d" % section_j_total)
+    print("keyboard vectors:         %d" % len(keyboard_vectors))
+    print("mouse vectors:            %d" % len(mouse_vectors))
+    print("media vectors:            %d" % len(media_vectors))
+    print("inputcaps vectors:        %d" % len(inputcaps_vectors))
+    print("kbm identity vectors:     %d" % len(kbm_identity_vectors))
+    section_k_total = (len(keyboard_vectors) + len(mouse_vectors)
+                        + len(media_vectors) + len(inputcaps_vectors)
+                        + len(kbm_identity_vectors))
+    print("Section K total:          %d" % section_k_total)
+    print("seq_diff vectors:         %d" % len(seq_diff_vectors))
+    print("event_ring vectors:       %d" % len(event_ring_vectors))
+    section_l_total = len(seq_diff_vectors) + len(event_ring_vectors)
+    print("Section L total:          %d" % section_l_total)
+    print("kbm sequence vectors:     %d (%d steps)" % (
+        len(kbm_sequence_vectors),
+        sum(len(v['steps']) for v in kbm_sequence_vectors)))
+    section_m_total = len(kbm_sequence_vectors)
+    print("kbm encode vectors:       %d" % len(kbm_encode_vectors))
+    section_n_total = len(kbm_encode_vectors)
+    print("Section N total:          %d" % section_n_total)
+    print("round-trip (exp_encoded): %d packet vectors, %d needing their own array" % (
+        len(keyboard_vectors) + len(mouse_vectors) + len(media_vectors)
+        + len(inputcaps_vectors),
+        sum(0 if v['enc_same'] else 1 for v in (keyboard_vectors + mouse_vectors
+                                                 + media_vectors + inputcaps_vectors))))
     total = (len(frame_vectors) + len(truncation_vectors) + len(auth_truncation_vectors)
              + len(input_state_vectors) + len(seq_newer_vectors) + len(time_after_vectors)
              + len(pbkdf2_vectors) + len(auth_tag_vectors) + len(secret_length_vectors)
-             + section_g_total + section_h_total + section_j_total)
+             + section_g_total + section_h_total + section_j_total
+             + section_k_total + section_l_total + section_m_total
+             + section_n_total)
     print("TOTAL:                    %d" % total)
 
 

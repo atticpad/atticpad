@@ -98,6 +98,7 @@
                           * shipped-profile check -- the filesystem half of
                           * the remapping editor's profile routes below */
 #include "profile_json.h"   /* apad_profile <-> JSON, for the same routes */
+#include "favicon_png.h"    /* the tab icon, embedded (GENERATED) */
 
 /* ---- limits (§8.5-style "cap it, don't try to be a general web server") -- */
 #define UI_MAX_REQUEST    8192u   /* request line + headers                 */
@@ -202,11 +203,17 @@ static void ui_build_state_json(ui_strbuf *out, const apad_server *server,
         sb_json_string(out, addrs[i].ip);
         sb_append(out, ",\"kind\":");
         sb_json_string(out, host_addr_kind_name(addrs[i].kind));
+        /* The physical medium (wifi/ethernet/other) as well as the kind:
+         * every home NIC is "lan", so the UI needs this to label an address
+         * and to order the list the same way host_pick_default_addr() does. */
+        sb_append(out, ",\"medium\":");
+        sb_json_string(out, host_addr_medium_name(addrs[i].medium));
         sb_append(out, "}");
     }
     sb_append(out, "]");
     /* Which address a fresh QR/URI defaults to (ipaddr.h
-     * host_pick_default_addr(): first LAN-classified address, else the
+     * host_pick_default_addr(): best (kind, medium) pair -- LAN over
+     * Tailscale over virtual, and within LAN, Wi-Fi over Ethernet, else the
      * first Tailscale one, else the first virtual one) -- the UI's address
      * selector (assets.h) preselects this, but the choice is not locked in:
      * the operator can pick any entry in own_ips above and /api/pair/qr.svg
@@ -753,6 +760,21 @@ static void ui_dispatch(apad_socket_t fd, apad_server *server, uint32_t now_ms,
         sb_free(&sb);
         return;
     }
+    /* A browser asks for /favicon.ico unprompted on every visit, so without
+     * this each page load logged a 404 and the tab showed a generic glyph.
+     * Same mark as the launcher icons and the HOME menu entry -- it comes
+     * from render_mark() via make-assets.py, not a second drawing. Served at
+     * both paths: .ico is what a browser guesses at, .png is what the <link>
+     * in assets.h points to, and the Content-Type is what actually decides
+     * how the bytes are read. */
+    if (is_get && (strcmp(req->path, "/favicon.ico") == 0
+                || strcmp(req->path, "/favicon.png") == 0)) {
+        ui_send_response(fd, 200, "OK", "image/png",
+                         (const char *)kApadFaviconPng,
+                         sizeof kApadFaviconPng);
+        return;
+    }
+
     if (is_get && strcmp(req->path, "/api/pair/qr.svg") == 0) {
         /* §10.3 QR: renders one of the SAME URIs /api/state's
          * "pairing.uris" array carries, computed fresh here rather than

@@ -53,16 +53,16 @@ static void fatal_draw_top(app_ctx *ctx)
 
     const float W = UI_TOP_W - 16.0f;
 
+    /* Error line plus ONE hint sentence (copy declutter pass, item 8) --
+     * "Another app may be using the network - close it and relaunch" is
+     * dropped as a duplicate of the catalog's own APAD_MSG_NET_UNAVAILABLE_
+     * HINT, which says the same thing and is the one that stays. */
     ui_textf_fit(UI_TOP_W * 0.5f, 60.0f, UI_S_HEAD, ui_c_bad(),
                  UI_ALIGN_CENTER, W, "%s",
                  apad_ui_msg(APAD_MSG_NET_UNAVAILABLE));
     ui_textf_fit(UI_TOP_W * 0.5f, 96.0f, UI_S_SMALL, ui_c_text(),
                  UI_ALIGN_CENTER, W, "%s",
                  apad_ui_msg(APAD_MSG_NET_UNAVAILABLE_HINT));
-    ui_textf_fit(UI_TOP_W * 0.5f, 122.0f, UI_S_SMALL, ui_c_dim(),
-                 UI_ALIGN_CENTER, W,
-                 "Another app may be using the network - close it and "
-                 "relaunch");
 
     /* Developer detail, secondary: this client has no log path (3DS has no
      * stdio/filesystem story worth building for this), so what would go to a
@@ -79,18 +79,19 @@ static void fatal_draw_bottom(app_ctx *ctx)
     (void)ctx;
     ui_header(UI_BOT_W, "startup failed", NULL, ui_c_dim());
 
-    ui_textf_fit(UI_BOT_W * 0.5f, 44.0f, UI_S_SMALL, ui_c_text(),
-                 UI_ALIGN_CENTER, W, "The network is not usable this launch.");
-    ui_textf_fit(UI_BOT_W * 0.5f, 66.0f, UI_S_TINY, ui_c_dim(),
+    /* "The network is not usable this launch." removed -- it repeats the top
+     * screen's error line, and the two-line self-test explanation collapsed
+     * to one sentence (copy declutter pass, item 8). This sentence is the
+     * exception the pass allows: this screen has no on-screen button for
+     * self-test (SELECT is the only route -- see this file's header
+     * comment), so unlike the removed hints elsewhere it isn't pointing at
+     * something already visible. "B: exit" is dropped since EXIT is right
+     * there (item 1). */
+    ui_textf_fit(UI_BOT_W * 0.5f, 60.0f, UI_S_TINY, ui_c_dim(),
                  UI_ALIGN_CENTER, W,
-                 "The self-test needs no network -- run it to find out");
-    ui_textf_fit(UI_BOT_W * 0.5f, 79.0f, UI_S_TINY, ui_c_dim(),
-                 UI_ALIGN_CENTER, W,
-                 "whether libapad is intact on this console.");
+                 "The self-test needs no network -- run it to check libapad");
 
     ui_button(&kExitBtn, "EXIT", 0, 1);
-    ui_textf_fit(UI_BOT_W * 0.5f, 216.0f, UI_S_TINY, ui_c_dim(),
-                 UI_ALIGN_CENTER, W, "B: exit");
 }
 
 const apad_screen apad_screen_fatal = {

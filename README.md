@@ -25,10 +25,22 @@ routes.
 | **Android client** | Tested on real hardware. On-screen controls, physical gamepad passthrough, gyro, QR pairing. Android 8.0+. |
 | **Linux server** | Daily-driven. Creates virtual pads through `uinput`; enumerates as an Xbox 360 controller. |
 | **Windows server** | Tested on Windows 11. Creates XInput pads through ViGEmBus. Tray app and local web UI. |
+| **PSP client** | Tested on real hardware. Nub, every button, typed address and PIN, remembered server. `EBOOT.PBP`. |
+| **DS / DSi client** | Tested on real hardware, in DS and DSi modes. Touch-driven stick, keyboard/mouse/media modes, camera QR pairing on DSi. `.nds`. |
 
-Ports for PS Vita, PSP, DS/DSi, Switch and a desktop client are designed for but
-not built — see [`docs/SUPPORT-TIERS.md`](docs/SUPPORT-TIERS.md) for the honest
-per-platform status, including what has *never been run*.
+**A client can also act as a keyboard, mouse and media remote**, not just a
+gamepad — see [`docs/KBM.md`](docs/KBM.md). Stated as plainly as the table
+above: the 3DS and Android sides of this have been verified live in an
+emulator (Azahar, an AVD) but not yet on real 3DS or Android hardware, and the
+Windows `SendInput` backend has been built and compiled by CI on every push
+but **never run against a real Windows machine**. `docs/QA.md` §11 is the
+checklist that closes that gap; the Linux server side (three `uinput` nodes
+per session) is daily-driven the same way the gamepad path is.
+
+The **PSP** and **DS/DSi clients** are verified on real consoles. Ports for
+PS Vita, Switch and a desktop client are designed for but not built — see
+[`docs/SUPPORT-TIERS.md`](docs/SUPPORT-TIERS.md) for the honest per-platform
+status, including what has *never been run*.
 
 ## What it looks like
 
@@ -64,8 +76,9 @@ See [`docs/INSTALL.md`](docs/INSTALL.md). In short:
 - **Linux server** — one binary; needs access to `/dev/uinput`.
 - **Windows server** — one `.exe`; needs the ViGEmBus driver installed.
 
-Then pair the client to the server once, with a 6-digit PIN or by scanning a QR
-code, and it reconnects on its own after that.
+Then pair the client to the server once and it reconnects on its own after
+that. Android can take a 6-digit PIN or scan the server's QR code; the 3DS has
+no keypad for a PIN, so it scans the QR.
 
 ## Security, stated plainly
 
@@ -80,6 +93,8 @@ attempts, then the PIN is invalidated), and every packet after the handshake
 carries a truncated HMAC-SHA256 tag. But **pairing is not remembered between
 sessions** — there is no persistent list of trusted devices in this release, so
 pairing protects the moment of connection, not the server in general.
+[docs/PAIRING.md](docs/PAIRING.md) walks through the code that makes this
+so, and what remembering devices would take.
 
 Even with pairing open, the threat model is toy-grade: it stops a housemate,
 not an adversary. An attacker already on your LAN who captures the handshake
@@ -98,7 +113,7 @@ AtticPad speaks a small, frozen, byte-exact UDP protocol.
 constant, offset and bit position is fixed, and changes go to a v2.
 
 It is documented well enough to write a client against without reading the C:
-239 golden conformance vectors are generated from the spec alone, and every
+361 golden conformance vectors are generated from the spec alone, and every
 client ships them as an on-device self-test (hold **L+R+Start** at launch).
 That matters because most target platforms cannot be tested directly.
 

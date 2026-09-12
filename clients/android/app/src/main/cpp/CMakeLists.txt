@@ -56,6 +56,15 @@ add_library(apadjni SHARED
     # logic instead of re-implementing it — same rationale as core/ above).
     "${APAD_ROOT}/clients/common/apad_client.c"
     "${APAD_ROOT}/clients/common/apad_qr.c"
+    # apad_kbm_touch.c: the §6.15-§6.17 touchscreen KEYBOARD/MOUSE/MEDIA
+    # "builders" (hoisted out of clients/3ds/source/screen_session.c
+    # 2026-09-09 for the NDS client to share). Android does not call into it
+    # today -- KbmSnapshot.kt/apad_jni.c build the wire snapshot from Compose
+    # gesture state, a different input surface than a single resistive
+    # touchscreen -- but it is built in here anyway so a future caller does
+    # not have to touch this file, the same reasoning apad_ui.c's own
+    # comment below gives for that pair.
+    "${APAD_ROOT}/clients/common/apad_kbm_touch.c"
     # clients/common/apad_ui*: the shared customer-copy catalog. apad_jni.c
     # only calls apad_ui_msg()/apad_ui_msg_count() (apad_ui_strings.c) today —
     # apad_ui.c's precedence function is re-derived by hand in Kotlin instead,

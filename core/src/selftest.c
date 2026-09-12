@@ -18,14 +18,20 @@
  * and there deliberately is no opt-out. Two reasons. (1) The build the CI gate
  * runs is `scripts/build.sh core`, which passes no extra defines; a flag-gated
  * conformance suite is one nobody runs, which is worse than none because it
- * looks like coverage. (2) The cost is const data. Measured on x86-64 at -Os,
- * this file grew from 17.7 kB to 32.9 kB: +10.3 kB text (the golden byte
- * arrays plus the runner) and +4.8 kB of relocatable const, which is the
- * tables' `const char *name` pointers -- on a bare-metal target with no PIE
- * those are plain rodata too. Call it 15 kB against 4 MB on the smallest
- * platform. Nothing here is reachable except from apad_selftest_run, so a
- * platform that truly cannot spare it can drop this whole translation unit;
- * it cannot half-drop it and still claim to run the self-test screen.
+ * looks like coverage. (2) The cost is const data, and it is worth restating
+ * with a current number rather than the one this comment carried from M1.
+ * Measured on x86-64 at -Os, this translation unit is now 89.3 kB of object:
+ * 70.9 kB text (the golden byte arrays plus the runners) and 18.4 kB of
+ * relocatable const, which is the tables' `const char *name` pointers -- on a
+ * bare-metal target with no PIE those are plain rodata too. The §6.15-§6.22
+ * sections (K/L/M/N) added 28.2 kB of that, the largest single jump so far,
+ * because a sequence vector carries a whole datagram AND a full expected
+ * state per step. Still ~2% of the 4 MB on the smallest platform, and the
+ * trade is deliberate: those are the only four message types whose vectors
+ * were written before the codec they test. Nothing here is reachable except
+ * from apad_selftest_run, so a platform that truly cannot spare it can drop
+ * this whole translation unit; it cannot half-drop it and still claim to run
+ * the self-test screen.
  * (Not measured on ARM/Thumb -- no cross compiler in this environment.)
  *
  * vectors.h is included by relative path because scripts/build.sh puts only
@@ -761,9 +767,15 @@ static void st_payloads(st_ctx *c)
              && apad_payload_size(0x42u) == 64
              && apad_payload_size(0x50u) == 4
              && apad_payload_size(0x51u) == 64);
+    /* Unknown-type probes MUST come from outside every allocated range, or
+     * this case fails the day that range grows. 0x21 used to sit here and
+     * broke when §6.15 allocated it to KEYBOARD. Every range §4 defines lies
+     * within 0x01..0x5F, so 0x99 is safe by construction rather than by luck
+     * -- and it is what core/testdata/generate.py already uses for the same
+     * reason. */
     st_check(c, "types/unknown_type_reported",
              apad_payload_size(0x00u) == APAD_ERR_TYPE
-             && apad_payload_size(0x21u) == APAD_ERR_TYPE
+             && apad_payload_size(0x99u) == APAD_ERR_TYPE
              && apad_payload_size(0xFFu) == APAD_ERR_TYPE);
 
     /* §6.0: BYE.reason, STATUS.code and ERROR.code carry NO clamp. A receiver
@@ -2756,6 +2768,683 @@ static void st_vec_pair_uri(st_ctx *c)
     }
 }
 
+/* Sections K/L/M — §6.15–§6.22 (KEYBOARD, MOUSE, MEDIA, INPUTCAPS,
+ * apad_seq_diff and the event ring).
+ *
+ * These vectors were derived from docs/PROTOCOL.md by an author who had not
+ * read codec.c, seq.c or session.c — §13's rule, and the thing §15.9 records
+ * TOUCHMAP as lacking. Nothing below may be relaxed to make a build pass:
+ * a disagreement here is evidence about one side or the other, and deciding
+ * which is a spec question, not a test-maintenance one.
+ *
+ * Three shapes, per §13:
+ *   K  packet vectors    — wire bytes in, decoded structure out
+ *   L  function vectors  — input tuple, expected integer, no packet
+ *   M  sequence vectors  — ordered packets, expected state after EVERY step
+ */
+/* ---- Section N and the round-trip half of Section K -------------------- *
+ *
+ * §2's encode side: reserved BYTES zero on send, reserved BITS masked. The
+ * in-memory structs carry no reserved bytes at all (kbm.h), so KEYBOARD's and
+ * MEDIA's reserved0/reserved1 and INPUTCAPS's reserved0 are zeroes an encoder
+ * has to write deliberately — there is nothing to copy them from.
+ *
+ * Every buffer is prefilled with 0xA5 and one byte past the payload is
+ * checked afterwards: an encoder is the half of the codec that writes, and
+ * these run on targets with no MMU to catch a one-byte overrun.
+ */
+static void st_kbm_check_encode(st_ctx *c, const char *section,
+                                const char *name, int rc,
+                                const uint8_t *buf, size_t cap,
+                                const uint8_t *exp, uint16_t explen)
+{
+    st_check2(c, name, st_name(c, section, name, "encode_len"),
+              rc == (int)explen);
+    st_check2(c, name, st_name(c, section, name, "encode_bytes"),
+              rc == (int)explen && memcmp(buf, exp, (size_t)explen) == 0);
+    st_check2(c, name, st_name(c, section, name, "encode_no_overrun"),
+              buf[explen] == 0xA5u && buf[cap - 1u] == 0xA5u);
+}
+
+static void st_kbm_fill_keyboard(apad_keyboard *kb, const uint8_t *keys,
+                                 uint16_t seq, const uint8_t *code,
+                                 const uint8_t *flags, uint32_t ticks)
+{
+    size_t i;
+
+    memset(kb, 0, sizeof *kb);
+    memcpy(kb->keys, keys, APAD_KEY_BITMAP_BYTES);
+    kb->event_seq = seq;
+    for (i = 0; i < (size_t)APAD_KEYBOARD_RING_DEPTH; i++) {
+        kb->events[i].usage = code[i];
+        kb->events[i].flags = flags[i];
+    }
+    kb->client_ticks_ms = ticks;
+}
+
+static void st_kbm_fill_mouse(apad_mouse *m, uint16_t dx, uint16_t dy,
+                              uint16_t wheel, uint16_t hwheel,
+                              uint16_t buttons, uint16_t seq,
+                              const uint8_t *code, const uint8_t *flags,
+                              uint32_t ticks)
+{
+    size_t i;
+
+    memset(m, 0, sizeof *m);
+    m->dx_accum = dx;
+    m->dy_accum = dy;
+    m->wheel_accum = wheel;
+    m->hwheel_accum = hwheel;
+    m->buttons = buttons;
+    m->event_seq = seq;
+    for (i = 0; i < (size_t)APAD_MOUSE_RING_DEPTH; i++) {
+        m->events[i].button = code[i];
+        m->events[i].flags = flags[i];
+    }
+    m->client_ticks_ms = ticks;
+}
+
+static void st_kbm_fill_media(apad_media *m, uint32_t held, uint16_t seq,
+                              const uint8_t *code, const uint8_t *flags,
+                              uint32_t ticks)
+{
+    size_t i;
+
+    memset(m, 0, sizeof *m);
+    m->held = held;
+    m->event_seq = seq;
+    for (i = 0; i < (size_t)APAD_MEDIA_RING_DEPTH; i++) {
+        m->events[i].control = code[i];
+        m->events[i].flags = flags[i];
+    }
+    m->client_ticks_ms = ticks;
+}
+
+static void st_kbm_fill_inputcaps(apad_inputcaps *ic, uint32_t features,
+                                  uint32_t status, uint32_t media_mask,
+                                  uint16_t rate)
+{
+    memset(ic, 0, sizeof *ic);
+    ic->features = features;
+    ic->status = status;
+    ic->media_mask = media_mask;
+    ic->mouse_rate_hz = rate;
+}
+
+/*
+ * Section N proper. Each vector hands an encoder a caller-shaped struct —
+ * reserved bits included, deliberately — and requires exact bytes out. The
+ * *_reserved_ones pairs require byte-identical output to their *_clean twin,
+ * which is what catches an encoder that trusts what it was given.
+ *
+ * No vector here carries an out-of-range event code: §6.20 says an encoder
+ * "is not required to normalise them, and SHOULD NOT", and a SHOULD is not
+ * something a conformance vector may assert either way.
+ */
+static void st_vec_kbm_encode(st_ctx *c)
+{
+    size_t i;
+
+    for (i = 0; i < (size_t)APAD_KBM_ENCODE_VECTOR_COUNT; i++) {
+        const apad_vec_kbm_encode *v = &apad_kbm_encode_vectors[i];
+        uint8_t buf[72];
+        int rc;
+
+        memset(buf, 0xA5, sizeof buf);
+        switch (v->msg_type) {
+        case APAD_MSG_KEYBOARD: {
+            apad_keyboard kb;
+            st_kbm_fill_keyboard(&kb, v->in_keys, v->in_event_seq,
+                                 v->in_event_code, v->in_event_flags,
+                                 v->in_client_ticks_ms);
+            rc = apad_encode_keyboard(buf, sizeof buf, &kb);
+            break;
+        }
+        case APAD_MSG_MOUSE: {
+            apad_mouse m;
+            st_kbm_fill_mouse(&m, v->in_dx, v->in_dy, v->in_wheel,
+                              v->in_hwheel, v->in_buttons, v->in_event_seq,
+                              v->in_event_code, v->in_event_flags,
+                              v->in_client_ticks_ms);
+            rc = apad_encode_mouse(buf, sizeof buf, &m);
+            break;
+        }
+        case APAD_MSG_MEDIA: {
+            apad_media m;
+            st_kbm_fill_media(&m, v->in_held, v->in_event_seq,
+                              v->in_event_code, v->in_event_flags,
+                              v->in_client_ticks_ms);
+            rc = apad_encode_media(buf, sizeof buf, &m);
+            break;
+        }
+        default: {
+            apad_inputcaps ic;
+            st_kbm_fill_inputcaps(&ic, v->in_features, v->in_status,
+                                  v->in_media_mask, v->in_mouse_rate_hz);
+            rc = apad_encode_inputcaps(buf, sizeof buf, &ic);
+            break;
+        }
+        }
+        st_kbm_check_encode(c, "vec/kbm_encode", v->name, rc, buf, sizeof buf,
+                            v->exp_payload, (uint16_t)v->exp_payload_len);
+    }
+}
+
+static void st_vec_kbm_payloads(st_ctx *c)
+{
+    size_t i, k;
+
+    /* §6.15 KEYBOARD. */
+    for (i = 0; i < (size_t)APAD_KEYBOARD_VECTOR_COUNT; i++) {
+        const apad_vec_keyboard *v = &apad_keyboard_vectors[i];
+        const uint8_t *pl = st_vec_g_payload(c, "vec/keyboard", v->name,
+                                             v->packet, v->packet_len,
+                                             (uint8_t)APAD_MSG_KEYBOARD,
+                                             (uint16_t)APAD_LEN_KEYBOARD);
+        apad_keyboard kb;
+        int ok;
+
+        if (pl == NULL) {
+            continue;
+        }
+        /* 0x5A, not 0, or "scrubbed to zero" cannot be told from "never
+         * written" — §2's scrub rule is half the assertion here. */
+        memset(&kb, 0x5A, sizeof kb);
+        st_check2(c, v->name, st_name(c, "vec/keyboard", v->name, "decode"),
+                  apad_decode_keyboard(pl, APAD_LEN_KEYBOARD, &kb)
+                  == (int)APAD_LEN_KEYBOARD);
+        st_check2(c, v->name, st_name(c, "vec/keyboard", v->name, "keys"),
+                  memcmp(kb.keys, v->exp_keys, APAD_KEY_BITMAP_BYTES) == 0);
+        st_check2(c, v->name, st_name(c, "vec/keyboard", v->name, "scalars"),
+                  kb.event_seq == v->exp_event_seq
+                  && kb.client_ticks_ms == v->exp_client_ticks_ms);
+        ok = 1;
+        for (k = 0; k < (size_t)APAD_KEYBOARD_RING_DEPTH; k++) {
+            if (kb.events[k].usage != v->exp_event_code[k]
+                || kb.events[k].flags != v->exp_event_flags[k]) {
+                ok = 0;
+            }
+        }
+        st_check2(c, v->name, st_name(c, "vec/keyboard", v->name, "events"),
+                  ok);
+
+        /* Round trip, built from the VECTOR's expected values rather than
+         * from `kb`, so the encode assertion does not inherit a decode bug.
+         * An offset that is wrong the same way in both directions decodes and
+         * re-encodes perfectly; only bytes fixed by the spec catch it. */
+        {
+            apad_keyboard enc;
+            uint8_t buf[72];
+            st_kbm_fill_keyboard(&enc, v->exp_keys, v->exp_event_seq,
+                                 v->exp_event_code, v->exp_event_flags,
+                                 v->exp_client_ticks_ms);
+            memset(buf, 0xA5, sizeof buf);
+            st_kbm_check_encode(c, "vec/keyboard", v->name,
+                                apad_encode_keyboard(buf, sizeof buf, &enc),
+                                buf, sizeof buf, v->exp_encoded,
+                                (uint16_t)APAD_LEN_KEYBOARD);
+        }
+    }
+
+    /* §6.16 MOUSE. */
+    for (i = 0; i < (size_t)APAD_MOUSE_VECTOR_COUNT; i++) {
+        const apad_vec_mouse *v = &apad_mouse_vectors[i];
+        const uint8_t *pl = st_vec_g_payload(c, "vec/mouse", v->name,
+                                             v->packet, v->packet_len,
+                                             (uint8_t)APAD_MSG_MOUSE,
+                                             (uint16_t)APAD_LEN_MOUSE);
+        apad_mouse m;
+        int ok;
+
+        if (pl == NULL) {
+            continue;
+        }
+        memset(&m, 0x5A, sizeof m);
+        st_check2(c, v->name, st_name(c, "vec/mouse", v->name, "decode"),
+                  apad_decode_mouse(pl, APAD_LEN_MOUSE, &m)
+                  == (int)APAD_LEN_MOUSE);
+        st_check2(c, v->name, st_name(c, "vec/mouse", v->name, "accumulators"),
+                  m.dx_accum == v->exp_dx_accum
+                  && m.dy_accum == v->exp_dy_accum
+                  && m.wheel_accum == v->exp_wheel_accum
+                  && m.hwheel_accum == v->exp_hwheel_accum);
+        st_check2(c, v->name, st_name(c, "vec/mouse", v->name, "scalars"),
+                  m.buttons == v->exp_buttons
+                  && m.event_seq == v->exp_event_seq
+                  && m.client_ticks_ms == v->exp_client_ticks_ms);
+        ok = 1;
+        for (k = 0; k < (size_t)APAD_MOUSE_RING_DEPTH; k++) {
+            if (m.events[k].button != v->exp_event_code[k]
+                || m.events[k].flags != v->exp_event_flags[k]) {
+                ok = 0;
+            }
+        }
+        st_check2(c, v->name, st_name(c, "vec/mouse", v->name, "events"), ok);
+
+        {
+            apad_mouse enc;
+            uint8_t buf[72];
+            st_kbm_fill_mouse(&enc, v->exp_dx_accum, v->exp_dy_accum,
+                              v->exp_wheel_accum, v->exp_hwheel_accum,
+                              v->exp_buttons, v->exp_event_seq,
+                              v->exp_event_code, v->exp_event_flags,
+                              v->exp_client_ticks_ms);
+            memset(buf, 0xA5, sizeof buf);
+            st_kbm_check_encode(c, "vec/mouse", v->name,
+                                apad_encode_mouse(buf, sizeof buf, &enc),
+                                buf, sizeof buf, v->exp_encoded,
+                                (uint16_t)APAD_LEN_MOUSE);
+        }
+    }
+
+    /* §6.17 MEDIA. */
+    for (i = 0; i < (size_t)APAD_MEDIA_VECTOR_COUNT; i++) {
+        const apad_vec_media *v = &apad_media_vectors[i];
+        const uint8_t *pl = st_vec_g_payload(c, "vec/media", v->name,
+                                             v->packet, v->packet_len,
+                                             (uint8_t)APAD_MSG_MEDIA,
+                                             (uint16_t)APAD_LEN_MEDIA);
+        apad_media m;
+        int ok;
+
+        if (pl == NULL) {
+            continue;
+        }
+        memset(&m, 0x5A, sizeof m);
+        st_check2(c, v->name, st_name(c, "vec/media", v->name, "decode"),
+                  apad_decode_media(pl, APAD_LEN_MEDIA, &m)
+                  == (int)APAD_LEN_MEDIA);
+        st_check2(c, v->name, st_name(c, "vec/media", v->name, "scalars"),
+                  m.held == v->exp_held
+                  && m.event_seq == v->exp_event_seq
+                  && m.client_ticks_ms == v->exp_client_ticks_ms);
+        ok = 1;
+        for (k = 0; k < (size_t)APAD_MEDIA_RING_DEPTH; k++) {
+            if (m.events[k].control != v->exp_event_code[k]
+                || m.events[k].flags != v->exp_event_flags[k]) {
+                ok = 0;
+            }
+        }
+        st_check2(c, v->name, st_name(c, "vec/media", v->name, "events"), ok);
+
+        {
+            apad_media enc;
+            uint8_t buf[72];
+            st_kbm_fill_media(&enc, v->exp_held, v->exp_event_seq,
+                              v->exp_event_code, v->exp_event_flags,
+                              v->exp_client_ticks_ms);
+            memset(buf, 0xA5, sizeof buf);
+            st_kbm_check_encode(c, "vec/media", v->name,
+                                apad_encode_media(buf, sizeof buf, &enc),
+                                buf, sizeof buf, v->exp_encoded,
+                                (uint16_t)APAD_LEN_MEDIA);
+        }
+    }
+
+    /* §6.19 INPUTCAPS. */
+    for (i = 0; i < (size_t)APAD_INPUTCAPS_VECTOR_COUNT; i++) {
+        const apad_vec_inputcaps *v = &apad_inputcaps_vectors[i];
+        const uint8_t *pl = st_vec_g_payload(c, "vec/inputcaps", v->name,
+                                             v->packet, v->packet_len,
+                                             (uint8_t)APAD_MSG_INPUTCAPS,
+                                             (uint16_t)APAD_LEN_INPUTCAPS);
+        apad_inputcaps ic;
+
+        if (pl == NULL) {
+            continue;
+        }
+        memset(&ic, 0x5A, sizeof ic);
+        st_check2(c, v->name, st_name(c, "vec/inputcaps", v->name, "decode"),
+                  apad_decode_inputcaps(pl, APAD_LEN_INPUTCAPS, &ic)
+                  == (int)APAD_LEN_INPUTCAPS);
+        st_check2(c, v->name, st_name(c, "vec/inputcaps", v->name, "masks"),
+                  ic.features == v->exp_features
+                  && ic.status == v->exp_status
+                  && ic.media_mask == v->exp_media_mask);
+        st_check2(c, v->name,
+                  st_name(c, "vec/inputcaps", v->name, "mouse_rate_hz"),
+                  ic.mouse_rate_hz == v->exp_mouse_rate_hz);
+
+        {
+            apad_inputcaps enc;
+            uint8_t buf[72];
+            st_kbm_fill_inputcaps(&enc, v->exp_features, v->exp_status,
+                                  v->exp_media_mask, v->exp_mouse_rate_hz);
+            memset(buf, 0xA5, sizeof buf);
+            st_kbm_check_encode(c, "vec/inputcaps", v->name,
+                                apad_encode_inputcaps(buf, sizeof buf, &enc),
+                                buf, sizeof buf, v->exp_encoded,
+                                (uint16_t)APAD_LEN_INPUTCAPS);
+        }
+    }
+
+    /*
+     * §6.15's byte-identity property, and §13 calls for it on all four types:
+     * a packet with every reserved field and bit set to ones MUST decode to
+     * a structure byte-identical to the one from the clean packet.
+     *
+     * Both destinations are prefilled with the SAME pattern, so struct
+     * padding — which no decoder is obliged to write — compares equal either
+     * way and cannot make this vacuous or flaky. What it does catch is a
+     * reserved field passed through instead of scrubbed, and any field a
+     * per-type vector above did not think to enumerate.
+     */
+    for (i = 0; i < (size_t)APAD_KBM_IDENTITY_VECTOR_COUNT; i++) {
+        const apad_vec_kbm_identity *v = &apad_kbm_identity_vectors[i];
+        union {
+            apad_keyboard  kb;
+            apad_mouse     mo;
+            apad_media     me;
+            apad_inputcaps ic;
+        } a, b;
+        const uint8_t *pa;
+        const uint8_t *pb;
+        uint16_t len;
+        size_t sz;
+        int ra;
+        int rb;
+
+        switch (v->msg_type) {
+        case APAD_MSG_KEYBOARD:  len = APAD_LEN_KEYBOARD;  sz = sizeof a.kb; break;
+        case APAD_MSG_MOUSE:     len = APAD_LEN_MOUSE;     sz = sizeof a.mo; break;
+        case APAD_MSG_MEDIA:     len = APAD_LEN_MEDIA;     sz = sizeof a.me; break;
+        default:                 len = APAD_LEN_INPUTCAPS; sz = sizeof a.ic; break;
+        }
+        pa = st_vec_g_payload(c, "vec/kbm_identity", v->name, v->clean,
+                              v->clean_len, v->msg_type, len);
+        pb = st_vec_g_payload(c, "vec/kbm_identity", v->name, v->dirty,
+                              v->dirty_len, v->msg_type, len);
+        if (pa == NULL || pb == NULL) {
+            continue;
+        }
+        memset(&a, 0x5A, sizeof a);
+        memset(&b, 0x5A, sizeof b);
+        switch (v->msg_type) {
+        case APAD_MSG_KEYBOARD:
+            ra = apad_decode_keyboard(pa, len, &a.kb);
+            rb = apad_decode_keyboard(pb, len, &b.kb);
+            break;
+        case APAD_MSG_MOUSE:
+            ra = apad_decode_mouse(pa, len, &a.mo);
+            rb = apad_decode_mouse(pb, len, &b.mo);
+            break;
+        case APAD_MSG_MEDIA:
+            ra = apad_decode_media(pa, len, &a.me);
+            rb = apad_decode_media(pb, len, &b.me);
+            break;
+        default:
+            ra = apad_decode_inputcaps(pa, len, &a.ic);
+            rb = apad_decode_inputcaps(pb, len, &b.ic);
+            break;
+        }
+        st_check2(c, v->name, st_name(c, "vec/kbm_identity", v->name, "decode"),
+                  ra == (int)len && rb == (int)len);
+        st_check2(c, v->name,
+                  st_name(c, "vec/kbm_identity", v->name, "byte_identical"),
+                  memcmp(&a, &b, sz) == 0);
+    }
+}
+
+/*
+ * §13 shape 2. §6.21's five worked values plus both wrap directions and the
+ * half-space boundary, and §6.20 step 2's gap arithmetic at both ring depths.
+ */
+static void st_vec_kbm_functions(st_ctx *c)
+{
+    size_t i;
+
+    for (i = 0; i < (size_t)APAD_SEQ_DIFF_VECTOR_COUNT; i++) {
+        const apad_vec_seq_diff *v = &apad_seq_diff_vectors[i];
+        st_check2(c, v->name, st_name(c, "vec/seq_diff", v->name, NULL),
+                  apad_seq_diff(v->a, v->b) == (int)v->exp);
+    }
+
+    for (i = 0; i < (size_t)APAD_EVENT_RING_VECTOR_COUNT; i++) {
+        const apad_vec_event_ring *v = &apad_event_ring_vectors[i];
+        int overflow = 0;
+        int n = apad_event_ring_new(v->event_seq, v->last_seq,
+                                    (int)v->ring_len, &overflow);
+
+        st_check2(c, v->name, st_name(c, "vec/event_ring", v->name, "replay"),
+                  n == (int)v->exp_replay);
+        st_check2(c, v->name, st_name(c, "vec/event_ring", v->name, "overflow"),
+                  (overflow != 0) == (v->exp_overflow != 0));
+
+        /* The gap the vector was derived from, asserted directly: if these
+         * two disagree the fault is in apad_seq_diff, not in the ring. */
+        st_check2(c, v->name, st_name(c, "vec/event_ring", v->name, "gap"),
+                  apad_seq_diff(v->event_seq, v->last_seq) == (int)v->gap);
+
+        /* The out-parameter must answer for THIS call. A non-overflowing gap
+         * that leaves a caller's variable set surfaces a loss that did not
+         * happen, which is the opposite of §6.20's "surface the overflow"
+         * (the two branches are exclusive). Prefilled with 1 so a
+         * write-only-on-overflow implementation is visible. */
+        overflow = 1;
+        n = apad_event_ring_new(v->event_seq, v->last_seq, (int)v->ring_len,
+                                &overflow);
+        st_check2(c, v->name,
+                  st_name(c, "vec/event_ring", v->name, "overflow_not_sticky"),
+                  n == (int)v->exp_replay
+                  && (overflow != 0) == (v->exp_overflow != 0));
+
+        /* NULL is documented as allowed and a no-MMU target has nothing to
+         * catch it if it is not. */
+        st_check2(c, v->name,
+                  st_name(c, "vec/event_ring", v->name, "null_overflow_ok"),
+                  apad_event_ring_new(v->event_seq, v->last_seq,
+                                      (int)v->ring_len, NULL)
+                  == (int)v->exp_replay);
+    }
+}
+
+/* enum apad_kbm_class for a vector's cls field. Spelled out rather than cast,
+ * so that a future renumbering of the enum fails to compile instead of
+ * silently windowing the wrong type. */
+static int st_kbm_class_of(uint8_t vec_cls)
+{
+    switch (vec_cls) {
+    case APAD_VEC_KBM_CLS_KEYBOARD: return (int)APAD_KBM_CLASS_KEYBOARD;
+    case APAD_VEC_KBM_CLS_MOUSE:    return (int)APAD_KBM_CLASS_MOUSE;
+    default:                        return (int)APAD_KBM_CLASS_MEDIA;
+    }
+}
+
+/*
+ * §13 shape 3 — the sequence vectors. The receiver below is §6.20's, built
+ * from its four numbered steps plus §6.16's three accumulator rules, and
+ * every step asserts the whole state afterwards. §13: "A sequence vector
+ * asserts after every step, not only at the end, or a design that converges
+ * by accident passes."
+ *
+ * What core supplies and this drives: the §6.20 per-type window
+ * (apad_session_accept_kbm), the payload decoders, apad_event_ring_new and
+ * apad_seq_diff. What this composes on top — replay order, skipping "no
+ * event" slots, and step 3's unconditional reconcile — is the algorithm the
+ * spec prints, because core deliberately holds no per-facility held state:
+ * that belongs to the server's mapping engine and to each client.
+ */
+static void st_vec_kbm_sequences(st_ctx *c)
+{
+    size_t i, j, k;
+
+    for (i = 0; i < (size_t)APAD_KBM_SEQUENCE_VECTOR_COUNT; i++) {
+        const apad_vec_kbm_sequence *v = &apad_kbm_sequence_vectors[i];
+        apad_session s;
+        uint8_t  keys[APAD_KEY_BITMAP_BYTES];
+        uint16_t buttons = 0;
+        uint32_t held = 0;
+        uint16_t last_applied = 0;
+        int      have_first = 0;
+        int      base_valid = 0;
+        uint16_t base[4];
+        int      cls = st_kbm_class_of(v->cls);
+        int      depth = (int)v->ring_depth;
+
+        memset(keys, 0, sizeof keys);
+        memset(base, 0, sizeof base);
+        apad_session_init(&s, 1, 0u);
+
+        for (j = 0; j < (size_t)v->step_count; j++) {
+            const apad_vec_kbm_step *st = &v->steps[j];
+            apad_packet pk;
+            apad_keyboard kb;
+            apad_mouse    mo;
+            apad_media    me;
+            uint8_t  code[8];
+            uint8_t  flg[8];
+            int32_t  motion[4];
+            uint16_t event_seq = 0;
+            int replay_len = 0;
+            int overflow = 0;
+            int accepted;
+            int n = 0;
+            int ok;
+
+            memset(&pk, 0, sizeof pk);
+            memset(code, 0, sizeof code);
+            memset(flg, 0, sizeof flg);
+            motion[0] = 0; motion[1] = 0; motion[2] = 0; motion[3] = 0;
+
+            st_check2(c, v->name, st_name(c, "vec/kbm_seq", v->name, "frame"),
+                      apad_packet_parse(st->packet, (size_t)st->packet_len,
+                                        &pk) == (int)st->packet_len
+                      && pk.header.type == v->msg_type
+                      && pk.payload != NULL);
+            if (pk.payload == NULL) {
+                break;
+            }
+
+            /* §6.20's per-type window, on the HEADER sequence. */
+            accepted = (apad_session_accept_kbm(&s, cls, pk.header.sequence)
+                        == APAD_OK);
+            st_check2(c, v->name,
+                      st_name(c, "vec/kbm_seq", v->name, "accepted"),
+                      accepted == (st->exp_accepted != 0));
+
+            if (accepted) {
+                switch (v->cls) {
+                case APAD_VEC_KBM_CLS_KEYBOARD:
+                    memset(&kb, 0x5A, sizeof kb);
+                    apad_decode_keyboard(pk.payload, APAD_LEN_KEYBOARD, &kb);
+                    event_seq = kb.event_seq;
+                    for (k = 0; k < 8u; k++) {
+                        code[k] = kb.events[k].usage;
+                        flg[k]  = kb.events[k].flags;
+                    }
+                    break;
+                case APAD_VEC_KBM_CLS_MOUSE:
+                    memset(&mo, 0x5A, sizeof mo);
+                    apad_decode_mouse(pk.payload, APAD_LEN_MOUSE, &mo);
+                    event_seq = mo.event_seq;
+                    for (k = 0; k < 4u; k++) {
+                        code[k] = mo.events[k].button;
+                        flg[k]  = mo.events[k].flags;
+                    }
+                    /* §6.16 rule 1: the FIRST ACCEPTED sample establishes the
+                     * baseline and produces zero motion. Rule 2 is the `if
+                     * (accepted)` this sits inside: a discarded datagram must
+                     * not advance it. */
+                    if (base_valid) {
+                        motion[0] = apad_seq_diff(mo.dx_accum, base[0]);
+                        motion[1] = apad_seq_diff(mo.dy_accum, base[1]);
+                        motion[2] = apad_seq_diff(mo.wheel_accum, base[2]);
+                        motion[3] = apad_seq_diff(mo.hwheel_accum, base[3]);
+                    }
+                    base_valid = 1;
+                    base[0] = mo.dx_accum;
+                    base[1] = mo.dy_accum;
+                    base[2] = mo.wheel_accum;
+                    base[3] = mo.hwheel_accum;
+                    break;
+                default:
+                    memset(&me, 0x5A, sizeof me);
+                    apad_decode_media(pk.payload, APAD_LEN_MEDIA, &me);
+                    event_seq = me.event_seq;
+                    for (k = 0; k < 4u; k++) {
+                        code[k] = me.events[k].control;
+                        flg[k]  = me.events[k].flags;
+                    }
+                    break;
+                }
+
+                /* §6.20 steps 1 and 2. Step 1 does NOT consult the ring: its
+                 * contents predate the receiver's interest in them. */
+                if (!have_first) {
+                    have_first = 1;
+                    n = 0;
+                } else {
+                    n = apad_event_ring_new(event_seq, last_applied, depth,
+                                            &overflow);
+                }
+                for (k = (size_t)(depth - n); k < (size_t)depth; k++) {
+                    if (code[k] != 0u) {   /* §6.20: skip "no event" slots */
+                        replay_len++;
+                    }
+                }
+
+                /* §6.20 step 3, unconditional: the snapshot is the authority.
+                 * Step 4: adopt event_seq whatever the gap was. */
+                switch (v->cls) {
+                case APAD_VEC_KBM_CLS_KEYBOARD:
+                    memcpy(keys, kb.keys, sizeof keys);
+                    break;
+                case APAD_VEC_KBM_CLS_MOUSE:
+                    buttons = mo.buttons;
+                    break;
+                default:
+                    held = me.held;
+                    break;
+                }
+                last_applied = event_seq;
+            }
+
+            st_check2(c, v->name,
+                      st_name(c, "vec/kbm_seq", v->name, "overflow"),
+                      (overflow != 0) == (st->exp_overflow != 0));
+            st_check2(c, v->name,
+                      st_name(c, "vec/kbm_seq", v->name, "replay_len"),
+                      replay_len == (int)st->exp_replay_len);
+
+            ok = 1;
+            if (accepted) {
+                size_t r = 0;
+                for (k = (size_t)(depth - n); k < (size_t)depth; k++) {
+                    if (code[k] == 0u) {
+                        continue;
+                    }
+                    if (r >= (size_t)st->exp_replay_len
+                        || code[k] != st->exp_replay_code[r]
+                        || flg[k] != st->exp_replay_flags[r]) {
+                        ok = 0;
+                        break;
+                    }
+                    r++;
+                }
+                if (r != (size_t)st->exp_replay_len) {
+                    ok = 0;
+                }
+            }
+            st_check2(c, v->name,
+                      st_name(c, "vec/kbm_seq", v->name, "replay_events"), ok);
+
+            /* State after this step — asserted for every step, accepted or
+             * not. After a discarded one it MUST equal the state before. */
+            st_check2(c, v->name, st_name(c, "vec/kbm_seq", v->name, "held"),
+                      memcmp(keys, st->exp_keys, sizeof keys) == 0
+                      && buttons == st->exp_buttons
+                      && held == st->exp_held);
+            st_check2(c, v->name,
+                      st_name(c, "vec/kbm_seq", v->name, "last_applied"),
+                      last_applied == st->exp_last_applied);
+            st_check2(c, v->name, st_name(c, "vec/kbm_seq", v->name, "motion"),
+                      motion[0] == st->exp_dx && motion[1] == st->exp_dy
+                      && motion[2] == st->exp_wheel
+                      && motion[3] == st->exp_hwheel);
+        }
+    }
+}
+
 static void st_vectors(st_ctx *c)
 {
     int ok = 1;
@@ -2786,6 +3475,10 @@ static void st_vectors(st_ctx *c)
     st_vec_section_g(c);
     st_vec_text(c);
     st_vec_pair_uri(c);
+    st_vec_kbm_payloads(c);
+    st_vec_kbm_encode(c);
+    st_vec_kbm_functions(c);
+    st_vec_kbm_sequences(c);
 }
 
 /* ---- entry point ------------------------------------------------------- */

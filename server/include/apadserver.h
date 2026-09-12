@@ -475,6 +475,64 @@ int apad_server_last_input(const apad_server *s, uint8_t slot,
                            apad_input_state *out, uint32_t *out_frame);
 
 /*
+ * §6.15-§6.19 keyboard/mouse/media, for a UI that wants to show "keyboard:
+ * ready, mouse: ready, media: not supported" per connected client, the same
+ * facts INPUTCAPS itself carries. A snapshot, same convention as
+ * apad_client_info: nothing here points into the server.
+ */
+typedef struct {
+    uint32_t features;    /* APAD_KBM_FEATURE_* this server accepts -- the
+                           * SAME for every session (a backend's capability
+                           * does not vary per client), included here purely
+                           * so a UI has one call rather than two */
+    uint32_t status;       /* APAD_KBM_STATUS_* for THIS session, right now */
+    uint32_t media_mask;   /* APAD_MEDIA_* controls this server will drive */
+
+    /* Section 6.20 step 2: lifetime count of events this session's server
+     * could not replay because a facility's event-ring gap exceeded its
+     * ring depth (0 for a session that has never overflowed any of the
+     * three). The reconcile that runs on every accepted KEYBOARD/MOUSE/
+     * MEDIA datagram restores the shadow's held STATE across a gap like
+     * this, but it cannot restore an EDGE that happened entirely inside
+     * the gap -- a key pressed and released between two accepted
+     * snapshots leaves nothing for the reconcile to see, so the state
+     * converges while the keystroke is simply gone. These three counters
+     * are how a UI shows that loss ever happened at all; the server's own
+     * on_log sink additionally reports it as it happens (rate-limited --
+     * see server/src/server.c's kbm_log_overflow()), so this is a summary
+     * for a UI that was not watching the log, not the only place it is
+     * surfaced. */
+    uint32_t keyboard_overflow_events;
+    uint32_t mouse_overflow_events;
+    uint32_t media_overflow_events;
+} apad_kbm_status;
+
+/*
+ * Copy KEYBOARD/MOUSE/MEDIA capability and per-session readiness for
+ * session `slot` into `*out`. Follows apad_server_last_input()'s own
+ * conventions exactly: a pure query, no clock, safe to poll at UI rates
+ * without perturbing protocol state.
+ *
+ * Returns:
+ *   APAD_OK         `*out` filled with the live values.
+ *   APAD_ERR_ARG     `s` or `out` is NULL, or `slot` is out of range, or
+ *                    `slot` has no connected session.
+ *
+ * `out->status` reads 0 for a session this server has not yet advertised
+ * INPUTCAPS to at all (before the ACK that discharges WELCOME, or -- on an
+ * AUTH_REQUIRED session -- before the first datagram whose tag verifies;
+ * §6.19 Delivery) -- that is a real, momentary state, not an error, so it is
+ * not distinguished from "advertised, nothing ready yet" the way
+ * apad_server_last_input() distinguishes APAD_ERR_STATE from APAD_OK: unlike
+ * an INPUT_STATE a session may legitimately never send, "no KBM device
+ * ready yet" is the expected state for the first instant of every session
+ * that uses this facility at all, not a distinct error condition worth its
+ * own return code.
+ */
+int apad_server_kbm_status(const apad_server *s, uint8_t slot,
+                           apad_kbm_status *out);
+
+/*
  * Reload the profile set from `sources`/`count` (apad_profiles_load()'s own
  * parameters, forwarded verbatim -- see apad_profile_source's doc comment
  * above) and re-resolve EVERY live session's `const apad_profile *` against

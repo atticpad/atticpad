@@ -6,6 +6,8 @@
     python3 clients/3ds/meta/make-assets.py --windows          # Windows .ico
     python3 clients/3ds/meta/make-assets.py --brand            # README logo +
                                                                # org avatar
+    python3 clients/3ds/meta/make-assets.py --psp              # PSP XMB tile +
+                                                               # backdrop
     python3 clients/3ds/meta/make-assets.py --banner3d-mark    # 3D banner tex
     python3 clients/3ds/meta/make-assets.py --banner3d-glyph   # 3D banner
                                                                # particle outline
@@ -56,6 +58,7 @@ TRANSPARENT = "--transparent" in sys.argv
 ANDROID     = "--android" in sys.argv
 WINDOWS     = "--windows" in sys.argv
 BRAND       = "--brand" in sys.argv
+PSP         = "--psp" in sys.argv
 BANNER3D    = "--banner3d-mark" in sys.argv
 GLYPH       = "--banner3d-glyph" in sys.argv
 
@@ -739,7 +742,117 @@ def make_brand_assets():
     mark, _ = fit_mark(S, 0.68)                      # its own corner rounding
     av.alpha_composite(mark)
     av.resize((A, A), Image.LANCZOS).save("docs/img/avatar.png")
-    print(f"  wrote docs/img/logo.png ({Ws//SSB}x{H}) and docs/img/avatar.png ({A}x{A})")
+
+    # ------------------------------------------------- web UI favicon
+    # The server's page had no favicon at all, so every visit was a 404 on
+    # /favicon.ico and a generic glyph in the tab. It is EMBEDDED in the
+    # binary rather than served from disk, for the same reason the shipped
+    # profiles are (see gen_profiles_builtin.py): a release is one file, and
+    # a downloaded server has no asset directory beside it.
+    #
+    # 48px because a browser downscales to 16 and this mark survives that
+    # (checked at 40px for the org avatar); the rounded plate is the 3DS
+    # icon's own, so a tab, a HOME menu entry and a launcher icon are
+    # visibly the same artwork.
+    F = 48
+    S = F * SSB
+    fav = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    ImageDraw.Draw(fav).rounded_rectangle([0, 0, S-1, S-1], radius=S*0.18,
+                                          fill=(38, 45, 58, 255))
+    fav_mark, _ = fit_mark(S, 0.74)
+    fav.alpha_composite(fav_mark)
+    fav = fav.resize((F, F), Image.LANCZOS)
+    # Encode ONCE and write the same bytes to both places. Saving the file
+    # separately produced a different (unoptimised) encoding of the same
+    # image, so the reference PNG and the embedded copy were not
+    # byte-identical -- harmless to look at, and exactly the drift that makes
+    # a later "does the header still match the file?" check fail for a reason
+    # nobody can see.
+    buf = io.BytesIO()
+    fav.save(buf, format="PNG", optimize=True)
+    png = buf.getvalue()
+    with io.open("docs/img/favicon.png", "wb") as fh:
+        fh.write(png)
+
+    rows = []
+    for i in range(0, len(png), 12):
+        rows.append("    " + " ".join(f"0x{b:02x}," for b in png[i:i+12]))
+    hdr = (
+        "/* server/host/common/favicon_png.h -- GENERATED, do not edit.\n"
+        " *\n"
+        " * Source: clients/3ds/meta/make-assets.py --brand (render_mark(), the\n"
+        " * one place the AtticPad mark is drawn -- see that file's header).\n"
+        " * Regenerate by rerunning it; the bytes below are a 48x48 PNG.\n"
+        " *\n"
+        " * Embedded rather than read from disk because a release is a single\n"
+        " * binary with no asset directory beside it, exactly as\n"
+        " * profiles_builtin.h is. Served at /favicon.ico and /favicon.png by\n"
+        " * webui.h; a browser accepts PNG bytes at the .ico path because the\n"
+        " * Content-Type header decides, not the extension.\n"
+        " */\n"
+        "#ifndef ATTICPAD_HOST_COMMON_FAVICON_PNG_H\n"
+        "#define ATTICPAD_HOST_COMMON_FAVICON_PNG_H\n"
+        "\n"
+        "static const unsigned char kApadFaviconPng[] = {\n"
+        + "\n".join(rows) + "\n"
+        "};\n"
+        "\n"
+        "#endif /* ATTICPAD_HOST_COMMON_FAVICON_PNG_H */\n"
+    )
+    io.open("server/host/common/favicon_png.h", "w", encoding="utf-8").write(hdr)
+    print(f"  wrote docs/img/logo.png ({Ws//SSB}x{H}), docs/img/avatar.png ({A}x{A}),"
+          f" docs/img/favicon.png ({F}x{F}) and server/host/common/favicon_png.h"
+          f" ({len(png)} bytes embedded)")
+
+# ---- PSP XMB tile and backdrop -----------------------------------------
+#
+# The XMB game list shows ICON0.PNG (144x80) and, behind the selected
+# entry, PIC1.PNG (480x272). The first tile was the README logo scaled
+# down: a rounded card with transparent corners, smaller than the tile,
+# which the XMB's own highlight frame turned into an odd inset. So: the
+# same lockup as the README logo (mark + wordmark, same render_mark()),
+# but drawn edge to edge on an OPAQUE slate tile of exactly the XMB's size,
+# and sized by whichever of width and height binds. Both files are read by
+# clients/psp/Makefile (PSP_EBOOT_ICON / PSP_EBOOT_PIC1) at pack time.
+
+def _lockup(Hs):
+    """Mark + wordmark on a transparent canvas Hs tall, cropped to its ink.
+    The geometry is make_brand_assets()' README lockup without the card."""
+    f  = ImageFont.truetype(BRAND_FONT, int(Hs*0.34))
+    tw = int(ImageDraw.Draw(Image.new("RGBA", (8, 8))).textlength(BRAND_WORD, font=f))
+    m, gap = int(Hs*0.76), int(Hs*0.10)
+    im = Image.new("RGBA", (m + gap + tw, Hs), (0, 0, 0, 0))
+    tile, pad_cy = fit_mark(m, 0.92)
+    my = int(Hs/2 - m/2)
+    im.alpha_composite(tile, (0, my))
+    ImageDraw.Draw(im).text((m + gap, my + pad_cy), BRAND_WORD, font=f,
+                            fill=CREAM + (255,), anchor="lm")
+    return im.crop(_brand_ink_bbox(im))
+
+def _plate(w, h, margin, ssb, fill):
+    """Opaque w x h plate with the lockup fitted inside a `margin` border."""
+    Ws, Hs = w*ssb, h*ssb
+    lock = _lockup(Hs)
+    box_w, box_h = Ws - 2*int(Ws*margin), Hs - 2*int(Hs*margin)
+    k = min(box_w / lock.width, box_h / lock.height)
+    lock = lock.resize((max(1, int(lock.width*k)), max(1, int(lock.height*k))),
+                       Image.LANCZOS)
+    im = Image.new("RGBA", (Ws, Hs), fill + (255,))
+    im.alpha_composite(lock, ((Ws - lock.width)//2, (Hs - lock.height)//2))
+    return im.resize((w, h), Image.LANCZOS).convert("RGB")
+
+def make_psp_assets():
+    SSB = 4
+    out = "clients/psp/meta"
+    os.makedirs(out, exist_ok=True)
+    _plate(144, 80, 0.09, SSB, SLATE).save(f"{out}/ICON0.PNG", optimize=True)
+    _plate(480, 272, 0.20, SSB, SLATE).save(f"{out}/PIC1.PNG", optimize=True)
+    print(f"  wrote {out}/ICON0.PNG (144x80) and {out}/PIC1.PNG (480x272), both opaque")
+
+if PSP:
+    print("AtticPad: PSP XMB tile + backdrop")
+    make_psp_assets()
+    sys.exit(0)
 
 if BRAND:
     # Mutually exclusive with the other modes, same as --windows: writes only

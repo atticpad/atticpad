@@ -961,8 +961,8 @@ PPSSPP and melonDS are scriptable enough to serve as CI smoke tests.
 
 In the README, honestly:
 
-- **Hardware-verified** — 3DS, Android, Linux server, Windows server (tested on real hardware every release)
-- **Emulator-verified** — PSP, DS/DSi, Vita (build passes and the on-device self-test passes under PPSSPP, melonDS, or Vita3K; never run on hardware)
+- **Hardware-verified** — 3DS, Android, PSP, DS/DSi, Linux server, Windows server (tested on real hardware every release)
+- **Emulator-verified** — a client whose build passes and whose on-device self-test passes under PPSSPP, melonDS, or Vita3K, but that has never run on hardware
 - **Built, untested** — Switch (CI-built, community-tested)
 
 The middle tier exists because [§8.5](#85-the-local-development-loop) makes it real: a client that boots in an emulator and passes its conformance vectors has cleared the codec, endianness, and alignment classes of bug, leaving only genuine hardware behaviour. That is a meaningfully different claim from "it compiled," and users deserve to see the difference.

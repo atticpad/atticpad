@@ -36,6 +36,51 @@ int apad_seq_diff(uint16_t a, uint16_t b)
     return -(int)(uint16_t)(0x10000u - d);    /* -32768 .. -1 */
 }
 
+/*
+ * §6.20 step 2 — how many trailing slots of an event ring to replay.
+ *
+ * Implemented ON TOP OF apad_seq_diff and nowhere else: §9 requires exactly
+ * one copy of the wrap arithmetic in the whole core, so this function
+ * contains no subtraction of its own and `nm` can still prove there is one
+ * implementation.
+ *
+ * IT CANNOT FAIL, AND THAT IS THE DESIGN. §6.20 step 3 makes the caller
+ * reconcile held state against the datagram's snapshot UNCONDITIONALLY --
+ * including when the gap is zero, and including on overflow -- because that
+ * is what limits a divergence to one packet instead of forever. Returning
+ * APAD_ERR_STALE for "nothing new" would invite `if (n < 0) return;`, which
+ * skips the reconcile and reintroduces exactly the permanent-divergence bug
+ * step 3 exists to prevent. So: a gap of zero or less is 0, "replay nothing",
+ * and the caller carries on to the reconcile.
+ */
+int apad_event_ring_new(uint16_t event_seq, uint16_t last_seq, int ring_len,
+                        int *out_overflow)
+{
+    int gap;
+
+    if (out_overflow != NULL) {
+        *out_overflow = 0;
+    }
+    if (ring_len <= 0) {
+        return 0;   /* a ring with no slots can replay nothing */
+    }
+
+    gap = apad_seq_diff(event_seq, last_seq);
+    if (gap <= 0) {
+        /* Nothing new, or a duplicate, or a reordered ring. §6.20 step 2. */
+        return 0;
+    }
+    if (gap > ring_len) {
+        /* Events were lost that the ring cannot carry. Replay everything it
+         * does hold, and SURFACE the overflow rather than swallowing it. */
+        if (out_overflow != NULL) {
+            *out_overflow = 1;
+        }
+        return ring_len;
+    }
+    return gap;
+}
+
 uint16_t apad_seq_next(uint16_t s)
 {
     return (uint16_t)((unsigned)s + 1u);

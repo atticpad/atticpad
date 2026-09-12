@@ -67,15 +67,28 @@ enum apad_msg_type {
     APAD_MSG_WELCOME     = 0x11,
     APAD_MSG_BYE         = 0x12,
     APAD_MSG_INPUT_STATE = 0x20,
+    /* Added after the v1 freeze, additively (§6.15-§6.19, audited against
+     * §6.14 in §6.20): new type codes only, and §4 makes a peer that predates
+     * them discard the datagram silently at §3.1 check 5. 0x20-0x2F is the
+     * client->server input range; 0x24 is RESERVED for TEXT (§6.22) and MUST
+     * NOT be allocated to anything else. */
+    APAD_MSG_KEYBOARD    = 0x21,
+    APAD_MSG_MOUSE       = 0x22,
+    APAD_MSG_MEDIA       = 0x23,
     APAD_MSG_PING        = 0x30,
     APAD_MSG_PONG        = 0x31,
     APAD_MSG_RUMBLE      = 0x40,
     APAD_MSG_LED         = 0x41,
     APAD_MSG_STATUS      = 0x42,
-    /* v2 EXPERIMENT (branch experiment/touchmap-v2): not in v1, not in
-     * docs/PROTOCOL.md, and NOT to be merged to master without a v2
-     * decision. 0x43 is the first free server->client type. */
+    /* Added after the v1 freeze, additively (§6.12, §6.14): a new type code
+     * only, and §4 makes a peer that predates it discard the datagram
+     * silently. 0x43 was the first free server->client type. */
     APAD_MSG_TOUCHMAP    = 0x43,
+    /* §6.19, added with the three above. Server->client: it tells a client
+     * which of §6.15-§6.17 this server will accept, and its ABSENCE is the
+     * negotiation -- a client that has never received one MUST NOT send any
+     * of them, so a v1 server (which cannot send this) never receives them. */
+    APAD_MSG_INPUTCAPS   = 0x44,
     APAD_MSG_ACK         = 0x50,
     APAD_MSG_ERROR       = 0x51
 };
@@ -87,15 +100,23 @@ enum apad_msg_type {
 #define APAD_LEN_WELCOME         60u
 #define APAD_LEN_BYE             4u
 #define APAD_LEN_INPUT_STATE     56u   /* §5 — 56, not 48; see §5 and §14.2 */
+/* §6.15-§6.17. KEYBOARD is 56 bytes like INPUT_STATE and by coincidence, not
+ * by any shared structure: 32 of them are the held-key bitmap. */
+#define APAD_LEN_KEYBOARD        56u   /* §6.15 */
+#define APAD_LEN_MOUSE           24u   /* §6.16 */
+#define APAD_LEN_MEDIA           20u   /* §6.17 */
 #define APAD_LEN_PING            8u
 #define APAD_LEN_PONG            8u
 #define APAD_LEN_RUMBLE          8u
 #define APAD_LEN_LED             4u
 #define APAD_LEN_STATUS          64u
-/* v2 EXPERIMENT: 4-byte header + 8 regions x 8 bytes. 68 of the 236
+/* §6.12: 4-byte header + 8 regions x 8 bytes. 68 of the 236
  * authenticated payload bytes (§11), so one datagram, never fragmented. */
 #define APAD_TOUCHMAP_MAX_REGIONS 8u
 #define APAD_LEN_TOUCHMAP        68u
+/* §6.19: fixed 16 bytes whatever `features` says, so a decoder has no length
+ * arithmetic to get wrong -- §6.12's argument, applied again. */
+#define APAD_LEN_INPUTCAPS       16u
 #define APAD_LEN_ACK             4u
 #define APAD_LEN_ERROR           64u
 
@@ -222,6 +243,42 @@ uint8_t apad_hat_from_buttons(uint32_t buttons);
 #define APAD_PADBTN_LTHUMB  (1u << 9)   /* L3 */
 #define APAD_PADBTN_RTHUMB  (1u << 10)  /* R3 */
 
+
+/* ---- §6.15-§6.19 keyboard / mouse / media validity masks ----------------
+ *
+ * The reserved-bit masks the decoders apply, kept here beside APAD_CAP_ and
+ * APAD_BTN_'s. The VOCABULARY these fields carry -- mouse button names, the
+ * §6.18 media index, the §6.19 feature and status bits, HID usage names --
+ * lives in atticpad/kbm.h with the structs it describes.
+ *
+ * §2: reserved bits are zero on send and SCRUBBED on receive, never a reason
+ * to reject. Every mask below is applied on both sides.
+ */
+
+/* §6.15/§6.16/§6.17 event slot: flags bit 0 is DOWN, bits 1-7 reserved. */
+#define APAD_KBM_EVENT_DOWN         (1u << 0)
+#define APAD_KBM_EVENT_FLAGS_MASK   0x01u
+
+/* §6.15 keys[0] bits 0-3: HID usages 0x00-0x03 are no-event, ErrorRollOver,
+ * POSTFail and ErrorUndefined -- conditions, not keys. */
+#define APAD_KEYS0_RESERVED_MASK    0x0Fu
+/* §6.15: an events[] slot whose usage is 0..3 is "no event". The decoder
+ * forces `flags` to 0 as well, so such a slot decodes byte-identically
+ * whatever a non-conforming sender put in it. */
+#define APAD_KEY_USAGE_RESERVED_MAX 3u
+
+/* §6.16 MOUSE.buttons bits 5..15 reserved; the five real buttons are
+ * APAD_MOUSEBTN_* (kbm.h) at bit index-1. */
+#define APAD_MOUSEBTN_VALID_MASK    0x001Fu
+
+/* §6.17 MEDIA.held and §6.19 INPUTCAPS.media_mask: control c is bit c-1, and
+ * §6.18 assigns 1..24, so bits 24..31 (indices 25..32) are reserved. ONE mask
+ * for both fields on purpose -- they name controls from the same index. */
+#define APAD_MEDIA_VALID_MASK       0x00FFFFFFu
+
+/* §6.19 features bits 3..31 and status bits 4..31 reserved. */
+#define APAD_KBM_FEATURE_VALID_MASK 0x00000007u
+#define APAD_KBM_STATUS_VALID_MASK  0x0000000Fu
 
 /* ---- §6.4 WELCOME flags ------------------------------------------------ */
 

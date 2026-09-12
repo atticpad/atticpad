@@ -480,16 +480,20 @@ const char *app_close_reason_text(int reason)
  * pool is four sockets, and holding one for the rest of the run to send a
  * single DISCOVER would be the kind of leak that only shows up on the console
  * with the fewest resources. */
+#define DISCOVER_WINDOW_MS 500u
+
 int app_discover(app_ctx *ctx)
 {
     uint8_t buf[APAD_MAX_DATAGRAM];
     uint8_t rbuf[APAD_MAX_DATAGRAM];
     apad_sock *sock;
-    apad_addr bcast, from;
+    apad_addr bcast, from, saved;
     apad_header hdr;
     apad_packet pkt;
     apad_announce ann;
-    int n, rn;
+    const uint8_t *prefer;
+    uint32_t start;
+    int n, rn, have;
 
     sock = apad_udp_open(0);
     if (sock == NULL) {
@@ -510,22 +514,62 @@ int app_discover(app_ctx *ctx)
         return 0;
     }
 
+    /* WHICH SERVER WINS WHEN SEVERAL ANSWER. Nothing here is hardcoded: the
+     * address in ctx->ip_text is either "" (fresh unit), the one config_3ds.c
+     * saved after the last successful session, or the one the previous
+     * discovery picked. If it names a host that answers this DISCOVER, that
+     * host wins even when another one answered first; only when it stays
+     * silent for the whole window does the first responder take over. Without
+     * this, a LAN with two servers always "chose" the faster machine at boot
+     * (2026-09-10 DS report: "the linux server ip is hardcoded at boot no?"). */
+    prefer = NULL;
+    if (ctx->ip_text[0] != '\0'
+        && apad_addr_parse(&saved, ctx->ip_text, 0) == APAD_OK) {
+        prefer = saved.ip;
+    }
+
     apad_addr_broadcast(&bcast, (uint16_t)APAD_DEFAULT_PORT);
     (void)apad_udp_send(sock, &bcast, buf, (size_t)n);
 
-    rn = apad_udp_recv(sock, &from, rbuf, sizeof rbuf, 500);
-    apad_udp_close(sock);
-    if (rn <= 0) {
-        return 0;
-    }
+    start = apad_ticks_ms();
+    have = 0;
+    for (;;) {
+        apad_addr rfrom;
+        apad_announce rann;
+        uint32_t elapsed = apad_time_since(apad_ticks_ms(), start);
+        int wait_ms;
 
-    memset(&pkt, 0, sizeof pkt);
-    if (apad_packet_parse(rbuf, (size_t)rn, &pkt) < 0
-        || pkt.header.type != (uint8_t)APAD_MSG_ANNOUNCE) {
-        return 0;
+        if (elapsed >= DISCOVER_WINDOW_MS) {
+            break;
+        }
+        wait_ms = (int)(DISCOVER_WINDOW_MS - elapsed);
+        rn = apad_udp_recv(sock, &rfrom, rbuf, sizeof rbuf, wait_ms);
+        if (rn <= 0) {
+            break;
+        }
+        memset(&pkt, 0, sizeof pkt);
+        if (apad_packet_parse(rbuf, (size_t)rn, &pkt) < 0
+            || pkt.header.type != (uint8_t)APAD_MSG_ANNOUNCE) {
+            continue;
+        }
+        memset(&rann, 0, sizeof rann);
+        if (apad_decode_announce(pkt.payload, pkt.payload_len, &rann) < 0) {
+            continue;
+        }
+        if (prefer == NULL || memcmp(rfrom.ip, prefer, 4) == 0) {
+            from = rfrom;
+            ann = rann;
+            have = 1;
+            break;              /* nothing to prefer, or this is it */
+        }
+        if (!have) {
+            from = rfrom;       /* first responder: the fallback */
+            ann = rann;
+            have = 1;
+        }
     }
-    memset(&ann, 0, sizeof ann);
-    if (apad_decode_announce(pkt.payload, pkt.payload_len, &ann) < 0) {
+    apad_udp_close(sock);
+    if (!have) {
         return 0;
     }
 

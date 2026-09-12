@@ -244,8 +244,7 @@ static apad_screen_id do_connect(app_ctx *ctx)
                  * S10.3 code, since there is still no PIN keypad -- this
                  * falls through and connects normally; the engine derives the
                  * session key and signs the ACK. */
-                app_note(ctx, 2, "server requires pairing -- scan its QR code "
-                                 "(SCAN QR / X)");
+                app_note(ctx, 2, "server requires pairing -- scan its QR code");
                 s_auto_attempt = 0;
                 return APAD_SCREEN_CONNECT;
             }
@@ -269,8 +268,7 @@ static apad_screen_id do_connect(app_ctx *ctx)
         app_note(ctx, 2, "%s",
                  ctx->have_secret
                      ? "server rejected the scanned key -- rescan its QR code"
-                     : "server asked for a pairing key -- scan its QR code "
-                       "(SCAN QR / X)");
+                     : "server asked for a pairing key -- scan its QR code");
         s_auto_attempt = 0;
         return APAD_SCREEN_CONNECT;
     }
@@ -589,8 +587,12 @@ static void connect_draw_bottom(app_ctx *ctx)
     s_flash_connect = 0;
     s_flash_scan = 0;
 
+    /* A (CONNECT) and X (SCAN QR) are already on-screen buttons; B has no
+     * on-screen equivalent (there is no room for an EXIT button here without
+     * reshuffling the whole right-hand column), so it is the only one worth
+     * a hint -- item 1 of the copy declutter pass. */
     ui_textf_fit(170.0f, 196.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT,
-                 144.0f, "A: connect   X: scan   B: exit");
+                 144.0f, "B: exit");
 
     if (ctx->have_secret) {
         /* The one visible sign that a scan happened. Says a key is HELD, not

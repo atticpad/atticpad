@@ -15,6 +15,7 @@
 #ifndef ATTICPAD_SERVER_BACKEND_H
 #define ATTICPAD_SERVER_BACKEND_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -98,6 +99,72 @@ typedef struct {
                              * usermod -aG input $USER && re-login"        */
 } apad_backend_health;
 
+/*
+ * §6.15-§6.19 keyboard/mouse/media support (docs/DESIGN.md follow-on to §6.1). The
+ * five hooks below are OPTIONAL -- a backend that leaves them all NULL (every
+ * backend that predates this addition, via C99 6.7.8p21's zero-fill on a
+ * designated initializer that omits a field) is correctly reported as
+ * KBM-incapable and nothing above server/backends/ needs to know why.
+ *
+ * Same abstraction discipline as the rest of this file: `kbm_caps()` is the
+ * generic capability answer a caller asks, exactly the shape health() already
+ * uses ("what can you do", never "who are you"). A caller may not branch on
+ * which backend produced a given caps bit.
+ */
+
+/* Which device create_kbm()/destroy_kbm() is being asked about. Three
+ * separate devices, not one: a single evdev node declaring both alphabetic
+ * keys and REL_X/REL_Y/BTN_LEFT gets BOTH capabilities from libinput, and an
+ * application that grabs "the keyboard" also grabs the pointer. Separate
+ * nodes also let a media-remote-only session materialise exactly one device
+ * instead of a full keyboard/mouse pair it will never use. */
+typedef enum {
+    APAD_KBM_DEV_KEYBOARD = 0,
+    APAD_KBM_DEV_MOUSE,
+    APAD_KBM_DEV_MEDIA
+} apad_kbm_device;
+
+/* kbm_caps() bits. Positions are deliberately identical to
+ * atticpad/kbm.h's APAD_KBM_FEATURE_* / APAD_KBM_STATUS_* wire bits (0, 1, 2)
+ * so a caller can use the low three bits of this return value directly as
+ * INPUTCAPS.features -- that is a convenience of the numbering, not a
+ * requirement this header enforces; nothing here #includes kbm.h. */
+#define APAD_KBM_CAP_KEYBOARD  (1u << 0)
+#define APAD_KBM_CAP_MOUSE     (1u << 1)
+#define APAD_KBM_CAP_MEDIA     (1u << 2)
+/* This backend injects input into the host's input stream rather than
+ * creating a real device an application can enumerate -- mirrors §6.19's
+ * INPUTCAPS.status SYNTHETIC bit. uinput.c does NOT set this: a uinput
+ * device is a real evdev device to everything above it. A future
+ * SendInput-shaped Windows backend would. */
+#define APAD_KBM_CAP_SYNTHETIC (1u << 3)
+
+/*
+ * One event to inject: a key/button/control transition. `code` is
+ * interpreted per `device` and the BACKEND translates it -- the caller
+ * (server/src/kbm.c) never does:
+ *   APAD_KBM_DEV_KEYBOARD  code = a USB HID Usage Page 0x07 usage ID
+ *   APAD_KBM_DEV_MOUSE     code = APAD_MOUSEBTN_* (atticpad/kbm.h), 1..5
+ *   APAD_KBM_DEV_MEDIA     code = an APAD_MEDIA_* §6.18 index, 1..24
+ * `down` is 1 for a press, 0 for a release.
+ */
+typedef struct {
+    uint8_t  device;   /* apad_kbm_device */
+    uint16_t code;
+    uint8_t  down;
+} apad_kbm_event_out;
+
+/* Relative pointer motion + wheel detents for one MOUSE datagram (§6.16),
+ * already converted from the wire's wrapping accumulators to a per-datagram
+ * delta -- server/src/kbm.c does that arithmetic (apad_seq_diff, §6.21), so
+ * a backend never sees an accumulator, only a motion vector. Screen-space
+ * convention throughout: +X right, +Y DOWN, same as the wire (§6.16) -- a
+ * backend whose native device wants +Y up negates at the point of writing,
+ * the same pattern uinput.c already uses for the pad's own ABS_Y (§5.4). */
+typedef struct {
+    int32_t dx, dy, wheel, hwheel;
+} apad_mouse_motion;
+
 typedef struct {
     int  (*init)(void);
     int  (*create_pad)(int slot, apad_pad_type type);
@@ -144,6 +211,55 @@ typedef struct {
      * -- never on `name` or on an `if (backend == X)`.
      */
     void (*health)(apad_backend_health *out);
+
+    /*
+     * §6.15-§6.19 keyboard/mouse/media, all five OPTIONAL (NULL is legal and
+     * means "this backend has none of this" -- exactly what a designated
+     * initializer that omits them already produces for every backend
+     * predating this addition, C99 6.7.8p21). A caller checks `kbm_caps`
+     * for NULL, and each bit of its return value, before ever calling the
+     * other four; it is a caller bug to call create_kbm/kbm_events/
+     * mouse_motion/destroy_kbm for a facility kbm_caps() did not advertise.
+     */
+
+    /* APAD_KBM_CAP_* bitmask of what this backend can do. NULL means 0
+     * (nothing) without being called -- a caller must check for NULL first,
+     * the same convention `health` already established. */
+    uint32_t (*kbm_caps)(void);
+
+    /* Create one of the (up to) three per-session KBM devices, lazily, on
+     * first use -- mirrors create_pad's shape and slot numbering. Returns 0
+     * on success, nonzero on failure (no separate health-style diagnostic:
+     * a caller that wants a reason calls health() itself, same as
+     * create_pad). Calling it twice for the same (slot, dev) without an
+     * intervening destroy_kbm is a caller bug, exactly like create_pad. */
+    int      (*create_kbm)(int slot, apad_kbm_device dev);
+
+    /* Inject `n` key/button/control transitions for `slot`, all belonging
+     * to whichever device(s) `ev[].device` names -- create_kbm for that
+     * device must already have succeeded. Returns 0 on success, nonzero on
+     * failure. A backend that batches injects (uinput.c: one EV_SYN per
+     * distinct device touched, at the end of the batch) may reorder within
+     * a call but MUST preserve each event's own device's press/release
+     * order -- the caller has already reduced the datagram's ring + snapshot
+     * to the minimal ordered sequence that reaches the same held state. */
+    int      (*kbm_events)(int slot, const apad_kbm_event_out *ev, size_t n);
+
+    /* Apply one MOUSE datagram's relative motion for `slot` -- create_kbm
+     * for APAD_KBM_DEV_MOUSE must already have succeeded. Returns 0 on
+     * success, nonzero on failure. Distinct from kbm_events() because
+     * motion is continuous (an accumulator delta) where button transitions
+     * are discrete edges -- folding them into one call would force every
+     * backend to special-case "this event has no device/code/down". */
+    int      (*mouse_motion)(int slot, const apad_mouse_motion *m);
+
+    /* Destroy one of the three per-session KBM devices. A no-op if it was
+     * never created (mirrors destroy_pad's idempotence). The CALLER is
+     * responsible for releasing everything held (§6.20) with kbm_events()
+     * BEFORE calling this -- a backend must not need to invent release
+     * events of its own when a device it did not choose to remove goes
+     * away. */
+    void     (*destroy_kbm)(int slot, apad_kbm_device dev);
 } apad_backend;
 
 /* Each backend exposes exactly one such symbol, named apad_backend_<id>.

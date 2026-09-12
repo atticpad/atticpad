@@ -29,10 +29,18 @@ extern "C" {
 #endif
 
 #if defined(_WIN32)
-/* server/backends/vigem.c — ViGEmBus. See docs/DESIGN.md §2.1: ViGEmBus was
- * retired in November 2023 and is feature-frozen; this is the ONE file that
- * would need to change if it ever breaks outright. */
-extern const apad_backend apad_backend_vigem;
+/* server/backends/win32.c — the composite that forwards pads to
+ * server/backends/vigem.c (ViGEmBus) and keyboard/mouse/media to
+ * server/backends/sendinput.c (User32 SendInput), behind one apad_backend.
+ * See win32.c's own header for why a composite and not one file doing
+ * both. apad_backend_vigem and apad_backend_sendinput themselves are
+ * intentionally NOT declared here: only win32.c, inside server/backends/,
+ * is meant to know both exist -- a host links against apad_backend_win32
+ * alone. docs/DESIGN.md §2.1: ViGEmBus was retired in November 2023 and is
+ * feature-frozen; vigem.c is the ONE file that would need to change if it
+ * ever breaks outright, and win32.c is what keeps that change from also
+ * touching KBM. */
+extern const apad_backend apad_backend_win32;
 #else
 /* server/backends/uinput.c — Linux /dev/uinput. Default branch: every
  * platform this tree supports today other than Windows is Linux. */

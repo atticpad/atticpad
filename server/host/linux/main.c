@@ -375,6 +375,49 @@ int main(int argc, char **argv)
     (void)setvbuf(stdout, NULL, _IONBF, 0);
     (void)setvbuf(stderr, NULL, _IONBF, 0);
 
+    /* --help/-h and an unrecognised flag are both handled BEFORE anything
+     * else this function does -- before the port is even parsed, let alone
+     * a socket opened. This is a fix, not a new feature: this binary used
+     * to fall through an unrecognised argv entry straight into normal
+     * startup, so `atticpad-server --help` (an agent probing the binary,
+     * 2026-08-25) silently bound UDP :21100 and :5353 and ran forever
+     * instead of printing usage, because nothing here ever checked argv
+     * against a closed set of known flags -- an unmatched flag was simply
+     * never looked at again. Binding a port is not a reasonable response
+     * to a typo, so an unrecognised flag now exits non-zero instead of
+     * starting. Scans every argv entry, same as the --headless/--no-mdns
+     * loop below (which this subsumes the safety of, but not its job --
+     * see that loop's own comment for why it stays separate): a bare
+     * numeric port in argv[1] is not a flag and is left alone here for the
+     * parsing block immediately below to handle. */
+    for (i = 1; i < (size_t)argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            (void)printf(
+                "Usage: %s [port] [--headless] [--no-mdns] [--help]\n"
+                "\n"
+                "  port         UDP port to listen on (default %u)\n"
+                "  --headless   disable the local web UI (127.0.0.1 only)\n"
+                "  --no-mdns    disable the tier-1 mDNS/Bonjour responder\n"
+                "  --help, -h   print this message and exit\n"
+                "\n"
+                "Environment: ATTICPAD_UI_PORT, ATTICPAD_PROFILES_DIR, "
+                "ATTICPAD_MDNS=0\n",
+                (argc > 0) ? argv[0] : "atticpad-server",
+                (unsigned)APAD_DEFAULT_PORT);
+            return 0;
+        }
+        if (strcmp(argv[i], "--headless") != 0
+            && strcmp(argv[i], "--no-mdns") != 0
+            && (argv[i][0] == '-')) {
+            (void)fprintf(stderr,
+                          "%s: unrecognised option '%s'\n"
+                          "Try '%s --help' for usage.\n",
+                          (argc > 0) ? argv[0] : "atticpad-server", argv[i],
+                          (argc > 0) ? argv[0] : "atticpad-server");
+            return 1;
+        }
+    }
+
     if (argc > 1) {
         int p = atoi(argv[1]);
         if (p > 0 && p < 65536) {
@@ -553,13 +596,39 @@ int main(int argc, char **argv)
                           "[atticpad] no network address found -- is this "
                           "PC connected to a network?\n");
         } else {
+            /* Lead with the ONE address a phone should actually be given
+             * -- host_pick_default_addr() ranks LAN over Tailscale over
+             * virtual and, within LAN, Wi-Fi over Ethernet. This line used
+             * to print all of them in enumeration order, docker0 and every
+             * bridge included, leaving the reader to guess which to type. */
+            size_t best = host_pick_default_addr(addrs, naddr);
+            if (best == (size_t)-1) {
+                best = 0u;
+            }
             (void)fprintf(stderr,
                           "[atticpad] if your device can't find this PC "
-                          "automatically, enter this address on it:");
-            for (j = 0; j < naddr; j++) {
-                (void)fprintf(stderr, " %s(%s)", addrs[j].ip, addrs[j].iface);
+                          "automatically, enter this address on it: %s "
+                          "(%s, %s)\n",
+                          addrs[best].ip, addrs[best].iface,
+                          host_addr_medium_name(addrs[best].medium));
+            /* The rest stay available but out of the way: a machine with
+             * two real networks does sometimes need the other one. */
+            if (naddr > 1u) {
+                int shown = 0;
+                for (j = 0; j < naddr; j++) {
+                    if (j == best || addrs[j].kind == HOST_ADDR_VIRTUAL) {
+                        continue;
+                    }
+                    if (!shown) {
+                        (void)fprintf(stderr, "[atticpad] other addresses:");
+                        shown = 1;
+                    }
+                    (void)fprintf(stderr, " %s(%s)", addrs[j].ip, addrs[j].iface);
+                }
+                if (shown) {
+                    (void)fprintf(stderr, "\n");
+                }
             }
-            (void)fprintf(stderr, "\n");
         }
     }
 

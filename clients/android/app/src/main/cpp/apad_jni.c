@@ -26,6 +26,7 @@
 #include "apad_client.h"
 #include "apad_qr.h"
 #include "apad_ui_strings.h"
+#include "atticpad/kbm.h"
 #include "atticpad/version.h"
 
 /* ---- int[] layouts, mirrored in AtticPadNative.kt ---------------------- */
@@ -38,7 +39,28 @@
 #define IN_ACCEL          16   /* x, y, z                   */
 #define IN_GYRO           19   /* pitch, roll, yaw          */
 #define IN_BATTERY        22
-#define IN_LEN            23
+/* IN_LEN used to end here at 23 (§5 input state only). §6.15-6.17 KBM
+ * appended below, APPEND ONLY — see AtticPadNative.kt's matching comment.
+ * Growing IN_LEN is safe because Kotlin and native ship in one APK: the
+ * guard below is `GetArrayLength(env, in) >= IN_LEN`, not `== IN_LEN`. */
+
+/* Nonzero iff this pump carries ANY keyboard/mouse/media data — an
+ * APAD_KBM_FEATURE_* bitmask, one bit per sub-struct below, mirroring
+ * apad_client_kbm_in.have (kbm.h/apad_client.h) exactly so the two are one
+ * `&` apart. Zero short-circuits the whole KBM unpack below and this pump
+ * behaves exactly like the pre-KBM apad_client_pump(): kbm == NULL. */
+#define IN_KBM_PRESENT     23
+#define IN_KB_KEYS0        24   /* .. +7: 32-byte keys[] bitmap, 4 LE bytes/word */
+#define IN_KB_EVENTS0      32   /* .. +7: usage | flags<<8, oldest at +0 */
+#define IN_MOUSE_DX        40
+#define IN_MOUSE_DY        41
+#define IN_MOUSE_WHEEL     42
+#define IN_MOUSE_HWHEEL    43
+#define IN_MOUSE_BUTTONS   44
+#define IN_MOUSE_EVENTS0   45   /* .. +3: button | flags<<8 */
+#define IN_MEDIA_HELD      49
+#define IN_MEDIA_EVENTS0   50   /* .. +3: control | flags<<8 */
+#define IN_LEN             54
 
 #define OUT_STATE         0
 #define OUT_SESSION_ID    1
@@ -65,7 +87,14 @@
 #define OUT_AUTH_REQUIRED 19   /* §6.4 WELCOME flags bit 0             */
 #define OUT_AUTH_STATE    20   /* enum apad_client_auth                */
 #define OUT_ERROR_CODE    21   /* §6.11 ERROR code, 0 = none           */
-#define OUT_LEN           22
+/* §6.19 INPUTCAPS. Appended, never inserted — same rule as the pairing
+ * block above. This is the mode bar's gate: GONE unless
+ * inputcaps_serial != 0 && features != 0 (see AtticPadNative.kt). */
+#define OUT_KBM_FEATURES   22  /* APAD_KBM_FEATURE_*: server ACCEPTS   */
+#define OUT_KBM_STATUS     23  /* APAD_KBM_STATUS_*: exists RIGHT NOW  */
+#define OUT_KBM_SERIAL     24  /* inputcaps_serial, 0 = none received  */
+#define OUT_KBM_MEDIA_MASK 25  /* which §6.18 controls the server drives */
+#define OUT_LEN            26
 
 static apad_client *handle_of(jlong h)
 {
@@ -260,11 +289,68 @@ Java_net_atticpad_AtticPadNative_clientConnect(JNIEnv *env, jclass cls, jlong h,
     return rc;
 }
 
+/*
+ * §6.15-6.17 unpack, shared by clientPump below. `raw` is IN_LEN wide and
+ * already validated by the caller. Fills `kbm` and returns it, or returns
+ * NULL when IN_KBM_PRESENT is zero — the short-circuit that makes an
+ * ordinary pad-only pump (still the common case: PAD mode, or a server
+ * with no INPUTCAPS at all) skip this whole block, exactly mirroring
+ * apad_client_pump()'s own kbm == NULL.
+ */
+static apad_client_kbm_in *unpack_kbm(const jint *raw, apad_client_kbm_in *kbm)
+{
+    int i;
+
+    if (raw[IN_KBM_PRESENT] == 0) {
+        return NULL;
+    }
+    memset(kbm, 0, sizeof *kbm);
+    kbm->have = (uint8_t)(raw[IN_KBM_PRESENT] & 0xFF);
+
+    /* keys[32], 4 little-endian bytes per word — the same packing
+     * AtticPadNative.KbmSnapshot uses to build it, so this is just an
+     * unpack, never a byte-order decision made on this side. */
+    for (i = 0; i < 8; i++) {
+        jint w = raw[IN_KB_KEYS0 + i];
+        kbm->keyboard.keys[i * 4 + 0] = (uint8_t)(w & 0xFF);
+        kbm->keyboard.keys[i * 4 + 1] = (uint8_t)((w >> 8) & 0xFF);
+        kbm->keyboard.keys[i * 4 + 2] = (uint8_t)((w >> 16) & 0xFF);
+        kbm->keyboard.keys[i * 4 + 3] = (uint8_t)((w >> 24) & 0xFF);
+    }
+    for (i = 0; i < (int)APAD_KEYBOARD_RING_DEPTH; i++) {
+        jint e = raw[IN_KB_EVENTS0 + i];
+        kbm->keyboard.events[i].usage = (uint8_t)(e & 0xFF);
+        kbm->keyboard.events[i].flags = (uint8_t)((e >> 8) & 0xFF);
+    }
+
+    kbm->mouse.dx_accum     = (uint16_t)raw[IN_MOUSE_DX];
+    kbm->mouse.dy_accum     = (uint16_t)raw[IN_MOUSE_DY];
+    kbm->mouse.wheel_accum  = (uint16_t)raw[IN_MOUSE_WHEEL];
+    kbm->mouse.hwheel_accum = (uint16_t)raw[IN_MOUSE_HWHEEL];
+    kbm->mouse.buttons      = (uint16_t)raw[IN_MOUSE_BUTTONS];
+    for (i = 0; i < (int)APAD_MOUSE_RING_DEPTH; i++) {
+        jint e = raw[IN_MOUSE_EVENTS0 + i];
+        kbm->mouse.events[i].button = (uint8_t)(e & 0xFF);
+        kbm->mouse.events[i].flags  = (uint8_t)((e >> 8) & 0xFF);
+    }
+
+    kbm->media.held = (uint32_t)raw[IN_MEDIA_HELD];
+    for (i = 0; i < (int)APAD_MEDIA_RING_DEPTH; i++) {
+        jint e = raw[IN_MEDIA_EVENTS0 + i];
+        kbm->media.events[i].control = (uint8_t)(e & 0xFF);
+        kbm->media.events[i].flags   = (uint8_t)((e >> 8) & 0xFF);
+    }
+
+    return kbm;
+}
+
 JNIEXPORT jint JNICALL
 Java_net_atticpad_AtticPadNative_clientPump(JNIEnv *env, jclass cls, jlong h,
                                             jintArray in, jint max_wait_ms)
 {
     apad_input_state st;
+    apad_client_kbm_in kbm;
+    apad_client_kbm_in *kbmp = NULL;
     jint raw[IN_LEN];
     int i;
 
@@ -307,9 +393,14 @@ Java_net_atticpad_AtticPadNative_clientPump(JNIEnv *env, jclass cls, jlong h,
         }
         st.battery = (uint8_t)((raw[IN_BATTERY] < 0 || raw[IN_BATTERY] > 255)
                                ? APAD_BATTERY_UNKNOWN : raw[IN_BATTERY]);
+
+        kbmp = unpack_kbm(raw, &kbm);
     }
 
-    return (jint)apad_client_pump(handle_of(h), &st, (int)max_wait_ms);
+    /* apad_client_pump_ex(..., NULL, ...) IS apad_client_pump() (see
+     * apad_client.h) — one call handles both, kbmp being NULL exactly when
+     * this pump carries no KBM data at all. */
+    return (jint)apad_client_pump_ex(handle_of(h), &st, kbmp, (int)max_wait_ms);
 }
 
 JNIEXPORT void JNICALL
@@ -348,6 +439,13 @@ Java_net_atticpad_AtticPadNative_clientStats(JNIEnv *env, jclass cls,
     v[OUT_AUTH_REQUIRED] = s.auth_required;
     v[OUT_AUTH_STATE]    = s.auth_state;
     v[OUT_ERROR_CODE]    = s.error_code;
+    /* §6.19: zero serial means none ever received — the mode bar's gate
+     * (AtticPadNative.kt) reads this exactly the way it reads every other
+     * zero-means-nothing-yet field in this block. */
+    v[OUT_KBM_FEATURES]   = (jint)s.inputcaps.features;
+    v[OUT_KBM_STATUS]     = (jint)s.inputcaps.status;
+    v[OUT_KBM_SERIAL]     = (jint)s.inputcaps_serial;
+    v[OUT_KBM_MEDIA_MASK] = (jint)s.inputcaps.media_mask;
 
     (*env)->SetIntArrayRegion(env, out, 0, OUT_LEN, v);
 }

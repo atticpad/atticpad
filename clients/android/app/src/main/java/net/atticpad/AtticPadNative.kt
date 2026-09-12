@@ -32,7 +32,32 @@ object AtticPadNative {
     const val IN_ACCEL = 16         // x, y, z          — milli-g
     const val IN_GYRO = 19          // pitch, roll, yaw — deci-deg/s
     const val IN_BATTERY = 22
-    const val IN_LEN = 23
+    // IN_LEN used to end here at 23 (§5 input state only). §6.15-6.17
+    // KBM APPENDED below, APPEND ONLY — mirrored in cpp/apad_jni.c, same
+    // comment. Growing IN_LEN is safe: apad_jni.c's guard is
+    // `GetArrayLength(env, in) >= IN_LEN`, never `==`.
+
+    /** Nonzero iff this pump carries keyboard/mouse/media data — an
+     *  KBM_FEATURE_* bitmask, one bit per sub-block below. Zero makes
+     *  native skip the whole KBM unpack, exactly like a pre-KBM client. */
+    const val IN_KBM_PRESENT = 23
+    const val IN_KB_KEYS0 = 24      // .. +7: 32-byte keys[] bitmap, 4 LE bytes/word
+    const val IN_KB_EVENTS0 = 32    // .. +7: usage | (flags shl 8), oldest at +0
+    const val IN_MOUSE_DX = 40
+    const val IN_MOUSE_DY = 41
+    const val IN_MOUSE_WHEEL = 42
+    const val IN_MOUSE_HWHEEL = 43
+    const val IN_MOUSE_BUTTONS = 44
+    const val IN_MOUSE_EVENTS0 = 45 // .. +3: button | (flags shl 8)
+    const val IN_MEDIA_HELD = 49
+    const val IN_MEDIA_EVENTS0 = 50 // .. +3: control | (flags shl 8)
+    const val IN_LEN = 54
+
+    // §6.20 ring depths (core/include/atticpad/kbm.h) — how many events
+    // IN_KB_EVENTS0/IN_MOUSE_EVENTS0/IN_MEDIA_EVENTS0 each hold.
+    const val KB_RING_DEPTH = 8
+    const val MOUSE_RING_DEPTH = 4
+    const val MEDIA_RING_DEPTH = 4
 
     // ---- stats layout, mirrored in cpp/apad_jni.c ------------------------
     const val OUT_STATE = 0
@@ -69,7 +94,26 @@ object AtticPadNative {
      *  because STATUS codes are 0..2 and ERROR codes 1..7 — one field cannot
      *  tell "warning" from "no free pad slot". */
     const val OUT_ERROR_CODE = 21
-    const val OUT_LEN = 22
+
+    // §6.19 INPUTCAPS. APPEND ONLY, same rule as the pairing block above —
+    // hand-kept in step with cpp/apad_jni.c. This is the mode bar's gate:
+    // GONE unless OUT_KBM_SERIAL != 0 && OUT_KBM_FEATURES != 0.
+    /** APAD_KBM_FEATURE_*: which of §6.15-6.17 the server ACCEPTS. */
+    const val OUT_KBM_FEATURES = 22
+
+    /** APAD_KBM_STATUS_*: what exists RIGHT NOW (a device may not be
+     *  created yet even when a feature is accepted). */
+    const val OUT_KBM_STATUS = 23
+
+    /** `inputcaps_serial` — 0 means no INPUTCAPS has ever been accepted;
+     *  see [OUT_KBM_FEATURES]'s doc for what that means for the UI. */
+    const val OUT_KBM_SERIAL = 24
+
+    /** Which §6.18 media controls the server will actually drive — greys
+     *  out the rest of [MediaRemoteView] rather than sending a control the
+     *  server has already said it will not act on. */
+    const val OUT_KBM_MEDIA_MASK = 25
+    const val OUT_LEN = 26
 
     // enum apad_client_state
     const val STATE_IDLE = 0
@@ -156,6 +200,134 @@ object AtticPadNative {
     const val AXIS_RY = 3           // +Y UP
     const val AXIS_L2 = 4           // 0..32767
     const val AXIS_R2 = 5
+
+    // ---- §6.15-6.19 keyboard / mouse / media vocabulary -------------------
+    // Mirrors core/include/atticpad/kbm.h. THE WIRE FORMAT LIVES IN C, NOT
+    // HERE — these are names for numbers libapad already assigns; nothing
+    // in this file encodes or decodes a packet.
+
+    /** kbm.h `flags` bit 0 — DOWN. Bits 1-7 reserved, scrubbed on decode. */
+    const val KBM_EVENT_DOWN = 1 shl 0
+
+    // §6.19 features: which of §6.15-6.17 the server ACCEPTS.
+    const val KBM_FEATURE_KEYBOARD = 1 shl 0
+    const val KBM_FEATURE_MOUSE = 1 shl 1
+    const val KBM_FEATURE_MEDIA = 1 shl 2
+
+    // §6.19 status: what exists RIGHT NOW.
+    const val KBM_STATUS_KEYBOARD_READY = 1 shl 0
+    const val KBM_STATUS_MOUSE_READY = 1 shl 1
+    const val KBM_STATUS_MEDIA_READY = 1 shl 2
+    const val KBM_STATUS_SYNTHETIC = 1 shl 3
+
+    // §6.16 mouse buttons — bit position AND event index, 1-based (0 = no event).
+    const val MOUSEBTN_LEFT = 1
+    const val MOUSEBTN_RIGHT = 2
+    const val MOUSEBTN_MIDDLE = 3
+    const val MOUSEBTN_BACK = 4
+    const val MOUSEBTN_FORWARD = 5
+
+    /** Bit for button index b (1..5) in `MOUSE.buttons` — APAD_MOUSEBTN_BIT(). */
+    fun mouseBtnBit(b: Int): Int = 1 shl (b - 1)
+
+    // §6.18 media control index — AtticPad's own dense vocabulary, not a HID
+    // usage. 1..24 assigned, up to 32 addressable by `held`/`media_mask`.
+    const val MEDIA_PLAY_PAUSE = 1
+    const val MEDIA_PLAY = 2
+    const val MEDIA_PAUSE = 3
+    const val MEDIA_STOP = 4
+    const val MEDIA_NEXT_TRACK = 5
+    const val MEDIA_PREV_TRACK = 6
+    const val MEDIA_FAST_FORWARD = 7
+    const val MEDIA_REWIND = 8
+    const val MEDIA_VOLUME_UP = 9
+    const val MEDIA_VOLUME_DOWN = 10
+    const val MEDIA_MUTE = 11
+    const val MEDIA_EJECT = 12
+    const val MEDIA_RECORD = 13
+    const val MEDIA_BRIGHTNESS_UP = 14
+    const val MEDIA_BRIGHTNESS_DOWN = 15
+    const val MEDIA_LAUNCH_BROWSER = 16
+    const val MEDIA_LAUNCH_MAIL = 17
+    const val MEDIA_LAUNCH_CALC = 18
+    const val MEDIA_SEARCH = 19
+    const val MEDIA_NAV_HOME = 20
+    const val MEDIA_NAV_BACK = 21
+    const val MEDIA_NAV_FORWARD = 22
+    const val MEDIA_REFRESH = 23
+    const val MEDIA_BOOKMARKS = 24
+
+    /** Bit for control index c (1..32) in `MEDIA.held` / `INPUTCAPS.media_mask`. */
+    fun mediaBit(c: Int): Int = 1 shl (c - 1)
+
+    // §6.15 HID usages, USB HID Usage Page 0x07 — the curated subset kbm.h
+    // names. Anything absent is still sendable (the wire carries the raw
+    // number); these are just the keys an on-screen keyboard needs a name for.
+    const val HID_KEY_A = 0x04; const val HID_KEY_B = 0x05; const val HID_KEY_C = 0x06
+    const val HID_KEY_D = 0x07; const val HID_KEY_E = 0x08; const val HID_KEY_F = 0x09
+    const val HID_KEY_G = 0x0A; const val HID_KEY_H = 0x0B; const val HID_KEY_I = 0x0C
+    const val HID_KEY_J = 0x0D; const val HID_KEY_K = 0x0E; const val HID_KEY_L = 0x0F
+    const val HID_KEY_M = 0x10; const val HID_KEY_N = 0x11; const val HID_KEY_O = 0x12
+    const val HID_KEY_P = 0x13; const val HID_KEY_Q = 0x14; const val HID_KEY_R = 0x15
+    const val HID_KEY_S = 0x16; const val HID_KEY_T = 0x17; const val HID_KEY_U = 0x18
+    const val HID_KEY_V = 0x19; const val HID_KEY_W = 0x1A; const val HID_KEY_X = 0x1B
+    const val HID_KEY_Y = 0x1C; const val HID_KEY_Z = 0x1D
+
+    // Digit row: 1..9 contiguous from 0x1E, ZERO IS 0x27 (after 9).
+    const val HID_KEY_1 = 0x1E; const val HID_KEY_2 = 0x1F; const val HID_KEY_3 = 0x20
+    const val HID_KEY_4 = 0x21; const val HID_KEY_5 = 0x22; const val HID_KEY_6 = 0x23
+    const val HID_KEY_7 = 0x24; const val HID_KEY_8 = 0x25; const val HID_KEY_9 = 0x26
+    const val HID_KEY_0 = 0x27
+
+    const val HID_KEY_ENTER = 0x28
+    const val HID_KEY_ESCAPE = 0x29
+    const val HID_KEY_BACKSPACE = 0x2A
+    const val HID_KEY_TAB = 0x2B
+    const val HID_KEY_SPACE = 0x2C
+
+    // Punctuation, mirrored from kbm.h's APAD_HID_KEY_* additions for the
+    // KEYBOARD mode redesign — a full grid needs these to type a path or a
+    // URL, not just letters/digits.
+    const val HID_KEY_MINUS = 0x2D        // - _
+    const val HID_KEY_EQUAL = 0x2E        // = +
+    const val HID_KEY_LEFTBRACE = 0x2F    // [ {
+    const val HID_KEY_RIGHTBRACE = 0x30   // ] }
+    const val HID_KEY_BACKSLASH = 0x31    // \ |
+    const val HID_KEY_SEMICOLON = 0x33    // ; :
+    const val HID_KEY_APOSTROPHE = 0x34   // ' "
+    const val HID_KEY_GRAVE = 0x35        // ` ~
+    const val HID_KEY_COMMA = 0x36        // , <
+    const val HID_KEY_PERIOD = 0x37       // . >
+    const val HID_KEY_SLASH = 0x38        // / ?
+
+    const val HID_KEY_F1 = 0x3A; const val HID_KEY_F2 = 0x3B; const val HID_KEY_F3 = 0x3C
+    const val HID_KEY_F4 = 0x3D; const val HID_KEY_F5 = 0x3E; const val HID_KEY_F6 = 0x3F
+    const val HID_KEY_F7 = 0x40; const val HID_KEY_F8 = 0x41; const val HID_KEY_F9 = 0x42
+    const val HID_KEY_F10 = 0x43; const val HID_KEY_F11 = 0x44; const val HID_KEY_F12 = 0x45
+
+    const val HID_KEY_DELETE = 0x4C  // Delete Forward, not Backspace
+    const val HID_KEY_RIGHT = 0x4F
+    const val HID_KEY_LEFT = 0x50
+    const val HID_KEY_DOWN = 0x51
+    const val HID_KEY_UP = 0x52
+
+    // The eight modifiers ride INSIDE keys[] like any other usage (§6.15).
+    const val HID_KEY_LEFTCTRL = 0xE0
+    const val HID_KEY_LEFTSHIFT = 0xE1
+    const val HID_KEY_LEFTALT = 0xE2
+    const val HID_KEY_LEFTGUI = 0xE3   // Windows / Command / Meta
+    const val HID_KEY_RIGHTCTRL = 0xE4
+    const val HID_KEY_RIGHTSHIFT = 0xE5
+    const val HID_KEY_RIGHTALT = 0xE6
+    const val HID_KEY_RIGHTGUI = 0xE7
+
+    /** Usage Page 0x07's "Application" key (a.k.a. the context-menu key) —
+     *  not in kbm.h's curated set (it lists letters/digits/F-keys/editing
+     *  keys, not this), but the wire carries any usage byte (kbm.h's own
+     *  doc: "codec.c passes through any usage it is given"). MediaRemoteView
+     *  is this app's only user of it, for the reference remote's Menu
+     *  button (task brief: "Menu... HID usage 0x65"). */
+    const val HID_KEY_MENU = 0x65
 
     /** libapad's product version string, e.g. "0.3.0-dev". */
     external fun version(): String

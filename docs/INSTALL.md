@@ -15,6 +15,7 @@ never talks to the internet.
 - [Linux server](#linux-server)
 - [Windows server](#windows-server)
 - [Nintendo 3DS client](#nintendo-3ds-client)
+- [PlayStation Portable client](#playstation-portable-client)
 - [Android client](#android-client)
 - [Pairing](#pairing)
 - [Troubleshooting](#troubleshooting)
@@ -75,8 +76,15 @@ If the module isn't loaded at all, `sudo modprobe uinput` (add `uinput` to
 The Windows server creates XInput gamepads through the **ViGEmBus** driver,
 which is *not* bundled — install it before running AtticPad, or no pad appears.
 
-Get the latest signed installer from the [ViGEmBus
-releases](https://github.com/nefarius/ViGEmBus/releases) and run it.
+The quickest way is winget, which pulls the same signed installer:
+
+```
+winget install ViGEm.ViGEmBus
+```
+
+Otherwise download it from the [ViGEmBus
+releases](https://github.com/nefarius/ViGEmBus/releases) and run it. Either way
+you may need to reboot before Windows loads the driver.
 
 > **Heads up:** ViGEmBus was archived by its author in November 2023 and
 > receives no further updates. It still works on Windows 11, and it is the only
@@ -99,6 +107,18 @@ first if you'd rather check than trust.
 Allow it through the Windows Firewall on **private networks** when prompted —
 without that, clients cannot reach it.
 
+### Keyboard, mouse and media mode
+
+A client can also act as a keyboard, mouse and media remote (`docs/KBM.md`).
+On Windows this is built on `SendInput`, which is **user-mode input
+injection, not a driver** — if a client's keyboard or mouse input does not
+reach a particular application, check first whether that application (a game,
+its anti-cheat, or a UAC-elevated window) is running with higher privileges
+than the AtticPad server itself: Windows will not let a non-elevated process
+inject into an elevated one. See `docs/KBM.md` for the full list of
+limitations, including which media transport keys this backend cannot send at
+all.
+
 ---
 
 ## Nintendo 3DS client
@@ -111,15 +131,38 @@ without that, clients cannot reach it.
 - Tested on a **New 3DS**. The Old 3DS is expected to work but has never been
   run — if you try it, a report either way is welcome.
 
-### Install the CIA (recommended)
+### Install with a QR code (no SD card needed)
+
+If the console is already on your Wi-Fi, FBI can fetch the `.cia` itself:
+
+1. Open **FBI** → *Remote Install* → **Scan QR Code**.
+2. Point it at this:
+
+<img src="img/fbi-install-qr.png" alt="QR code encoding https://github.com/atticpad/atticpad/releases/latest/download/atticpad-3ds.cia" width="220">
+
+3. Confirm the install, then launch **AtticPad** from the HOME menu.
+
+The code encodes
+`https://github.com/atticpad/atticpad/releases/latest/download/atticpad-3ds.cia`,
+which always points at the newest release — so the same code keeps working
+after an update, and you can re-scan it to upgrade in place.
+
+Two honest caveats. The URL is an HTTPS redirect to the actual asset, and
+whether a given console's HTTP client follows it and negotiates GitHub's TLS
+depends on the console and its firmware; if the download fails, use the SD-card
+route below, which always works. And this path has been verified by decoding
+the image with the same QR decoder the client itself uses — not yet by a person
+scanning it from FBI, so a report either way is welcome.
+
+### Install the CIA from the SD card
 
 1. Copy `atticpad-3ds.cia` to your SD card.
 2. Open **FBI** → *SD* → browse to the file → **Install and delete** (or
    *Install*, to keep the copy).
 3. Launch **AtticPad** from the HOME menu.
 
-FBI can also install over the network: *Remote Install → Receive URLs over the
-network*, then send the URL of the `.cia` from your PC.
+FBI can also take a URL you type or send yourself: *Remote Install → Receive
+URLs over the network*.
 
 ### Or run the 3DSX
 
@@ -129,9 +172,111 @@ the HOME menu.
 
 ### Self-test
 
-Hold **L + R + Start** while the app launches to run the on-device conformance
-self-test. It runs before any networking, so it stays reachable even when
+Hold **L + R + Start** while the app launches — or use the visible
+`SELECT: self-test` prompt, which is the way in if a shoulder button is worn
+out — to run the on-device conformance self-test. It runs before any networking, so it stays reachable even when
 everything else is broken. There is also a visible `SELECT: self-test` prompt.
+
+---
+
+## PlayStation Portable client
+
+**Tested on real hardware** — [`SUPPORT-TIERS.md`](SUPPORT-TIERS.md) lists
+what is verified. Reports from hardware are welcome.
+
+### Requirements
+
+- A PSP running custom firmware, or PPSSPP.
+- A saved Wi-Fi connection, set up under *Settings → Network Settings →
+  Infrastructure Mode*, and the WLAN switch on the side of the console on.
+  The app tries the connection it used last time, then the first saved one;
+  if that network refuses it, **L / R** move through the others and **X**
+  tries again. A PSP joins WEP
+  and WPA networks over 802.11b, so a router set to WPA2-only or to
+  802.11n-only will refuse it.
+- **WLAN Power Save off**, under *Settings → Power Save Settings*. With it on
+  the radio dozes between beacons, and a controller stream pays for that in
+  lost packets and dropped sessions. The app shows a warning while it is on.
+
+### Install
+
+1. Download `atticpad-psp.zip`.
+2. Extract it onto the root of the memory stick. It contains
+   `PSP/GAME/ATTICPAD/EBOOT.PBP`, so the layout lands where the console expects.
+3. Launch **AtticPad** from the XMB under *Game → Memory Stick*.
+
+### Using it
+
+The app has no touchscreen and no camera, so both the server address and the
+pairing PIN are typed on an on-screen keypad:
+
+- **D-pad** moves the cursor, **X** types, **O** deletes
+- **□**, **L** or **R** switch between the address and port fields
+- **△** connects (and submits the PIN)
+- **SELECT** runs the self-test; **HOME** quits
+- In a session, hold **L + R + SELECT** until the bar fills to disconnect
+
+If the server is paired, it will ask for the six digits the PC is showing.
+
+### Self-test
+
+Hold **L + R + START** as it launches, or press **SELECT** at any time. It runs
+the same conformance suite every other client ships and needs no network, so it
+still works on a console that cannot reach a server.
+
+---
+
+## Nintendo DS and DSi client
+
+**Tested on real hardware**, in both DS and DSi modes —
+[`SUPPORT-TIERS.md`](SUPPORT-TIERS.md) lists what is verified. Reports from
+hardware are welcome.
+
+### Requirements
+
+- A DS, DS Lite, DSi or 3DS that can run homebrew `.nds` files: a flashcart,
+  or a DSi/3DS with a homebrew launcher.
+- A network the console can join. In DS mode that means an **open or WEP**
+  network — the radio speaks nothing else — and [`SETUP-DS.md`](SETUP-DS.md)
+  explains why and how to run one. In DSi mode WPA2 works too.
+- Or melonDS, which needs no network setup at all.
+
+### Install
+
+1. Download `atticpad-nds.nds`.
+2. Copy it anywhere on the SD card and launch it from your homebrew menu.
+
+### Using it
+
+1. **Network.** The client first tries the network you joined last time
+   (saved on the SD card, key included), then the connections saved in the
+   console's Nintendo Wi-Fi Connection settings. If neither works, it scans
+   and lists what it sees: tap an open network to join it; a WEP network,
+   or a WPA2 one in DSi mode, asks for its key on the touch keyboard.
+   Networks the console cannot join in DS mode are shown dimmed and say so.
+2. **Server.** It looks for a server on the network, then shows the keyboard
+   so you can type the PC's address (the server prints it, and it is the
+   first line of the server's web page) and the port, 21100 unless you
+   changed it. Tap CONNECT. The last address that worked is remembered on
+   the SD card when one is present.
+3. **Pairing.** If the server is paired, it asks for the six digits the PC is
+   showing; type them on the keyboard. Deriving the key takes about a second
+   on this console.
+4. **Playing.** The top screen shows the round trip and which buttons are
+   pressed; the bottom screen is the touch surface, which the server maps to
+   the left stick by default. The strip along its top switches modes:
+   **PAD**, **MOUSE** (drag to move, tap to click, the right edge scrolls),
+   **KEYS** (a keyboard; tap SHIFT or CTRL once to arm it for the next key,
+   or hold L/R), and **MEDIA** (transport and volume). Modes appear only when
+   the server supports them.
+5. **DISCONNECT** at the bottom of the touch screen ends the session, after a
+   confirmation.
+
+### Self-test
+
+Hold **L + R + START** as it launches, or tap **SELF-TEST** at any time. It runs
+the same conformance suite every other client ships and needs no network. On a
+DS it takes over a minute — the bar on screen shows it is working.
 
 ---
 
@@ -162,13 +307,18 @@ one you are on before you start it. See the security note in the
 
 Pairing also is not remembered between sessions in this release: it
 authenticates the connection being made while the window is open, rather than
-building a list of trusted devices.
+building a list of trusted devices. [PAIRING.md](PAIRING.md) explains the
+mechanism with the code paths.
 
 1. On the server, open the web UI and choose **Pair**. It shows a **6-digit
    PIN** and a **QR code**, both valid for 120 seconds.
 2. On the client, pick your server from the discovered list — or enter its IP
    address by hand, which always works.
-3. Either scan the QR code with the client's camera, or type the PIN.
+3. Scan the QR code with the client's camera, or type the PIN.
+
+   **On the 3DS, scanning is the only option** — the client has no keypad for
+   entering a PIN, so use **SCAN QR** (or press **X**) on the connect screen.
+   The PIN exists for clients that cannot scan.
 
 Five wrong attempts invalidate the PIN and generate a new one.
 
