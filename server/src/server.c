@@ -30,6 +30,7 @@
 #include "atticpad/atticpad.h"
 #include "apadserver.h"
 #include "backend.h"
+#include "kbm.h"
 #include "mapping.h"
 #include "pairing.h"
 #include "serverlog.h"
@@ -86,7 +87,66 @@ typedef struct {
     uint8_t       auth_verified;    /* >=1 inbound tag has verified         */
     uint8_t       auth_charged;     /* already cost the window one attempt  */
     uint32_t      pair_generation;  /* which secret its key came from       */
+
+    /* §6.15-§6.19 keyboard/mouse/media (server/src/kbm.c owns the diffing;
+     * this is only the per-session state kbm.c needs between calls, plus
+     * this file's own INPUTCAPS delivery bookkeeping -- same split as
+     * map_state above vs mapping.c). Reset only at HELLO-new-slot time,
+     * exactly like map_state (see handle_hello) -- NOT in free_session(),
+     * which instead releases everything held and destroys any device
+     * (apad_kbm_release_all), the same distinction free_session() already
+     * draws for map_state vs the touchmap_* delivery fields below. */
+    apad_kbm_state kbm_state;
+
+    /* INPUTCAPS (§6.19) delivery, mirroring touchmap_dirty/repeats/next_ms
+     * above -- three copies ~250ms apart, re-armed on a features/status
+     * change, plus a >=5s slow repeat while the session is open. Reset in
+     * free_session() like every other delivery-bookkeeping field. */
+    uint8_t       inputcaps_can_arm;    /* WELCOME's ACK landed (or, on an
+                                         * AUTH_REQUIRED session, the first
+                                         * verifying tag arrived) -- §6.19
+                                         * Delivery */
+    uint8_t       inputcaps_dirty;      /* (re)arm the 3-copy burst         */
+    uint8_t       inputcaps_repeats;    /* burst copies left to send        */
+    uint32_t      inputcaps_next_ms;    /* when the next burst copy is due  */
+    uint32_t      inputcaps_last_sent_ms; /* for the >=5s slow repeat; 0 =
+                                           * never sent                     */
+    /* §6.20: log a lazy KBM device-creation failure ONCE per facility per
+     * session, not once per rejected datagram -- mirrors this file's other
+     * "log once" comments (e.g. the S9 send-failure path) rather than
+     * flooding the log at up to 10 Hz. */
+    uint8_t       kbm_kb_create_failed_logged;
+    uint8_t       kbm_mo_create_failed_logged;
+    uint8_t       kbm_me_create_failed_logged;
+
+    /* §6.20 step 2: event-ring overflow (gap since last accepted datagram
+     * of this type exceeded the ring depth) MUST be made observable -- see
+     * apad_kbm_apply_keyboard()'s doc comment (kbm.h) for why the
+     * unconditional reconcile does NOT already cover this: it restores
+     * held state, not a dropped press/release edge. kbm.c hands back a
+     * per-call lost-event count; this is where it accumulates, one triple
+     * per facility, for the rate-limited log line in kbm_log_overflow()
+     * below and for apad_server_kbm_status()'s lifetime counters. Reset in
+     * free_session() like the other delivery/diagnostic bookkeeping above
+     * -- NOT in apad_kbm_state (a fresh session should not inherit a prior
+     * occupant's overflow history). */
+    uint32_t      kbm_kb_overflow_total;   /* lifetime lost events, this session */
+    uint32_t      kbm_kb_overflow_pending; /* lost since the last log line  */
+    uint32_t      kbm_kb_overflow_last_log_ms;
+    uint8_t       kbm_kb_overflow_logged;  /* has this facility logged at least once */
+    uint32_t      kbm_mo_overflow_total;
+    uint32_t      kbm_mo_overflow_pending;
+    uint32_t      kbm_mo_overflow_last_log_ms;
+    uint8_t       kbm_mo_overflow_logged;
+    uint32_t      kbm_me_overflow_total;
+    uint32_t      kbm_me_overflow_pending;
+    uint32_t      kbm_me_overflow_last_log_ms;
+    uint8_t       kbm_me_overflow_logged;
 } server_session;
+
+/* §6.20 step 2's overflow log period -- see kbm_log_overflow() below for why
+ * this exists at all rather than a plain apad_logf() at the call site. */
+#define KBM_OVERFLOW_LOG_PERIOD_MS 5000u
 
 #define ERROR_RATE_LIMIT_PER_SEC 10u
 #define ERROR_RATE_WINDOW_MS      1000u
@@ -151,6 +211,21 @@ struct apad_server {
 
     server_session      sessions[APAD_MAX_SESSIONS];
     error_rate_slot     error_rate[ERROR_RATE_TRACK_SLOTS];
+
+    /* §6.19 INPUTCAPS.features/media_mask this server advertises, and the
+     * STATUS_SYNTHETIC bit it will set on every session -- computed ONCE
+     * from backend->kbm_caps() at create time (a backend's capabilities do
+     * not change while it is running), not per session. features == 0 means
+     * this backend supports none of §6.15-§6.17 (kbm_caps is NULL, or
+     * returned nothing in the low three bits) and INPUTCAPS is never sent
+     * at all -- exactly what a v1-shaped server that predates this feature
+     * always did. media_mask is a policy choice, not a backend query (the
+     * five backend.h hooks have no per-control-index introspection): every
+     * §6.18 assigned index whenever the MEDIA feature bit is set, none
+     * otherwise. */
+    uint32_t            kbm_features;
+    uint32_t            kbm_media_mask;
+    uint8_t             kbm_synthetic;
 
     /* §7 tier 2: this host's own subnet-directed broadcast addresses,
      * copied from cfg.broadcast_addrs at create time. Only .ip is ever
@@ -244,11 +319,19 @@ static void free_session(apad_server *s, int slot)
         s->backend->destroy_pad(slot);
         s->sessions[slot].pad_created = 0;
     }
+    /* §6.20: release everything held across all three KBM facilities and
+     * destroy any device this session created, BEFORE anything else here
+     * clears bookkeeping about it -- idempotent, so this is safe even for a
+     * session that never sent a KEYBOARD/MOUSE/MEDIA datagram at all. Does
+     * NOT reset kbm_state itself (map_state above gets the same treatment,
+     * for the same reason): a fresh apad_kbm_state_init() happens only when
+     * a slot is handed to a genuinely new occupant, in handle_hello. */
+    apad_kbm_release_all(s->backend, slot, &s->sessions[slot].kbm_state);
     apad_session_close(&s->sessions[slot].core, APAD_CLOSE_LOCAL);   /* wipes the §10 key */
     s->sessions[slot].in_use          = 0;
     s->sessions[slot].retx_len        = 0;
     s->sessions[slot].auth_required   = 0;
-    /* v2 EXPERIMENT: cleared with the rest of the session, so a device that
+    /* §6.12: cleared with the rest of the session, so a device that
      * reconnects into this slot is sent its layout again rather than
      * inheriting "already delivered" from whoever held the slot before. */
     s->sessions[slot].touchmap_dirty  = 0;
@@ -258,6 +341,30 @@ static void free_session(apad_server *s, int slot)
     s->sessions[slot].auth_verified   = 0;
     s->sessions[slot].auth_charged    = 0;
     s->sessions[slot].pair_generation = 0;
+    /* §6.19 INPUTCAPS delivery bookkeeping -- same reasoning as the
+     * touchmap_* resets just above: a slot reused by a later HELLO must not
+     * inherit "already armed" or "3 copies in flight" from whoever held it
+     * before. */
+    s->sessions[slot].inputcaps_can_arm      = 0;
+    s->sessions[slot].inputcaps_dirty        = 0;
+    s->sessions[slot].inputcaps_repeats      = 0;
+    s->sessions[slot].inputcaps_next_ms      = 0;
+    s->sessions[slot].inputcaps_last_sent_ms = 0;
+    s->sessions[slot].kbm_kb_create_failed_logged = 0;
+    s->sessions[slot].kbm_mo_create_failed_logged = 0;
+    s->sessions[slot].kbm_me_create_failed_logged = 0;
+    s->sessions[slot].kbm_kb_overflow_total       = 0;
+    s->sessions[slot].kbm_kb_overflow_pending     = 0;
+    s->sessions[slot].kbm_kb_overflow_last_log_ms = 0;
+    s->sessions[slot].kbm_kb_overflow_logged      = 0;
+    s->sessions[slot].kbm_mo_overflow_total       = 0;
+    s->sessions[slot].kbm_mo_overflow_pending     = 0;
+    s->sessions[slot].kbm_mo_overflow_last_log_ms = 0;
+    s->sessions[slot].kbm_mo_overflow_logged      = 0;
+    s->sessions[slot].kbm_me_overflow_total       = 0;
+    s->sessions[slot].kbm_me_overflow_pending     = 0;
+    s->sessions[slot].kbm_me_overflow_last_log_ms = 0;
+    s->sessions[slot].kbm_me_overflow_logged      = 0;
     s->sessions[slot].last_ping_sent_ms = 0;
     s->sessions[slot].ping_origin_ms    = 0;
     s->sessions[slot].ping_pending      = 0;
@@ -628,9 +735,12 @@ static void send_ack(apad_server *s, uint32_t now, server_session *ss,
     apad_session_on_sent(&ss->core, &hdr, now);   /* unconditional: see emit() */
 }
 
-/* v2 EXPERIMENT (experiment/touchmap-v2): defined below, called from the
+/* §6.12: defined below, called from the
  * HELLO handler above it. */
 static void send_touchmap(apad_server *s, server_session *ss, uint32_t now);
+
+/* §6.19: defined below, called from apad_server_tick(). */
+static void send_inputcaps(apad_server *s, server_session *ss, uint32_t now);
 
 /* Send one payload through a session's tx sequence/flags, cache it for
  * retransmit if the session FSM armed it (§9). */
@@ -860,6 +970,12 @@ static void handle_hello(apad_server *s, const apad_addr *from,
                       h.device_name, sizeof h.device_name);
         s->sessions[slot].profile = apad_profiles_match(s->sessions[slot].device_name);
         apad_mapping_state_init(&s->sessions[slot].map_state);
+        /* §6.15-§6.19: fresh per-session KBM state for a genuinely new
+         * occupant of this slot, same moment and same reasoning as
+         * map_state just above -- a brand-new session must not inherit a
+         * stale held-key shadow or device-created flag from whoever
+         * occupied this slot before. */
+        apad_kbm_state_init(&s->sessions[slot].kbm_state);
     }
     ss = &s->sessions[slot];
     ss->caps = h.caps & (uint32_t)APAD_CAP_VALID_MASK;
@@ -1002,13 +1118,17 @@ static void handle_hello(apad_server *s, const apad_addr *from,
     }
 }
 
-/* v2 EXPERIMENT (branch experiment/touchmap-v2): tell the client what its
+/* §6.12: tell the client what its
  * touchscreen currently maps to, so it can draw the real layout.
  *
- * Sent once, right after WELCOME, because that is the moment the session's
- * profile is decided and the client is about to render its first frame. A
- * profile can be hot-reloaded later (apad_profiles_load), which this does NOT
- * yet chase -- see the branch's open questions.
+ * Not sent right after WELCOME: it is marked dirty here, at the moment the
+ * session's profile is decided, but actually goes out once the ACK that
+ * discharges WELCOME arrives (see server.c:1276). §9 allows only one
+ * reliable message in flight, and arming a second one this early would
+ * cancel WELCOME's own retransmit -- trading a reliably-delivered layout for
+ * an unreliable handshake. A profile can also be hot-reloaded later
+ * (apad_server_reload_profiles), which re-marks touchmap_dirty on the
+ * affected sessions, so a reload is chased the same way a connect is.
  *
  * Silent when the profile has no touch mapping: a client that hears nothing
  * keeps whatever it drew before, and "no message" is the honest encoding of
@@ -1098,6 +1218,296 @@ static void handle_input_state(apad_server *s, const apad_addr *from,
 
     apad_mapping_apply(&st, ss->caps, ss->profile, &ss->map_state, &pad);
     (void)s->backend->update_pad(slot, &pad);
+}
+
+/* §6.19 INPUTCAPS: tell the client which of §6.15-§6.17 this server will
+ * accept right now. Called only from apad_server_tick()'s delivery loop
+ * (below), never directly from a handler -- same "mark, don't send" split
+ * send_touchmap() already uses, so a burst of status changes collapses into
+ * whatever the next tick actually sends rather than one datagram per change.
+ */
+static void send_inputcaps(apad_server *s, server_session *ss, uint32_t now)
+{
+    apad_inputcaps ic;
+    uint8_t        payload[APAD_LEN_INPUTCAPS];
+    int            n;
+
+    memset(&ic, 0, sizeof ic);
+    ic.features      = s->kbm_features;
+    ic.media_mask     = s->kbm_media_mask;
+    ic.mouse_rate_hz  = 0u;   /* §6.19: 0 = use the session's input_rate_hz */
+
+    if (apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_KEYBOARD)) {
+        ic.status |= APAD_KBM_STATUS_KEYBOARD_READY;
+    }
+    if (apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_MOUSE)) {
+        ic.status |= APAD_KBM_STATUS_MOUSE_READY;
+    }
+    if (apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_MEDIA)) {
+        ic.status |= APAD_KBM_STATUS_MEDIA_READY;
+    }
+    if (s->kbm_synthetic) {
+        ic.status |= APAD_KBM_STATUS_SYNTHETIC;
+    }
+
+    n = apad_encode_inputcaps(payload, sizeof payload, &ic);
+    if (n < 0) {
+        return;
+    }
+    (void)send_via_session(s, ss, (uint8_t)APAD_MSG_INPUTCAPS, payload,
+                           (uint16_t)n, now);
+}
+
+/*
+ * S6.20 step 2: "make the overflow observable" -- but NOT once per
+ * datagram. A client generating this condition is either dropping bursts
+ * of its own datagrams or producing events faster than it ships them
+ * (S6.20 allows up to ~125 Hz for KEYBOARD alone), so a receiver that
+ * echoed every single occurrence straight to the log would just move S8's
+ * amplification hazard from the wire onto the log stream -- the naive
+ * "apad_logf() right at the overflow check in kbm.c" version is wrong for
+ * exactly that reason, quite apart from kbm.c having no log sink at all
+ * (see kbm.h). Instead: log the FIRST overflow this session has ever seen
+ * for this facility immediately (an operator watching the log should not
+ * wait 5s to learn a client just started losing keystrokes), then fold
+ * every subsequent occurrence into a running count and only emit another
+ * line once KBM_OVERFLOW_LOG_PERIOD_MS has passed since the last one --
+ * same "burst once, then throttle" shape touchmap/INPUTCAPS delivery
+ * already use elsewhere in this file, applied to a log line instead of a
+ * wire send.
+ *
+ * Log strings below are ASCII-only on purpose: this line reaches the
+ * Windows console via the same on_log sink server/host/windows/main.c
+ * prints unmodified (see agent memory windows_buffering_and_ascii_sweep --
+ * a prior sweep of every server/src source file found and fixed non-ASCII
+ * bytes in this exact file's other apad_logf() calls for the same reason).
+ */
+static void kbm_log_overflow(const apad_server *s, server_session *ss,
+                             int slot, const char *facility,
+                             uint32_t *total, uint32_t *pending,
+                             uint32_t *last_log_ms, uint8_t *logged,
+                             unsigned lost, uint32_t now)
+{
+    if (lost == 0u) {
+        return;
+    }
+    *total   += lost;
+    *pending += lost;
+    if (*logged
+        && apad_time_since(now, *last_log_ms) < KBM_OVERFLOW_LOG_PERIOD_MS) {
+        return;   /* within the period: folded into the next periodic line */
+    }
+    apad_logf(&s->log, APAD_LOG_WARN,
+              "device \"%s\" (slot %d): %s event-ring overflow -- %u "
+              "event(s) lost since last report (gap exceeded the ring "
+              "depth); the reconcile restores held state but cannot "
+              "recover a press/release edge that happened inside the gap "
+              "-- check for a lossy link or a client sending faster than "
+              "it should (%u lost total this session)",
+              ss->device_name, slot, facility, *pending, *total);
+    *pending     = 0u;
+    *last_log_ms = now;
+    *logged      = 1u;
+}
+
+/*
+ * §6.15-§6.19 dispatch shape, mirrored three times: find the session, check
+ * the peer address, run it through §6.20's per-type staleness window
+ * (apad_session_on_recv already calls apad_session_accept_kbm for these
+ * three types -- a stale/reordered datagram comes back APAD_ERR_STALE here
+ * and is dropped, session left alone, exactly like a stale INPUT_STATE
+ * above), then check the facility was actually advertised, lazily create
+ * the backend device, and hand the decoded payload to kbm.c.
+ *
+ * "Not advertised -> discard silently, create nothing" (kbm_features bit
+ * clear, or the backend has no kbm_caps at all) is deliberately NOT an
+ * ERROR: §6.19 says a client MUST NOT send these without an INPUTCAPS
+ * advertising them, so a client that does anyway is either predating
+ * INPUTCAPS entirely (impossible -- it would not know to send KEYBOARD/
+ * MOUSE/MEDIA in the first place) or non-conforming, and at up to 10+ Hz
+ * per facility an ERROR reply here would be the same self-inflicted
+ * amplifier §8 already forbids for unknown-session INPUT_STATE.
+ *
+ * Lazy device-creation failure is likewise silent (logged once per facility
+ * per session -- see the server_session field comment) rather than an
+ * ERROR, for the same volume reason. Success re-arms INPUTCAPS so the
+ * client sees the matching *_READY bit on the very next delivery.
+ */
+static void handle_keyboard(apad_server *s, const apad_addr *from,
+                            const apad_packet *pkt, uint32_t now)
+{
+    int slot;
+    server_session *ss;
+    apad_keyboard kb;
+    int rc;
+
+    slot = find_session_by_id(s, pkt->header.session_id);
+    if (slot < 0) {
+        return;   /* unknown session: silently drop, same as INPUT_STATE */
+    }
+    ss = &s->sessions[slot];
+    if (!apad_addr_equal(&ss->peer, from)) {
+        return;
+    }
+
+    rc = apad_session_on_recv(&ss->core, pkt, now);
+    if (rc != APAD_OK) {
+        return;   /* §6.20: stale KEYBOARD discarded, session stays alive */
+    }
+
+    if ((s->kbm_features & (uint32_t)APAD_KBM_FEATURE_KEYBOARD) == 0u) {
+        return;
+    }
+
+    if (!apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_KEYBOARD)) {
+        if (s->backend->create_kbm == NULL
+            || s->backend->create_kbm(slot, APAD_KBM_DEV_KEYBOARD) != 0) {
+            if (!ss->kbm_kb_create_failed_logged) {
+                apad_logf(&s->log, APAD_LOG_WARN,
+                          "device \"%s\" (slot %d): keyboard device creation "
+                          "failed; KEYBOARD dropped until it can be retried",
+                          ss->device_name, slot);
+                ss->kbm_kb_create_failed_logged = 1u;
+            }
+            return;
+        }
+        apad_kbm_note_created(&ss->kbm_state, APAD_KBM_DEV_KEYBOARD);
+        ss->kbm_kb_create_failed_logged = 0u;
+        ss->inputcaps_dirty = 1u;   /* re-arm: client should see KEYBOARD_READY */
+    }
+
+    rc = apad_decode_keyboard(pkt->payload, pkt->payload_len, &kb);
+    if (rc < 0) {
+        return;
+    }
+    {
+        unsigned lost = 0u;
+        apad_kbm_apply_keyboard(s->backend, slot, &ss->kbm_state, &kb, now,
+                                &lost);
+        kbm_log_overflow(s, ss, slot, "keyboard",
+                         &ss->kbm_kb_overflow_total,
+                         &ss->kbm_kb_overflow_pending,
+                         &ss->kbm_kb_overflow_last_log_ms,
+                         &ss->kbm_kb_overflow_logged, lost, now);
+    }
+}
+
+static void handle_mouse(apad_server *s, const apad_addr *from,
+                         const apad_packet *pkt, uint32_t now)
+{
+    int slot;
+    server_session *ss;
+    apad_mouse mo;
+    int rc;
+
+    slot = find_session_by_id(s, pkt->header.session_id);
+    if (slot < 0) {
+        return;
+    }
+    ss = &s->sessions[slot];
+    if (!apad_addr_equal(&ss->peer, from)) {
+        return;
+    }
+
+    rc = apad_session_on_recv(&ss->core, pkt, now);
+    if (rc != APAD_OK) {
+        return;
+    }
+
+    if ((s->kbm_features & (uint32_t)APAD_KBM_FEATURE_MOUSE) == 0u) {
+        return;
+    }
+
+    if (!apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_MOUSE)) {
+        if (s->backend->create_kbm == NULL
+            || s->backend->create_kbm(slot, APAD_KBM_DEV_MOUSE) != 0) {
+            if (!ss->kbm_mo_create_failed_logged) {
+                apad_logf(&s->log, APAD_LOG_WARN,
+                          "device \"%s\" (slot %d): mouse device creation "
+                          "failed; MOUSE dropped until it can be retried",
+                          ss->device_name, slot);
+                ss->kbm_mo_create_failed_logged = 1u;
+            }
+            return;
+        }
+        apad_kbm_note_created(&ss->kbm_state, APAD_KBM_DEV_MOUSE);
+        ss->kbm_mo_create_failed_logged = 0u;
+        ss->inputcaps_dirty = 1u;
+    }
+
+    rc = apad_decode_mouse(pkt->payload, pkt->payload_len, &mo);
+    if (rc < 0) {
+        return;
+    }
+    {
+        unsigned lost = 0u;
+        apad_kbm_apply_mouse(s->backend, slot, &ss->kbm_state, &mo, now,
+                             &lost);
+        kbm_log_overflow(s, ss, slot, "mouse",
+                         &ss->kbm_mo_overflow_total,
+                         &ss->kbm_mo_overflow_pending,
+                         &ss->kbm_mo_overflow_last_log_ms,
+                         &ss->kbm_mo_overflow_logged, lost, now);
+    }
+}
+
+static void handle_media(apad_server *s, const apad_addr *from,
+                         const apad_packet *pkt, uint32_t now)
+{
+    int slot;
+    server_session *ss;
+    apad_media me;
+    int rc;
+
+    slot = find_session_by_id(s, pkt->header.session_id);
+    if (slot < 0) {
+        return;
+    }
+    ss = &s->sessions[slot];
+    if (!apad_addr_equal(&ss->peer, from)) {
+        return;
+    }
+
+    rc = apad_session_on_recv(&ss->core, pkt, now);
+    if (rc != APAD_OK) {
+        return;
+    }
+
+    if ((s->kbm_features & (uint32_t)APAD_KBM_FEATURE_MEDIA) == 0u) {
+        return;
+    }
+
+    if (!apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_MEDIA)) {
+        if (s->backend->create_kbm == NULL
+            || s->backend->create_kbm(slot, APAD_KBM_DEV_MEDIA) != 0) {
+            if (!ss->kbm_me_create_failed_logged) {
+                apad_logf(&s->log, APAD_LOG_WARN,
+                          "device \"%s\" (slot %d): media device creation "
+                          "failed; MEDIA dropped until it can be retried",
+                          ss->device_name, slot);
+                ss->kbm_me_create_failed_logged = 1u;
+            }
+            return;
+        }
+        apad_kbm_note_created(&ss->kbm_state, APAD_KBM_DEV_MEDIA);
+        ss->kbm_me_create_failed_logged = 0u;
+        ss->inputcaps_dirty = 1u;
+    }
+
+    rc = apad_decode_media(pkt->payload, pkt->payload_len, &me);
+    if (rc < 0) {
+        return;
+    }
+    {
+        unsigned lost = 0u;
+        apad_kbm_apply_media(s->backend, slot, &ss->kbm_state, &me, now,
+                             &lost);
+        kbm_log_overflow(s, ss, slot, "media",
+                         &ss->kbm_me_overflow_total,
+                         &ss->kbm_me_overflow_pending,
+                         &ss->kbm_me_overflow_last_log_ms,
+                         &ss->kbm_me_overflow_logged, lost, now);
+    }
 }
 
 static void handle_ping(apad_server *s, const apad_addr *from,
@@ -1273,7 +1683,7 @@ static void handle_ack(apad_server *s, const apad_addr *from,
     }
     (void)apad_session_on_recv(&ss->core, pkt, now);   /* clears retx_armed */
 
-    /* v2 EXPERIMENT: the layout goes out HERE, not straight after WELCOME.
+    /* §6.12: the layout goes out HERE, not straight after WELCOME.
      * §9 allows one reliable message in flight and a second arm REPLACES the
      * first, so arming a reliable TOUCHMAP a line after WELCOME would cancel
      * WELCOME's own retransmit -- trading a reliably-delivered layout for an
@@ -1282,6 +1692,23 @@ static void handle_ack(apad_server *s, const apad_addr *from,
     /* Mark, do not send: apad_server_tick() owns delivery and repetition,
      * so connect and profile-edit take the identical path. */
     ss->touchmap_dirty = 1u;
+
+    /* §6.19 Delivery: "Not before the ACK that discharges WELCOME." On an
+     * AUTH_REQUIRED session this ACK is deliberately unauthenticated
+     * (check_auth()'s one exemption) and arming here would be exactly the
+     * bug §6.19 spends a paragraph on -- three copies landing entirely
+     * inside the ~1s PBKDF2 window before the client holds a key, each
+     * failing §3.1 check 7. So: arm here ONLY when this session was never
+     * issued an AUTH_REQUIRED WELCOME; the auth_required case arms instead
+     * in check_auth(), on the first datagram whose tag verifies. Skipped
+     * entirely when this backend has nothing to advertise (kbm_features ==
+     * 0), so a backend with no KEYBOARD/MOUSE/MEDIA support never spends a
+     * single INPUTCAPS datagram -- identical to today's behaviour before
+     * this feature existed. */
+    if (!ss->auth_required && s->kbm_features != 0u) {
+        ss->inputcaps_can_arm = 1u;
+        ss->inputcaps_dirty   = 1u;
+    }
 }
 
 /* Tear down every session that was issued an AUTH_REQUIRED WELCOME and has
@@ -1380,6 +1807,16 @@ static int check_auth(apad_server *s, uint32_t now, const apad_addr *from,
                                         s->user, &s->log);
             }
             return 0;
+        }
+        /* §6.19 Delivery: "On an authenticated session, not before the
+         * first datagram whose tag verifies." This IS that datagram --
+         * apad_packet_verify() just succeeded, above -- and ss->auth_verified
+         * is about to flip from 0 to 1 for the first time this session, so
+         * this fires exactly once. Skipped when this backend advertises
+         * nothing, same reasoning as the non-auth arm site in handle_ack(). */
+        if (!ss->auth_verified && s->kbm_features != 0u) {
+            ss->inputcaps_can_arm = 1u;
+            ss->inputcaps_dirty   = 1u;
         }
         ss->auth_verified = 1u;
         return 1;
@@ -1494,6 +1931,15 @@ int apad_server_on_datagram(apad_server *s, uint32_t now_ms,
     case APAD_MSG_INPUT_STATE:
         handle_input_state(s, from, &pkt, now);
         break;
+    case APAD_MSG_KEYBOARD:
+        handle_keyboard(s, from, &pkt, now);
+        break;
+    case APAD_MSG_MOUSE:
+        handle_mouse(s, from, &pkt, now);
+        break;
+    case APAD_MSG_MEDIA:
+        handle_media(s, from, &pkt, now);
+        break;
     case APAD_MSG_PING:
         handle_ping(s, from, &pkt, now);
         break;
@@ -1556,7 +2002,7 @@ int apad_server_tick(apad_server *s, uint32_t now_ms)
         return APAD_ERR_ARG;
     }
 
-    /* v2 EXPERIMENT: deliver the touch layout.
+    /* §6.12: deliver the touch layout.
      *
      * TOUCHMAP is deliberately UNRELIABLE -- §9 delivery would let a client
      * that does not ACK it be torn down, which is exactly what happened to a
@@ -1583,6 +2029,43 @@ int apad_server_tick(apad_server *s, uint32_t now_ms)
             ss->touchmap_repeats--;
             ss->touchmap_next_ms = now_ms + 250u;
             send_touchmap(s, ss, now_ms);
+        }
+
+        /* §6.20 watchdog: every live session, every tick, regardless of
+         * whether this backend or this session has anything held -- a no-op
+         * when there is nothing to release. Independent of the INPUTCAPS
+         * delivery below: a held key must be released on its own 1000 ms
+         * schedule whether or not this server is currently advertising the
+         * facility at all. */
+        apad_kbm_watchdog(s->backend, i, &ss->kbm_state, now_ms);
+
+        /* §6.19 INPUTCAPS delivery. Same "mark, don't send" shape as
+         * TOUCHMAP just above, plus the slow repeat §6.19 requires ("at
+         * least one copy every 5 seconds while the session is open") so an
+         * arming bug or a burst that swallows all three copies costs a few
+         * seconds, not the whole facility. Gated on inputcaps_can_arm,
+         * which handle_ack()/check_auth() only ever set once this server
+         * has evidence the client can verify a tag (or needs none) -- see
+         * their comments for §6.19 Delivery's exact rule. */
+        if (ss->inputcaps_can_arm) {
+            if (ss->inputcaps_dirty) {
+                ss->inputcaps_dirty   = 0;
+                ss->inputcaps_repeats = 3u;
+                ss->inputcaps_next_ms = now_ms;
+            }
+            if (ss->inputcaps_repeats > 0u &&
+                apad_time_after(now_ms, ss->inputcaps_next_ms)) {
+                ss->inputcaps_repeats--;
+                ss->inputcaps_next_ms = now_ms + 250u;
+                send_inputcaps(s, ss, now_ms);
+                ss->inputcaps_last_sent_ms = now_ms;
+            } else if (ss->inputcaps_repeats == 0u
+                       && (ss->inputcaps_last_sent_ms == 0u
+                           || apad_time_since(now_ms, ss->inputcaps_last_sent_ms)
+                              >= 5000u)) {
+                send_inputcaps(s, ss, now_ms);
+                ss->inputcaps_last_sent_ms = now_ms;
+            }
         }
     }
 
@@ -1736,6 +2219,25 @@ apad_server *apad_server_create(const apad_server_cfg *cfg,
         free(s);
         return NULL;
     }
+
+    /* §6.19: what this server will ever advertise in INPUTCAPS. See the
+     * struct apad_server comment on these three fields -- computed once
+     * here, never per session. APAD_KBM_CAP_KEYBOARD/MOUSE/MEDIA
+     * (backend.h) share bit positions 0/1/2 with APAD_KBM_FEATURE_KEYBOARD/
+     * MOUSE/MEDIA (atticpad/kbm.h) by design, so the low three bits of
+     * kbm_caps()'s return value ARE apad_inputcaps::features directly. */
+    {
+        uint32_t caps = (backend->kbm_caps != NULL) ? backend->kbm_caps() : 0u;
+
+        s->kbm_features = caps & (uint32_t)(APAD_KBM_CAP_KEYBOARD
+                                            | APAD_KBM_CAP_MOUSE
+                                            | APAD_KBM_CAP_MEDIA);
+        s->kbm_synthetic = (uint8_t)((caps & (uint32_t)APAD_KBM_CAP_SYNTHETIC)
+                                     ? 1u : 0u);
+        s->kbm_media_mask = (s->kbm_features & (uint32_t)APAD_KBM_CAP_MEDIA)
+            ? (uint32_t)((1u << APAD_MEDIA_ASSIGNED_MAX) - 1u)
+            : 0u;
+    }
     return s;
 }
 
@@ -1878,7 +2380,7 @@ int apad_server_set_profile(apad_server *s, uint8_t slot,
     }
     s->sessions[slot].profile = p;
     s->sessions[slot].profile_pinned = 1u;
-    /* v2 EXPERIMENT: switching profiles changes the touch layout just as much
+    /* §6.12: switching profiles changes the touch layout just as much
      * as editing one does, so the client has to be told. Missing this was the
      * third of three ways to change a mapping -- connect and save both
      * resent, and only picking an existing profile silently did not. */
@@ -1912,6 +2414,41 @@ int apad_server_last_input(const apad_server *s, uint8_t slot,
     if (out_frame != NULL) {
         *out_frame = ss->input_frame;
     }
+    return APAD_OK;
+}
+
+int apad_server_kbm_status(const apad_server *s, uint8_t slot,
+                           apad_kbm_status *out)
+{
+    const server_session *ss;
+
+    if (s == NULL || out == NULL || !slot_valid((int)slot)) {
+        return APAD_ERR_ARG;
+    }
+    ss = &s->sessions[slot];
+    if (!ss->in_use) {
+        return APAD_ERR_ARG;
+    }
+
+    memset(out, 0, sizeof *out);
+    out->features   = s->kbm_features;
+    out->media_mask = s->kbm_media_mask;
+
+    if (apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_KEYBOARD)) {
+        out->status |= APAD_KBM_STATUS_KEYBOARD_READY;
+    }
+    if (apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_MOUSE)) {
+        out->status |= APAD_KBM_STATUS_MOUSE_READY;
+    }
+    if (apad_kbm_is_created(&ss->kbm_state, APAD_KBM_DEV_MEDIA)) {
+        out->status |= APAD_KBM_STATUS_MEDIA_READY;
+    }
+    if (s->kbm_synthetic) {
+        out->status |= APAD_KBM_STATUS_SYNTHETIC;
+    }
+    out->keyboard_overflow_events = ss->kbm_kb_overflow_total;
+    out->mouse_overflow_events    = ss->kbm_mo_overflow_total;
+    out->media_overflow_events    = ss->kbm_me_overflow_total;
     return APAD_OK;
 }
 
@@ -1988,7 +2525,7 @@ int apad_server_reload_profiles(apad_server *s, const apad_profile_source *sourc
                       i, had_profile[i] ? old_names[i] : "(none)", newp->name);
         }
         ss->profile = newp;
-        /* v2 EXPERIMENT: the layout this client is drawing is now stale --
+        /* §6.12: the layout this client is drawing is now stale --
          * a region moved, a profile was edited, or it matched a different
          * file entirely. Marked rather than sent, because this function has
          * no clock: apadserver.h is explicit that the host supplies now_ms,

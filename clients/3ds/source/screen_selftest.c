@@ -119,12 +119,10 @@ static void selftest_draw_top(app_ctx *ctx)
               done ? (pass ? ui_c_good() : ui_c_bad()) : ui_c_warn());
 
     if (!done) {
-        ui_textf_fit(UI_TOP_W * 0.5f, 96.0f, UI_S_HEAD, ui_c_text(),
-                     UI_ALIGN_CENTER, W, "%s",
-                     apad_ui_msg(APAD_MSG_SELFTEST_RUNNING));
-        ui_textf_fit(UI_TOP_W * 0.5f, 124.0f, UI_S_SMALL, ui_c_dim(),
-                     UI_ALIGN_CENTER, W, "%s",
-                     apad_ui_msg(APAD_MSG_SELFTEST_SUBTITLE));
+        /* The header's right-hand word already says "Checking..."; the
+         * bottom screen's "working ..." (selftest_draw_bottom) is the other
+         * kept running-state cue -- copy declutter pass, item 4. Nothing
+         * else duplicates that state here any more. */
         return;
     }
 
@@ -151,52 +149,35 @@ static void selftest_draw_top(app_ctx *ctx)
         ui_textf_fit(UI_TOP_W * 0.5f, 170.0f, UI_S_SMALL, ui_c_bad(),
                      UI_ALIGN_CENTER, W, "last failure:  %s", s_last_fail);
     }
-
-    ui_textf_fit(UI_TOP_W * 0.5f, 206.0f, UI_S_TINY, ui_c_dim(),
-                 UI_ALIGN_CENTER, W,
-                 "the golden packets are authored independently of the codec");
-    ui_textf_fit(UI_TOP_W * 0.5f, 220.0f, UI_S_TINY, ui_c_dim(),
-                 UI_ALIGN_CENTER, W,
-                 "-- both agreeing is the signal, and it needs no build flag");
+    /* "the golden packets are authored independently of the codec -- both
+     * agreeing is the signal, and it needs no build flag" removed (copy
+     * declutter pass, item 4): explanatory prose, not an action, error or
+     * permission. */
 }
 
 static void selftest_draw_bottom(app_ctx *ctx)
 {
     const float W = UI_BOT_W - 20.0f;
     int done = (s_sub == ST_DONE);
-    const char *dest = app_screen_name(ctx->selftest_return);
 
     ui_header(UI_BOT_W, "self-test", NULL, ui_c_dim());
 
-    ui_textf_fit(10.0f, 34.0f, UI_S_SMALL, ui_c_dim(), UI_ALIGN_LEFT, W, "%s",
-                 apad_ui_msg(APAD_MSG_SELFTEST_SUBTITLE));
-    ui_textf_fit(10.0f, 52.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT, W,
-                 "Checks how AtticPad encodes and decodes its network");
-    ui_textf_fit(10.0f, 65.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT, W,
-                 "messages, handles sequence numbers, and verifies its");
-    ui_textf_fit(10.0f, 78.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT, W,
-                 "built-in test data.");
-
-    ui_textf_fit(10.0f, 104.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT, W,
-                 "It exercises nothing platform-specific: a PASS here");
-    ui_textf_fit(10.0f, 117.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT, W,
-                 "says the shared AtticPad code is intact on this console,");
-    ui_textf_fit(10.0f, 130.0f, UI_S_TINY, ui_c_dim(), UI_ALIGN_LEFT, W,
-                 "not that the network, gyro or touchscreen work.");
-
-    /* Relocated from the connect screen's top half (2026-08-12, "hide the
-     * debug surface" pass): per-console calibration/engineering data, at
-     * home on the one screen that already keeps ABI/version info. */
-    ui_textf_fit(10.0f, 148.0f, UI_S_TINY, ui_c_border(), UI_ALIGN_LEFT, W,
+    /* The three-line "what this checks" and "what it doesn't prove"
+     * paragraphs, and the SELFTEST_SUBTITLE line above them, are removed
+     * (copy declutter pass, item 4) -- explanatory prose, not an action,
+     * error or permission. Relocated from the connect screen's top half
+     * (2026-08-12, "hide the debug surface" pass) and KEPT: per-console
+     * calibration/engineering data, at home on the one screen that already
+     * carries ABI/version info. */
+    ui_textf_fit(10.0f, 34.0f, UI_S_TINY, ui_c_border(), UI_ALIGN_LEFT, W,
                  "soc %u B (0x1000-aligned)   gyro coeff %.6f   apt hook %s",
                  ctx->soc_bufsize, (double)ctx->gyro_coeff,
                  app_apt_hook_name(ctx->last_apt_hook));
 
     if (done) {
+        /* "any button, or touch -- back to the %s screen" removed (copy
+         * declutter pass, item 1): CONTINUE is right there. */
         ui_button(&kContinueBtn, "CONTINUE", 0, 1);
-        ui_textf_fit(UI_BOT_W * 0.5f, 224.0f, UI_S_TINY, ui_c_dim(),
-                     UI_ALIGN_CENTER, W,
-                     "any button, or touch -- back to the %s screen", dest);
     } else {
         ui_textf_fit(UI_BOT_W * 0.5f, 200.0f, UI_S_BODY, ui_c_warn(),
                      UI_ALIGN_CENTER, W, "working ...");

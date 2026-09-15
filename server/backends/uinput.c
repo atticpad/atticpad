@@ -23,8 +23,13 @@
 
 #include <linux/uinput.h>
 
+#include "atticpad/kbm.h"        /* APAD_MOUSEBTN_* */
 #include "atticpad/protocol.h"   /* APAD_MAX_SESSIONS, APAD_HAT_* */
 #include "backend.h"
+#include "uinput_keymap.h"       /* apad_hid_to_evdev[], apad_media_to_evdev[] --
+                                   * itself #includes atticpad/kbm.h for the
+                                   * APAD_MEDIA_* vocabulary, so this include
+                                   * is order-independent with the one above */
 
 #define UINPUT_PATH   "/dev/uinput"
 #define MAX_PADS      ((int)APAD_MAX_SESSIONS)
@@ -62,6 +67,31 @@ typedef struct {
 } uinput_pad;
 
 static uinput_pad g_pads[MAX_PADS];
+
+/* §6.15-§6.19: up to three MORE nodes per slot, created lazily and
+ * independently of the pad and of each other. One node cannot sensibly be
+ * both keyboard and mouse -- a device declaring alphabetic keys AND
+ * REL_X/REL_Y/BTN_LEFT gets both capabilities from libinput, and an
+ * application that grabs "the keyboard" also grabs the pointer. Separate
+ * nodes also let a media-remote-only session materialise exactly one
+ * device. Identity is BUS_USB with an AtticPad vendor/product -- NOT a
+ * masquerade the way the pad's 045e:028e is: the pad only borrows Microsoft's
+ * IDs because SDL's gamecontrollerdb.txt keys mappings on that GUID, and no
+ * equivalent database exists for keyboards a client would need to match. */
+typedef struct {
+    int kb_fd, mo_fd, me_fd;   /* -1 when that device does not exist */
+} uinput_kbm;
+
+static uinput_kbm g_kbm[MAX_PADS];
+
+#define VID_ATTICPAD          0x1d50   /* openmoko's shared open-source USB
+                                        * VID -- the convention hobby/virtual
+                                        * devices with no vendor of their own
+                                        * use; picked for that convention, not
+                                        * for any affiliation with OpenMoko */
+#define PID_ATTICPAD_KEYBOARD 0xa1b0
+#define PID_ATTICPAD_MOUSE    0xa1b1
+#define PID_ATTICPAD_MEDIA    0xa1b2
 
 /* Xbox-convention button bit -> Linux BTN_* code. Table, not a switch, so
  * update_pad's hot loop is a straight scan. */
@@ -111,6 +141,10 @@ static int backend_init(void)
         g_pads[i].last_buttons = 0u;
         g_pads[i].last_hat_x = 0;
         g_pads[i].last_hat_y = 0;
+
+        g_kbm[i].kb_fd = -1;
+        g_kbm[i].mo_fd = -1;
+        g_kbm[i].me_fd = -1;
     }
     return 0;
 }
@@ -294,13 +328,335 @@ static void destroy_pad(int slot)
     }
 }
 
+/* Forward-declared: destroy_kbm() is defined further down (with the rest of
+ * the §6.15-§6.19 hooks), but backend_shutdown() above create_pad's own
+ * teardown needs to reach it too, mirroring destroy_pad's loop. */
+static void destroy_kbm(int slot, apad_kbm_device dev);
+
 static void backend_shutdown(void)
 {
     int i;
 
     for (i = 0; i < MAX_PADS; i++) {
         destroy_pad(i);
+        destroy_kbm(i, APAD_KBM_DEV_KEYBOARD);
+        destroy_kbm(i, APAD_KBM_DEV_MOUSE);
+        destroy_kbm(i, APAD_KBM_DEV_MEDIA);
     }
+}
+
+/* ======================================================================== */
+/* §6.15-§6.19 keyboard/mouse/media (backend.h's five optional hooks)       */
+/* ======================================================================== */
+
+static int *kbm_fd_ptr(int slot, apad_kbm_device dev)
+{
+    if (!slot_ok(slot)) {
+        return NULL;
+    }
+    switch (dev) {
+    case APAD_KBM_DEV_KEYBOARD: return &g_kbm[slot].kb_fd;
+    case APAD_KBM_DEV_MOUSE:    return &g_kbm[slot].mo_fd;
+    case APAD_KBM_DEV_MEDIA:    return &g_kbm[slot].me_fd;
+    default:                    return NULL;
+    }
+}
+
+/* APAD_MOUSEBTN_* (atticpad/kbm.h, 1..5) -> Linux BTN_* code. §6.16's own
+ * BACK/FORWARD names map to BTN_SIDE/BTN_EXTRA -- the pair real 5-button
+ * mice actually report for "back"/"forward" (X11/libinput's own convention,
+ * buttons 8/9), even though evdev separately defines BTN_BACK/BTN_FORWARD
+ * codes that see far less real-hardware use. */
+static uint16_t mouse_btn_to_evdev(uint16_t btn)
+{
+    switch (btn) {
+    case APAD_MOUSEBTN_LEFT:    return BTN_LEFT;
+    case APAD_MOUSEBTN_RIGHT:   return BTN_RIGHT;
+    case APAD_MOUSEBTN_MIDDLE:  return BTN_MIDDLE;
+    case APAD_MOUSEBTN_BACK:    return BTN_SIDE;
+    case APAD_MOUSEBTN_FORWARD: return BTN_EXTRA;
+    default:                    return 0u;
+    }
+}
+
+static uint32_t kbm_caps(void)
+{
+    /* NOT APAD_KBM_CAP_SYNTHETIC: every device this backend creates is a
+     * real evdev node (UI_DEV_CREATE), indistinguishable from physical
+     * hardware to anything above it -- see the file header. */
+    return (uint32_t)(APAD_KBM_CAP_KEYBOARD | APAD_KBM_CAP_MOUSE
+                      | APAD_KBM_CAP_MEDIA);
+}
+
+static int create_kbm(int slot, apad_kbm_device dev)
+{
+    int  *fdp = kbm_fd_ptr(slot, dev);
+    int   fd;
+    int   i;
+    struct uinput_setup us;
+    char  name[UINPUT_MAX_NAME_SIZE];
+
+    if (fdp == NULL || *fdp >= 0) {
+        return -1;   /* bad (slot, dev), or already created */
+    }
+
+    fd = open(UINPUT_PATH, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return -1;
+    }
+
+    memset(&us, 0, sizeof us);
+    us.id.bustype = BUS_USB;
+    us.id.vendor  = VID_ATTICPAD;
+
+    switch (dev) {
+    case APAD_KBM_DEV_KEYBOARD:
+        if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0) {
+            goto fail;
+        }
+        /* Every evdev target apad_hid_to_evdev[] names, once each -- 0 (no
+         * mapping) and KEY_UNKNOWN (240, the kernel's own "this HID usage
+         * has no evdev equivalent" sentinel, see uinput_keymap.h) both mean
+         * "not a real key", so neither is declared. Re-declaring the same
+         * code for a second HID usage that targets it (uinput_keymap.h's
+         * documented duplicates) is harmless -- UI_SET_KEYBIT is
+         * idempotent. */
+        for (i = 0; i < (int)(sizeof apad_hid_to_evdev
+                              / sizeof apad_hid_to_evdev[0]); i++) {
+            uint16_t code = apad_hid_to_evdev[i];
+            if (code == 0u || code == (uint16_t)KEY_UNKNOWN) {
+                continue;
+            }
+            if (ioctl(fd, UI_SET_KEYBIT, code) < 0) {
+                goto fail;
+            }
+        }
+        if (ioctl(fd, UI_SET_EVBIT, EV_MSC) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_MSCBIT, MSC_SCAN) < 0) {
+            goto fail;
+        }
+        /* EV_REP: kernel autorepeat. Real USB HID keyboards (usbhid)
+         * declare this too -- see this file's own build/verification notes
+         * for the evtest + text-editor evidence behind keeping it. */
+        if (ioctl(fd, UI_SET_EVBIT, EV_REP) < 0) {
+            goto fail;
+        }
+        us.id.product = PID_ATTICPAD_KEYBOARD;
+        (void)snprintf(name, sizeof name, "AtticPad Keyboard %d", slot);
+        break;
+
+    case APAD_KBM_DEV_MOUSE:
+        if (ioctl(fd, UI_SET_EVBIT, EV_REL) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_RELBIT, REL_X) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_RELBIT, REL_Y) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_RELBIT, REL_HWHEEL) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_KEYBIT, BTN_SIDE) < 0) {
+            goto fail;
+        }
+        if (ioctl(fd, UI_SET_KEYBIT, BTN_EXTRA) < 0) {
+            goto fail;
+        }
+        us.id.product = PID_ATTICPAD_MOUSE;
+        (void)snprintf(name, sizeof name, "AtticPad Mouse %d", slot);
+        break;
+
+    case APAD_KBM_DEV_MEDIA:
+        if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0) {
+            goto fail;
+        }
+        for (i = 0; i < (int)(sizeof apad_media_to_evdev
+                              / sizeof apad_media_to_evdev[0]); i++) {
+            uint16_t code = apad_media_to_evdev[i];
+            if (code == 0u) {
+                continue;
+            }
+            if (ioctl(fd, UI_SET_KEYBIT, code) < 0) {
+                goto fail;
+            }
+        }
+        us.id.product = PID_ATTICPAD_MEDIA;
+        (void)snprintf(name, sizeof name, "AtticPad Media %d", slot);
+        break;
+
+    default:
+        goto fail;
+    }
+
+    memcpy(us.name, name, sizeof us.name);
+    if (ioctl(fd, UI_DEV_SETUP, &us) < 0) {
+        goto fail;
+    }
+    if (ioctl(fd, UI_DEV_CREATE) < 0) {
+        goto fail;
+    }
+
+    *fdp = fd;
+    return 0;
+
+fail:
+    (void)close(fd);
+    return -1;
+}
+
+/*
+ * Inject `n` events, all belonging to whichever device(s) `ev[].device`
+ * names -- in practice always one device per call, since server/src/kbm.c
+ * calls in per accepted datagram and a datagram is one type. An event whose
+ * device was never created (fd < 0) is skipped rather than failing the
+ * whole batch, mirroring how an unmapped code (0, or KEY_UNKNOWN) is
+ * skipped rather than treated as an error -- both are "nothing to inject",
+ * not a fault. One SYN_REPORT per distinct device actually touched, at the
+ * end of the batch, exactly like update_pad's own single trailing SYN.
+ */
+static int kbm_events(int slot, const apad_kbm_event_out *ev, size_t n)
+{
+    size_t i;
+    int    touched_kb = 0, touched_mo = 0, touched_me = 0;
+
+    if (!slot_ok(slot) || ev == NULL) {
+        return -1;
+    }
+
+    for (i = 0; i < n; i++) {
+        int      fd;
+        uint16_t code;
+
+        switch ((apad_kbm_device)ev[i].device) {
+        case APAD_KBM_DEV_KEYBOARD:
+            fd = g_kbm[slot].kb_fd;
+            if (fd < 0) {
+                continue;
+            }
+            code = (ev[i].code < (sizeof apad_hid_to_evdev
+                                  / sizeof apad_hid_to_evdev[0]))
+                       ? apad_hid_to_evdev[ev[i].code] : 0u;
+            if (code == 0u || code == (uint16_t)KEY_UNKNOWN) {
+                continue;
+            }
+            /* MSC_SCAN before EV_KEY, carrying the raw HID usage -- the
+             * same order a real USB HID keyboard's driver reports. */
+            if (emit(fd, EV_MSC, MSC_SCAN, ev[i].code) < 0) {
+                return -1;
+            }
+            if (emit(fd, EV_KEY, code, ev[i].down ? 1 : 0) < 0) {
+                return -1;
+            }
+            touched_kb = 1;
+            break;
+
+        case APAD_KBM_DEV_MOUSE:
+            fd = g_kbm[slot].mo_fd;
+            if (fd < 0) {
+                continue;
+            }
+            code = mouse_btn_to_evdev(ev[i].code);
+            if (code == 0u) {
+                continue;
+            }
+            if (emit(fd, EV_KEY, code, ev[i].down ? 1 : 0) < 0) {
+                return -1;
+            }
+            touched_mo = 1;
+            break;
+
+        case APAD_KBM_DEV_MEDIA:
+            fd = g_kbm[slot].me_fd;
+            if (fd < 0) {
+                continue;
+            }
+            code = (ev[i].code < (sizeof apad_media_to_evdev
+                                  / sizeof apad_media_to_evdev[0]))
+                       ? apad_media_to_evdev[ev[i].code] : 0u;
+            if (code == 0u) {
+                continue;
+            }
+            if (emit(fd, EV_KEY, code, ev[i].down ? 1 : 0) < 0) {
+                return -1;
+            }
+            touched_me = 1;
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    if (touched_kb && emit(g_kbm[slot].kb_fd, EV_SYN, SYN_REPORT, 0) < 0) {
+        return -1;
+    }
+    if (touched_mo && emit(g_kbm[slot].mo_fd, EV_SYN, SYN_REPORT, 0) < 0) {
+        return -1;
+    }
+    if (touched_me && emit(g_kbm[slot].me_fd, EV_SYN, SYN_REPORT, 0) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* §6.16: +Y is DOWN here (screen space), and so is evdev's REL_Y -- the
+ * OPPOSITE situation from the pad's ABS_Y (§5.4), which needs negate_y().
+ * No flip needed: the wire's mouse convention and evdev's already agree. */
+static int mouse_motion(int slot, const apad_mouse_motion *m)
+{
+    int fd;
+
+    if (!slot_ok(slot) || m == NULL) {
+        return -1;
+    }
+    fd = g_kbm[slot].mo_fd;
+    if (fd < 0) {
+        return -1;
+    }
+    if (m->dx != 0 && emit(fd, EV_REL, REL_X, m->dx) < 0) {
+        return -1;
+    }
+    if (m->dy != 0 && emit(fd, EV_REL, REL_Y, m->dy) < 0) {
+        return -1;
+    }
+    if (m->wheel != 0 && emit(fd, EV_REL, REL_WHEEL, m->wheel) < 0) {
+        return -1;
+    }
+    if (m->hwheel != 0 && emit(fd, EV_REL, REL_HWHEEL, m->hwheel) < 0) {
+        return -1;
+    }
+    return emit(fd, EV_SYN, SYN_REPORT, 0);
+}
+
+static void destroy_kbm(int slot, apad_kbm_device dev)
+{
+    int *fdp = kbm_fd_ptr(slot, dev);
+
+    if (fdp == NULL || *fdp < 0) {
+        return;
+    }
+    (void)ioctl(*fdp, UI_DEV_DESTROY);
+    (void)close(*fdp);
+    *fdp = -1;
 }
 
 /* backend.h's health() hook. backend_init() above never actually touches
@@ -352,5 +708,10 @@ const apad_backend apad_backend_uinput = {
     .destroy_pad   = destroy_pad,
     .shutdown      = backend_shutdown,
     .name          = "uinput",
-    .health        = backend_health
+    .health        = backend_health,
+    .kbm_caps      = kbm_caps,
+    .create_kbm    = create_kbm,
+    .kbm_events    = kbm_events,
+    .mouse_motion  = mouse_motion,
+    .destroy_kbm   = destroy_kbm
 };

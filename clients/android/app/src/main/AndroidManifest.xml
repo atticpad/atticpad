@@ -34,25 +34,41 @@
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <!--
-      Bluetooth Controller mode (BtHidController.kt / BtControllerActivity.kt)
-      — the phone registers itself as a Bluetooth HID gamepad for a PC or
-      console, no AtticPad server involved. Started as a same-day spike
-      (a deliberate, reviewed decision), promoted to a first-class
-      product mode 2026-08-12.
+      Bluetooth Controller mode (BtHidController.kt / BluetoothTransport.kt)
+      — the phone registers itself as a Bluetooth HID gamepad/keyboard/
+      mouse/media remote for a PC, no AtticPad server involved. Started as
+      a same-day spike (a deliberate, reviewed decision), promoted to a
+      first-class product mode 2026-08-12, and merged into MainActivity's
+      own connect flow and session overlay 2026-08-26 (job 3) — see
+      MainActivity's own class doc for why there is no separate Activity
+      for this any more.
 
       BLUETOOTH / BLUETOOTH_ADMIN cover API 26..30, where they are normal
       (install-time) permissions. From API 31 they are replaced by the
-      runtime BLUETOOTH_CONNECT (registerApp/sendReport/getBondedDevices)
-      and BLUETOOTH_ADVERTISE (ACTION_REQUEST_DISCOVERABLE) below —
-      requested at runtime only when this screen is opened
-      (BtControllerActivity.beginPermissionFlow), never on ordinary launch,
-      the same "never unless a screen actually needs it" rule the CAMERA
-      permission already follows.
+      runtime BLUETOOTH_CONNECT (registerApp/sendReport/getBondedDevices),
+      BLUETOOTH_ADVERTISE (ACTION_REQUEST_DISCOVERABLE) and BLUETOOTH_SCAN
+      (startDiscovery/ACTION_FOUND — phone-initiated pairing, added
+      2026-08-26 so the user does not have to drive pairing from the PC's
+      own Bluetooth settings) below — requested at runtime only when this
+      screen is opened (MainActivity.beginBtPermissionFlow), never on
+      ordinary launch, the same "never unless a screen actually needs it"
+      rule the CAMERA permission already follows.
+
+      BLUETOOTH_SCAN carries neverForLocation: the scan here only
+      populates a "nearby computers" pairing list (BluetoothDevice/
+      BluetoothClass off ACTION_FOUND) and is never correlated with, or
+      used to derive, the phone's physical location, which is exactly the
+      case that flag exists for — asserting it means this app is not
+      subject to the location-permission/location-services requirements a
+      plain BLUETOOTH_SCAN grant would otherwise carry on API 31+.
     -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
 
     <!--
       §10.3 in-app QR scanning. Requested at RUNTIME only when the user taps
@@ -137,17 +153,6 @@
                 <data android:scheme="atticpad" />
             </intent-filter>
         </activity>
-
-        <!-- Bluetooth Controller mode — see BtHidController.kt's class doc.
-             Not `exported`: reachable only from inside this app
-             (MainActivity's "No PC? Bluetooth Controller" card), never
-             from outside. -->
-        <activity
-            android:name=".BtControllerActivity"
-            android:exported="false"
-            android:label="${appLabel} — Bluetooth Controller"
-            android:screenOrientation="fullSensor"
-            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|smallestScreenSize" />
 
         <!--
           The app's spine (docs/DESIGN.md §7.2). foregroundServiceType is mandatory

@@ -108,13 +108,20 @@ int apad_payload_size(uint8_t type)
     case APAD_MSG_RUMBLE:      return (int)APAD_LEN_RUMBLE;
     case APAD_MSG_LED:         return (int)APAD_LEN_LED;
     case APAD_MSG_STATUS:      return (int)APAD_LEN_STATUS;
-    /* v2 EXPERIMENT (experiment/touchmap-v2). Registering the length here
+    /* §6.12. Registering the length here
      * is what makes the type RECEIVABLE at all: this table is the §4
      * unknown-type gate, so a message absent from it is discarded during
      * parse and never reaches any handler. The server could encode and
      * send TOUCHMAP happily while every client silently dropped it --
      * which is exactly what happened until this line existed. */
     case APAD_MSG_TOUCHMAP:    return (int)APAD_LEN_TOUCHMAP;
+    /* §6.15-§6.19, and the same lesson as TOUCHMAP above: without these four
+     * lines a client would encode and send a KEYBOARD happily while every
+     * server dropped it during parse, with nothing anywhere to say why. */
+    case APAD_MSG_KEYBOARD:    return (int)APAD_LEN_KEYBOARD;
+    case APAD_MSG_MOUSE:       return (int)APAD_LEN_MOUSE;
+    case APAD_MSG_MEDIA:       return (int)APAD_LEN_MEDIA;
+    case APAD_MSG_INPUTCAPS:   return (int)APAD_LEN_INPUTCAPS;
     case APAD_MSG_ACK:         return (int)APAD_LEN_ACK;
     case APAD_MSG_ERROR:       return (int)APAD_LEN_ERROR;
     default:                   return APAD_ERR_TYPE;   /* §4: discard silently */
@@ -642,10 +649,10 @@ int apad_encode_rumble(uint8_t *b, size_t cap, const apad_rumble *in)
     return (int)APAD_LEN_RUMBLE;
 }
 
-/* ---- v2 EXPERIMENT: TOUCHMAP (0x43) -------------------------------------
+/* ---- TOUCHMAP (0x43), §6.12 ---------------------------------------------
  *
- * Branch experiment/touchmap-v2. Not v1, not in docs/PROTOCOL.md, and not to
- * be merged without a v2 decision -- see the struct comment in atticpad.h.
+ * Added after the v1 freeze, additively -- see §6.14 for the ruling, and the
+ * struct comment in atticpad.h for what the message is for.
  *
  * Layout, little-endian, assembled byte by byte like everything else here:
  *
@@ -931,6 +938,267 @@ int apad_decode_input_state(const uint8_t *b, size_t len, apad_input_state *out)
     out->client_ticks_ms = rd_u32(b + 52);
 
     return (int)APAD_LEN_INPUT_STATE;
+}
+
+/* ---- §6.15-§6.19 KEYBOARD, MOUSE, MEDIA, INPUTCAPS ---------------------- *
+ *
+ * Added after the v1 freeze, additively, and audited against §6.14 in §6.20:
+ * four new type codes with their payloads, and nothing else touched.
+ *
+ * Three normalisations below look like they could be shared with §5's and
+ * cannot be, so they are written out per type:
+ *
+ *   - RESERVED BITS are masked on BOTH sides (§2). keys[0] bits 0-3, event
+ *     flags bits 1-7, MOUSE.buttons bits 5-15, MEDIA.held / media_mask bits
+ *     24-31, features bits 3-31, status bits 4-31.
+ *   - A RESERVED NUMERIC RANGE is normalised on DECODE ONLY -- an events[]
+ *     slot whose usage/button/control is out of range. Same asymmetry as
+ *     battery (§5.5) and player_index (§6.8): a sender putting one on the
+ *     wire is non-conforming, and laundering it in the encoder would hide
+ *     that from whoever has to debug it.
+ *   - A NO-EVENT SLOT ALSO GETS ITS `flags` FORCED TO 0 on decode. §6.15
+ *     requires it, and the reason is mechanical rather than cosmetic: it is
+ *     what makes a no-event slot decode byte-identically whatever a
+ *     non-conforming sender transmitted, which is what lets a conformance
+ *     vector compare two decoded structures for exact equality.
+ */
+
+/*
+ * §6.15 KEYBOARD, 56 bytes:
+ *   0  keys[32]        32   held-key bitmap; usage u is byte u>>3, bit u&7
+ *   32 event_seq        2
+ *   34 reserved0        1
+ *   35 reserved1        1
+ *   36 events[8]       16   +0 usage, +1 flags; OLDEST at index 0
+ *   52 client_ticks_ms  4
+ */
+int apad_encode_keyboard(uint8_t *b, size_t cap, const apad_keyboard *in)
+{
+    size_t i;
+
+    ENC_GUARD(APAD_LEN_KEYBOARD);
+
+    memcpy(b + 0, in->keys, APAD_KEY_BITMAP_BYTES);
+    /* §6.15: keys[0] bits 0..3 are reserved -- HID 0x00-0x03 are no-event,
+     * ErrorRollOver, POSTFail and ErrorUndefined, conditions rather than
+     * keys. Zero on send whatever the caller passed (§2). */
+    b[0] = (uint8_t)(b[0] & ~(unsigned)APAD_KEYS0_RESERVED_MASK);
+    wr_u16(b + 32, in->event_seq);
+    /* b[34] reserved0, b[35] reserved1 already zeroed by ENC_GUARD */
+    for (i = 0; i < (size_t)APAD_KEYBOARD_RING_DEPTH; i++) {
+        uint8_t *e = b + 36u + (i * 2u);
+        wr_u8(e + 0, in->events[i].usage);
+        wr_u8(e + 1, (uint8_t)(in->events[i].flags & APAD_KBM_EVENT_FLAGS_MASK));
+    }
+    wr_u32(b + 52, in->client_ticks_ms);
+
+    return (int)APAD_LEN_KEYBOARD;
+}
+
+int apad_decode_keyboard(const uint8_t *b, size_t len, apad_keyboard *out)
+{
+    size_t i;
+
+    DEC_GUARD(APAD_LEN_KEYBOARD);
+
+    memcpy(out->keys, b + 0, APAD_KEY_BITMAP_BYTES);
+    out->keys[0] = (uint8_t)(out->keys[0] & ~(unsigned)APAD_KEYS0_RESERVED_MASK);
+    out->event_seq = rd_u16(b + 32);
+    /* b[34], b[35] reserved: ignored, and the struct carries no field for
+     * them, so there is nothing to scrub. */
+    for (i = 0; i < (size_t)APAD_KEYBOARD_RING_DEPTH; i++) {
+        const uint8_t *e = b + 36u + (i * 2u);
+        uint8_t usage = rd_u8(e + 0);
+        if (usage <= (uint8_t)APAD_KEY_USAGE_RESERVED_MAX) {
+            continue;   /* §6.15 "no event": usage AND flags stay 0 */
+        }
+        /* WHAT IS DELIBERATELY NOT NORMALISED HERE: HID 1.12 leaves usages
+         * 0xA5-0xAF, 0xDE-0xDF and 0xE8-0xFF reserved, and §6.15 requires a
+         * decoder to PASS THEM THROUGH UNCHANGED. A full validity mask would
+         * freeze one revision of the HID specification into a decoder that
+         * cannot be changed, and an unmapped usage is already harmless: a
+         * server has no table entry for it and emits nothing. Do not "fix"
+         * this by adding a range check. */
+        out->events[i].usage = usage;
+        out->events[i].flags =
+            (uint8_t)(rd_u8(e + 1) & APAD_KBM_EVENT_FLAGS_MASK);
+    }
+    out->client_ticks_ms = rd_u32(b + 52);
+
+    return (int)APAD_LEN_KEYBOARD;
+}
+
+/*
+ * §6.16 MOUSE, 24 bytes:
+ *   0  dx_accum         2   wrapping accumulator, + = right
+ *   2  dy_accum         2   wrapping accumulator, +Y DOWN (screen space)
+ *   4  wheel_accum      2   wrapping, DETENTS, + = away from the user
+ *   6  hwheel_accum     2   wrapping, detents, + = right
+ *   8  buttons          2
+ *   10 event_seq        2
+ *   12 events[4]        8   +0 button, +1 flags; oldest at index 0
+ *   20 client_ticks_ms  4
+ *
+ * The four accumulators are moved verbatim in both directions. §6.16 makes
+ * their ABSOLUTE VALUE meaningless: a receiver computes motion as
+ * apad_seq_diff(now, previous) against the last ACCEPTED sample, so there is
+ * nothing here for a codec to clamp, scale or validate. Doing any of those
+ * would be actively wrong at the wrap.
+ */
+int apad_encode_mouse(uint8_t *b, size_t cap, const apad_mouse *in)
+{
+    size_t i;
+
+    ENC_GUARD(APAD_LEN_MOUSE);
+
+    wr_u16(b + 0,  in->dx_accum);
+    wr_u16(b + 2,  in->dy_accum);
+    wr_u16(b + 4,  in->wheel_accum);
+    wr_u16(b + 6,  in->hwheel_accum);
+    /* §6.16: bits 5..15 reserved, zero on send. */
+    wr_u16(b + 8,  (uint16_t)(in->buttons & APAD_MOUSEBTN_VALID_MASK));
+    wr_u16(b + 10, in->event_seq);
+    for (i = 0; i < (size_t)APAD_MOUSE_RING_DEPTH; i++) {
+        uint8_t *e = b + 12u + (i * 2u);
+        wr_u8(e + 0, in->events[i].button);
+        wr_u8(e + 1, (uint8_t)(in->events[i].flags & APAD_KBM_EVENT_FLAGS_MASK));
+    }
+    wr_u32(b + 20, in->client_ticks_ms);
+
+    return (int)APAD_LEN_MOUSE;
+}
+
+int apad_decode_mouse(const uint8_t *b, size_t len, apad_mouse *out)
+{
+    size_t i;
+
+    DEC_GUARD(APAD_LEN_MOUSE);
+
+    out->dx_accum     = rd_u16(b + 0);
+    out->dy_accum     = rd_u16(b + 2);
+    out->wheel_accum  = rd_u16(b + 4);
+    out->hwheel_accum = rd_u16(b + 6);
+    out->buttons      = (uint16_t)(rd_u16(b + 8) & APAD_MOUSEBTN_VALID_MASK);
+    out->event_seq    = rd_u16(b + 10);
+    for (i = 0; i < (size_t)APAD_MOUSE_RING_DEPTH; i++) {
+        const uint8_t *e = b + 12u + (i * 2u);
+        uint8_t button = rd_u8(e + 0);
+        /* §6.16: 0 is "no event", and anything above 5 is not a button. Both
+         * decode to button 0 with flags forced to 0. */
+        if (button == 0u || button > (uint8_t)APAD_MOUSEBTN_MAX) {
+            continue;
+        }
+        out->events[i].button = button;
+        out->events[i].flags  =
+            (uint8_t)(rd_u8(e + 1) & APAD_KBM_EVENT_FLAGS_MASK);
+    }
+    out->client_ticks_ms = rd_u32(b + 20);
+
+    return (int)APAD_LEN_MOUSE;
+}
+
+/*
+ * §6.17 MEDIA, 20 bytes:
+ *   0  held             4   control c (1..32) is bit c-1
+ *   4  event_seq        2
+ *   6  reserved0        1
+ *   7  reserved1        1
+ *   8  events[4]        8   +0 control, +1 flags; oldest at index 0
+ *   16 client_ticks_ms  4
+ *
+ * Note the in-memory struct puts events[] at offset 6 and the wire puts them
+ * at 8, because the struct carries no reserved bytes. A cast would silently
+ * shift every event by two bytes; this file never casts.
+ */
+int apad_encode_media(uint8_t *b, size_t cap, const apad_media *in)
+{
+    size_t i;
+
+    ENC_GUARD(APAD_LEN_MEDIA);
+
+    /* §6.17/§6.18: bits of `held` for unassigned indices (25..32, i.e. bits
+     * 24..31) are reserved -- zero on send, scrubbed on receive. */
+    wr_u32(b + 0, in->held & APAD_MEDIA_VALID_MASK);
+    wr_u16(b + 4, in->event_seq);
+    /* b[6] reserved0, b[7] reserved1 already zeroed by ENC_GUARD */
+    for (i = 0; i < (size_t)APAD_MEDIA_RING_DEPTH; i++) {
+        uint8_t *e = b + 8u + (i * 2u);
+        wr_u8(e + 0, in->events[i].control);
+        wr_u8(e + 1, (uint8_t)(in->events[i].flags & APAD_KBM_EVENT_FLAGS_MASK));
+    }
+    wr_u32(b + 16, in->client_ticks_ms);
+
+    return (int)APAD_LEN_MEDIA;
+}
+
+int apad_decode_media(const uint8_t *b, size_t len, apad_media *out)
+{
+    size_t i;
+
+    DEC_GUARD(APAD_LEN_MEDIA);
+
+    out->held      = rd_u32(b + 0) & APAD_MEDIA_VALID_MASK;
+    out->event_seq = rd_u16(b + 4);
+    for (i = 0; i < (size_t)APAD_MEDIA_RING_DEPTH; i++) {
+        const uint8_t *e = b + 8u + (i * 2u);
+        uint8_t control = rd_u8(e + 0);
+        /* §6.17: 0 is "no event"; a control outside 0..32, and ANY index
+         * §6.18 leaves unassigned, normalises to 0 with flags forced to 0.
+         * §6.18 assigns 1..24, so the two rules collapse into one bound --
+         * and 25..32 must be scrubbed by a receiver that predates their
+         * assignment, which is why INPUTCAPS.media_mask exists to gate them
+         * (§6.14, §6.18). */
+        if (control == 0u || control > (uint8_t)APAD_MEDIA_ASSIGNED_MAX) {
+            continue;
+        }
+        out->events[i].control = control;
+        out->events[i].flags   =
+            (uint8_t)(rd_u8(e + 1) & APAD_KBM_EVENT_FLAGS_MASK);
+    }
+    out->client_ticks_ms = rd_u32(b + 16);
+
+    return (int)APAD_LEN_MEDIA;
+}
+
+/*
+ * §6.19 INPUTCAPS, 16 bytes:
+ *   0  features         4
+ *   4  status           4
+ *   8  media_mask       4
+ *   12 mouse_rate_hz    2   0 = use the session's input_rate_hz
+ *   14 reserved0        2
+ *
+ * mouse_rate_hz is NOT clamped against APAD_MAX_RATE_HZ here. §6.19 defines
+ * only "0 means use the session's input_rate_hz" and gives the field no
+ * reserved range, so clamping would be this codec inventing a rule; §11's
+ * ceiling belongs to whoever sets the rate, exactly as
+ * apad_session_server_accept treats a client's desired_rate_hz.
+ */
+int apad_encode_inputcaps(uint8_t *b, size_t cap, const apad_inputcaps *in)
+{
+    ENC_GUARD(APAD_LEN_INPUTCAPS);
+
+    wr_u32(b + 0,  in->features   & APAD_KBM_FEATURE_VALID_MASK);
+    wr_u32(b + 4,  in->status     & APAD_KBM_STATUS_VALID_MASK);
+    wr_u32(b + 8,  in->media_mask & APAD_MEDIA_VALID_MASK);
+    wr_u16(b + 12, in->mouse_rate_hz);
+    /* b[14..15] reserved0 already zeroed by ENC_GUARD */
+
+    return (int)APAD_LEN_INPUTCAPS;
+}
+
+int apad_decode_inputcaps(const uint8_t *b, size_t len, apad_inputcaps *out)
+{
+    DEC_GUARD(APAD_LEN_INPUTCAPS);
+
+    out->features      = rd_u32(b + 0)  & APAD_KBM_FEATURE_VALID_MASK;
+    out->status        = rd_u32(b + 4)  & APAD_KBM_STATUS_VALID_MASK;
+    out->media_mask    = rd_u32(b + 8)  & APAD_MEDIA_VALID_MASK;
+    out->mouse_rate_hz = rd_u16(b + 12);
+    /* b[14..15] reserved0: ignored (§2), and dropped -- the struct carries no
+     * field for it, so a reserved byte cannot reach a caller at all. */
+
+    return (int)APAD_LEN_INPUTCAPS;
 }
 
 /* ---- addresses (pure byte work; kept out of the shim so every platform

@@ -24,7 +24,11 @@
   // built-in default already applies exactly this swap -- but is spelled
   // out so a copy of this file is easy to retarget for a new device:
   // change any one line to remap that button, or delete a line to fall
-  // back to this same default for just that button.
+  // back to this same default for just that button. "LT"/"RT" are valid
+  // targets too, alongside the digital pad buttons: a wire button aimed at
+  // one gives that analog trigger a full digital pull while it is held
+  // (the only way to reach a trigger on a device with no ZL/ZR and no
+  // touchscreen, such as a PSP).
   "buttons": {
     "A": "B", "B": "A", "X": "Y", "Y": "X",
     "L": "LB", "R": "RB"

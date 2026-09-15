@@ -4,8 +4,9 @@
 #
 # CI is the gate; local is the loop. The rule that keeps the two equivalent:
 # console targets here use the SAME pinned image digest as CI, sourced from
-# scripts/toolchains.env by KEY (DEVKITARM, DEVKITA64, PSPDEV, VITASDK) —
-# never a hardcoded tag or path. If a provider swaps, one file changes.
+# scripts/toolchains.env by KEY (DEVKITARM, DEVKITA64, PSPDEV, VITASDK,
+# BLOCKSDS) — never a hardcoded tag or path. If a provider swaps, one file
+# changes.
 #
 # This wrapper NEVER produces a release artifact. It builds and, where it is
 # safe and fast to do so, RUNS the result (self-test, smoke test). Releases
@@ -21,7 +22,10 @@
 #                               # present, else the pinned DEVKITARM digest)
 #   scripts/build.sh 3ds-cia   # 3ds, plus a .cia (docs/DESIGN.md S8.3) via the
 #                               # pinned makerom release (scripts/cia-tools.env)
-#   scripts/build.sh psp|nds|switch   # not implemented yet (docs/DESIGN.md S11: M5)
+#   scripts/build.sh psp        # PSP client (pinned pspdev container)
+#   scripts/build.sh nds        # DS client (clients/nds/build.sh, pinned
+#                               # BLOCKSDS container — docs/DESIGN.md S11: M5)
+#   scripts/build.sh switch     # not implemented yet (docs/DESIGN.md S11: M5)
 #   scripts/build.sh vita      # shelved — see docs/DESIGN.md S11 (vitasdk-docker
 #                               # can't run in its own image, not "not built yet")
 #   scripts/build.sh windows   # cross-compiled Windows server (mingw-w64,
@@ -51,9 +55,9 @@ SHIM="${REPO_ROOT}/shim"
 CC_NATIVE="${CC:-cc}"
 
 # Pinned digests. Sourced by KEY so console targets (below, once they exist)
-# and CI's container: fields both reference DEVKITARM/DEVKITA64/PSPDEV/VITASDK
-# rather than a tag. Never edit toolchains.env by hand — see
-# scripts/pin-toolchains.sh.
+# and CI's container: fields both reference
+# DEVKITARM/DEVKITA64/PSPDEV/VITASDK/BLOCKSDS rather than a tag. Never edit
+# toolchains.env by hand — see scripts/pin-toolchains.sh.
 # shellcheck source=toolchains.env
 source "${HERE}/toolchains.env"
 
@@ -100,14 +104,20 @@ Targets that exist today:
             runs the result (Linux cannot run a PE32+ binary) and never
             signs anything — see the "Build and test" note above for what
             that means for reporting.
+  psp       clients/psp/build.sh — EBOOT.PBP. Native pspsdk if present, else
+            the pinned PSPDEV digest via Docker/Podman —
+            PSPDEV=${PSPDEV:-<unset>}
+  nds       clients/nds/build.sh — atticpad-nds.nds, via the pinned BLOCKSDS
+            digest via Docker/Podman — BLOCKSDS=${BLOCKSDS:-<unset>}. Same
+            shape as psp above (this wrapper delegates and asserts the
+            artifact exists); the client itself lands docs/DESIGN.md §11: M5, so
+            until clients/nds/build.sh exists this prints a clear message
+            and exits nonzero rather than a raw "no such file" from bash.
 
-Console targets with no client code yet (docs/DESIGN.md §11 roadmap: M5). These
-print a clear message and exit nonzero rather than failing on a missing
+Console targets with no client code yet (docs/DESIGN.md §11 roadmap: M5). This
+prints a clear message and exits nonzero rather than failing on a missing
 toolchain or a confusing compiler error:
   switch    devkitA64   — DEVKITA64=${DEVKITA64:-<unset>}
-  psp       PSPDEV      — PSPDEV=${PSPDEV:-<unset>}
-  nds       BlocksDS    — not yet in scripts/toolchains.env (docs/DESIGN.md D8: no
-                          pinned BlocksDS image chosen yet)
 
 Shelved, not merely unbuilt (docs/DESIGN.md §11):
   vita      VitaSDK     — VITASDK=${VITASDK:-<unset>} — gnuton/vitasdk-docker's
@@ -180,6 +190,20 @@ build_server() {
   log "server: embedded-profiles guard (scripts/support/check_profiles_builtin.sh)"
   "${HERE}/support/check_profiles_builtin.sh"
 
+  # server/backends/uinput_keymap.h and sendinput_scancodes.h both claim, in
+  # their own header comments, to be row-for-row mirrors of
+  # references/hid/usage-to-evdev.txt and usage-to-scancode-set1.txt. A table
+  # that silently drifts from its own stated provenance is exactly the
+  # failure references/hid/ exists to prevent -- so re-check it every build
+  # rather than trusting the comment.
+  log "server: keyboard/media keycode-table guard (scripts/support/check_kbm_tables.c — must match references/hid/ exactly)"
+  mkdir -p "${BUILD_DIR}/server"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      "${HERE}/support/check_kbm_tables.c" \
+      -o "${BUILD_DIR}/server/check-kbm-tables"
+  "${BUILD_DIR}/server/check-kbm-tables" "${REPO_ROOT}"
+
   # A stick's reachable set must be a DISC. Shaping each axis independently
   # (what this did until the radial fix) turns a round stick into a diamond:
   # with the default quadratic curve, a circular input becomes
@@ -197,9 +221,44 @@ build_server() {
       "${SHIM}/net_bsd.c" "${SHIM}/time_posix.c" \
       "${REPO_ROOT}/server/src/server.c" "${REPO_ROOT}/server/src/mapping.c" \
       "${REPO_ROOT}/server/src/jsonc.c" "${REPO_ROOT}/server/src/profiles.c" \
-      "${REPO_ROOT}/server/src/pairing.c" \
+      "${REPO_ROOT}/server/src/pairing.c" "${REPO_ROOT}/server/src/kbm.c" \
       -lm -o "${BUILD_DIR}/server/stick-shape-test"
   "${BUILD_DIR}/server/stick-shape-test"
+
+  # A profile may aim a wire BUTTON at an analog trigger ("buttons": {"L":
+  # "LT"}), which is the only route to LT/RT on a device with no ZL/ZR and
+  # no touchscreen (a PSP). The failure this guards is silent in both
+  # directions: a trigger that never moves, or -- worse -- a released button
+  # stamping 0 over a real analog pull because the sources were assigned
+  # rather than combined by max.
+  log "server: trigger-button guard (scripts/support/trigger_button_test.c — a profile may map a button to LT/RT, max-combined with every other source)"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      -I"${REPO_ROOT}/server/include" -I"${REPO_ROOT}/server/src" \
+      "${HERE}/support/trigger_button_test.c" \
+      "${CORE_SRC}/codec.c" "${CORE_SRC}/hmac_sha256.c" \
+      "${CORE_SRC}/seq.c" "${CORE_SRC}/session.c" \
+      "${SHIM}/net_bsd.c" "${SHIM}/time_posix.c" \
+      "${REPO_ROOT}/server/src/server.c" "${REPO_ROOT}/server/src/mapping.c" \
+      "${REPO_ROOT}/server/src/jsonc.c" "${REPO_ROOT}/server/src/profiles.c" \
+      "${REPO_ROOT}/server/src/pairing.c" "${REPO_ROOT}/server/src/kbm.c" \
+      -lm -o "${BUILD_DIR}/server/trigger-button-test"
+  "${BUILD_DIR}/server/trigger-button-test"
+
+  # A report that carries a modifier and a letter TOGETHER (the 3DS on-screen
+  # keyboard's sticky Shift latch does exactly this) must inject the modifier
+  # first: the whole batch goes out under one SYN_REPORT, consumers apply it
+  # in order, and ascending usage order would put A (0x04) before LEFTSHIFT
+  # (0xE1) -- a lowercase letter on the host. Silent, and invisible to anyone
+  # testing with a physically held modifier, which lands in an earlier report.
+  log "server: keyboard report-ordering guard (scripts/support/kbm_order_test.c — a report's modifiers must precede its keys)"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      -I"${REPO_ROOT}/server/include" -I"${REPO_ROOT}/server/src" \
+      "${HERE}/support/kbm_order_test.c" \
+      "${CORE_SRC}/seq.c" "${REPO_ROOT}/server/src/kbm.c" \
+      -o "${BUILD_DIR}/server/kbm-order-test"
+  "${BUILD_DIR}/server/kbm-order-test"
 
   log "server: compiling libapadserver + linux host -> atticpad-server (-std=c11 -Wall -Wextra -Werror, uinput backend)"
   mkdir -p "${BUILD_DIR}/server"
@@ -211,7 +270,7 @@ build_server() {
       "${SHIM}/net_bsd.c" "${SHIM}/time_posix.c" \
       "${REPO_ROOT}/server/src/server.c" "${REPO_ROOT}/server/src/mapping.c" \
       "${REPO_ROOT}/server/src/jsonc.c" "${REPO_ROOT}/server/src/profiles.c" \
-      "${REPO_ROOT}/server/src/pairing.c" \
+      "${REPO_ROOT}/server/src/pairing.c" "${REPO_ROOT}/server/src/kbm.c" \
       "${REPO_ROOT}/server/backends/uinput.c" \
       "${REPO_ROOT}/server/host/linux/main.c" \
       -lm \
@@ -277,6 +336,28 @@ build_windows() {
   log "windows: embedded-profiles guard (scripts/support/check_profiles_builtin.sh)"
   "${HERE}/support/check_profiles_builtin.sh"
 
+  # server/backends/sendinput_scancodes.h claims, in its own header comment,
+  # to be a row-for-row mirror of references/hid/usage-to-scancode-set1.txt
+  # -- the exact same claim uinput_keymap.h makes about usage-to-evdev.txt,
+  # which build_server() above already re-checks on every native build.
+  # check_kbm_tables.c verifies BOTH tables in one pass (it #includes both
+  # headers), so this does not need the mingw cross-compiler at all -- it is
+  # host-side data validation, built and run with CC_NATIVE, same as
+  # check_profiles_builtin.sh just above. Without this call, a drift
+  # introduced ONLY in sendinput_scancodes.h (the table the Linux uinput
+  # path never touches) would still happen to be caught by build_server()
+  # running in the same CI push -- but this build_windows() function is the
+  # one that actually links server/backends/sendinput.c, so the guard
+  # belongs here too: the mingw/Windows path should not depend on the
+  # native/Linux path also having run to catch its own table's drift.
+  log "windows: keyboard/media keycode-table guard (scripts/support/check_kbm_tables.c — must match references/hid/ exactly)"
+  mkdir -p "${BUILD_DIR}/server"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      "${HERE}/support/check_kbm_tables.c" \
+      -o "${BUILD_DIR}/server/check-kbm-tables"
+  "${BUILD_DIR}/server/check-kbm-tables" "${REPO_ROOT}"
+
   "${HERE}/windows-mingw-check.sh"
   # shellcheck source=windows.env
   source "${HERE}/windows.env"
@@ -310,15 +391,17 @@ build_windows() {
     "${SHIM}/net_winsock.c" "${SHIM}/time_win32.c"
     "${REPO_ROOT}/server/src/server.c" "${REPO_ROOT}/server/src/mapping.c"
     "${REPO_ROOT}/server/src/jsonc.c" "${REPO_ROOT}/server/src/profiles.c"
-    "${REPO_ROOT}/server/src/pairing.c"
+    "${REPO_ROOT}/server/src/pairing.c" "${REPO_ROOT}/server/src/kbm.c"
     "${REPO_ROOT}/server/backends/vigem.c"
+    "${REPO_ROOT}/server/backends/sendinput.c"
+    "${REPO_ROOT}/server/backends/win32.c"
   )
   for src in "${c_srcs[@]}"; do
     local obj="${OUT}/$(basename "${src}").o"
     "${CC_WIN}" "${CFLAGS[@]}" -c "${src}" -o "${obj}"
     objs+=("${obj}")
   done
-  log "windows: ${#c_srcs[@]}/${#c_srcs[@]} translation units compiled clean (shim, libapadserver, vigem.c backend)"
+  log "windows: ${#c_srcs[@]}/${#c_srcs[@]} translation units compiled clean (shim, libapadserver, vigem.c + sendinput.c + win32.c backends)"
 
   log "windows: compiling vendored ViGEmClient.cpp (server/backends/vendor/vigemclient/, pinned commit — see vendor/README.md; -isystem, not -Werror — third-party source, see this function's header comment)"
   local vigemclient_obj="${OUT}/ViGEmClient.cpp.o"
@@ -369,9 +452,23 @@ EOF
     objs+=("${res_obj}")
   fi
 
-  log "windows: linking atticpad-server.exe (${CXX_WIN} -static — C++ link because of the vendored ViGEmClient TU; -static so the target machine, which has no C/C++ runtime DLLs of its own, needs none)"
+  # -mwindows: link for the WINDOWS (GUI) subsystem so the loader never
+  # allocates a console for this process. It is a tray app (docs/DESIGN.md §6.3);
+  # a console flashing up on a double-click is the most visibly unfinished
+  # thing it could do. The previous console-subsystem build could only hide
+  # the window AFTER the loader had already painted it.
+  #
+  # -Wl,-e,mainCRTStartup: keep main(argc, argv). ld picks the entry symbol
+  # from the subsystem, and for the GUI subsystem that default is
+  # WinMainCRTStartup, which wants a WinMain this program does not have.
+  # Naming the console CRT entry explicitly keeps the ordinary main() while
+  # still producing a GUI-subsystem PE. server/host/windows/main.c's
+  # attach_console() is the other half: it reattaches stdio to the parent
+  # console when there IS one, so shell and SSH runs still print.
+  log "windows: linking atticpad-server.exe (${CXX_WIN} -static -mwindows — C++ link because of the vendored ViGEmClient TU; -static so the target machine, which has no C/C++ runtime DLLs of its own, needs none; GUI subsystem so no console window is ever created)"
   # shellcheck disable=SC2086
-  "${CXX_WIN}" -static -o "${OUT}/atticpad-server.exe" "${objs[@]}" ${APAD_MINGW_LIBS}
+  "${CXX_WIN}" -static -mwindows -Wl,-e,mainCRTStartup \
+      -o "${OUT}/atticpad-server.exe" "${objs[@]}" ${APAD_MINGW_LIBS}
 
   if [[ ! -f "${OUT}/atticpad-server.exe" ]]; then
     warn "windows: link reported success but ${OUT}/atticpad-server.exe does not exist."
@@ -414,11 +511,20 @@ build_tools() {
   # engine every real client (Android, 3DS, ...) links -- through a real
   # session. It tests THE ENGINE; loopback-client tests THE SERVER (it
   # hand-rolls adversarial datagrams of its own). Neither replaces the
-  # other -- see tools/engine-client/main.c's header. Build only here: it
-  # has no self-loopback mode, it needs a live server on the far end (see
-  # .github/workflows/ci.yml's integration job for where it actually runs).
-  log "tools: engine-client (build only -- needs a live server to run; see ci.yml's integration job)"
-  "${REPO_ROOT}/tools/engine-client/build.sh" build-only
+  # other -- see tools/engine-client/main.c's header.
+  #
+  # "run", not "build-only", since the KBM pass: two of its modes bring their
+  # OWN fake peer up on a scratch port and need no server at all --
+  # --inputcaps-reorder (S6.20's fourth staleness window: a reordered
+  # INPUTCAPS must not revive a cleared feature bit) and --release-on-clear
+  # (S6.19's release-before-stop, and S6.20's 10 Hz held-repeat floor measured
+  # at the receiver). Both assert and exit non-zero on failure. They were
+  # sitting here as build-only, which is the same as not having them: a
+  # self-checking regression test that never runs is decoration. The default
+  # mode, which does need a live server, still only runs in ci.yml's
+  # integration job.
+  log "tools: engine-client (build + run the two serverless self-checking modes)"
+  "${REPO_ROOT}/tools/engine-client/build.sh" run
 }
 
 # ---------------------------------------------------------------------------
@@ -432,6 +538,65 @@ build_tools() {
 # .3dsx only, no .cia — see docs/DESIGN.md §8.3 and clients/3ds/build.sh's header
 # comment for why that is out of scope here.
 # ---------------------------------------------------------------------------
+build_psp() {
+  log "psp: delegating to clients/psp/build.sh (PSPDEV=${PSPDEV})"
+  "${REPO_ROOT}/clients/psp/build.sh"
+
+  # Same guard as build_3ds: the delegate's own success message does not
+  # prove the artifact exists, and a missing EBOOT.PBP that reports success
+  # is how a stale build gets shipped.
+  local artifact="${REPO_ROOT}/clients/psp/EBOOT.PBP"
+  if [[ ! -f "${artifact}" ]]; then
+    warn "psp: clients/psp/build.sh exited 0 but ${artifact} does not exist — treating as a failure."
+    exit 1
+  fi
+  log "psp: confirmed ${artifact} ($(du -h "${artifact}" | cut -f1))"
+}
+
+# ---------------------------------------------------------------------------
+# nds — clients/nds/build.sh is the one place that knows how to build a DS
+# binary (pinned BLOCKSDS digest from toolchains.env, sourced above, via
+# Docker/Podman, --user "$(id -u):$(id -g)" so artifacts don't come out
+# root-owned — see clients/psp/build.sh's comment on the same flag). Same
+# shape as build_psp() just above: this wrapper delegates and confirms the
+# artifact landed, it does not know how to invoke the container itself.
+#
+# clients/nds/ has not landed in every worktree yet (docs/DESIGN.md §11: M5) — the
+# explicit existence check below is so that gap prints a clear message
+# naming the missing file and what will wire up once it exists, rather than
+# a bare "No such file or directory" from bash with no next step attached.
+# ---------------------------------------------------------------------------
+build_nds() {
+  local delegate="${REPO_ROOT}/clients/nds/build.sh"
+  if [[ ! -x "${delegate}" ]]; then
+    cat >&2 <<EOF
+scripts/build.sh: nds: ${delegate} does not exist yet (or is not executable).
+
+BLOCKSDS is already pinned in scripts/toolchains.env
+(BLOCKSDS=${BLOCKSDS:-<unset>}), and this function and
+.github/workflows/ci.yml's client-nds job are already wired to call
+clients/nds/build.sh build — what's missing is clients/nds/ itself
+(docs/DESIGN.md §11: M5). Once it lands (build|clean|run, same contract as
+clients/psp/build.sh: source scripts/toolchains.env, run the pinned
+BLOCKSDS digest via Docker/Podman), this function calls it unchanged.
+EOF
+    exit 1
+  fi
+
+  log "nds: delegating to clients/nds/build.sh (BLOCKSDS=${BLOCKSDS})"
+  "${delegate}" build
+
+  # Same guard as build_psp/build_3ds: the delegate's own success message
+  # does not prove the artifact exists, and a missing .nds that reports
+  # success is how a stale build gets shipped.
+  local artifact="${REPO_ROOT}/clients/nds/atticpad-nds.nds"
+  if [[ ! -f "${artifact}" ]]; then
+    warn "nds: clients/nds/build.sh exited 0 but ${artifact} does not exist — treating as a failure."
+    exit 1
+  fi
+  log "nds: confirmed ${artifact} ($(du -h "${artifact}" | cut -f1))"
+}
+
 build_3ds() {
   log "3ds: delegating to clients/3ds/build.sh (DEVKITARM=${DEVKITARM})"
   "${REPO_ROOT}/clients/3ds/build.sh"
@@ -578,13 +743,13 @@ case "${target}" in
     console_stub "switch" "DEVKITA64" "M5"
     ;;
   psp)
-    console_stub "psp" "PSPDEV" "M5"
+    build_psp
     ;;
   vita)
     vita_shelved
     ;;
   nds)
-    console_stub "nds" "(BlocksDS — not yet pinned, see docs/DESIGN.md D8)" "M5"
+    build_nds
     ;;
   ""|-h|--help|help)
     usage

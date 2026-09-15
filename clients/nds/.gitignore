@@ -1,0 +1,7 @@
+# build/, *.nds and *.elf are already covered by the repository root's
+# .gitignore. These are the leftovers the BlocksDS makefile drops that it
+# does not know about.
+*.dump
+*.map
+# build.sh's dev-hook stamp: local build state, never shared.
+.hooks

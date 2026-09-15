@@ -18,12 +18,15 @@ name: Canary (unpinned toolchains)
 # step with the real build (the same commands the future pinned CI job and
 # scripts/build.sh would use) and keep the `:latest` image reference.
 #
-# nds/BlocksDS is deliberately absent: docs/DESIGN.md D8 records that no BlocksDS
-# image has been chosen or pinned yet (scripts/toolchains.env has no NDS
-# key). Guessing an image here would repeat exactly the mistake this
-# project's own rules warn about (there is no vitasdk/vitasdk on Docker
-# Hub) — add this job when a BlocksDS image is deliberately chosen and
-# pinned, not before.
+# nds/BlocksDS: scripts/toolchains.env now pins BLOCKSDS
+# (skylyrac/blocksds@sha256:..., generated from the versioned tag
+# skylyrac/blocksds:slim-v1.23.0 — see scripts/pin-toolchains.sh). The
+# blocksds-latest job below watches skylyrac/blocksds:slim-latest, the
+# unpinned tag, same role every other job in this file plays for its own
+# toolchain — verified 2026-09-09 that both the versioned pin and
+# slim-latest currently exist and resolve (confirmed with `docker pull`),
+# unlike vitasdk/vitasdk, which does not exist at all on Docker Hub (see the
+# vitasdk-latest job below).
 
 on:
   schedule:
@@ -109,4 +112,27 @@ jobs:
           arm-vita-eabi-gcc --version
           echo 'int f(void){return 1;}' > /tmp/t.c
           arm-vita-eabi-gcc -c /tmp/t.c -o /tmp/t.o
+          echo "OK"
+
+  blocksds-latest:
+    name: BlocksDS (:slim-latest)
+    runs-on: ubuntu-latest
+    container:
+      image: skylyrac/blocksds:slim-latest
+    steps:
+      - name: compiler smoke test (arm-none-eabi-gcc)
+        # Verified 2026-09-09 against the pinned digest (which slim-latest
+        # currently matches): the image exports BLOCKSDS
+        # (/opt/wonderful/thirdparty/blocksds/core) and WONDERFUL_TOOLCHAIN
+        # (/opt/wonderful), but PATH is only /opt/wonderful/bin — the
+        # compiler itself lives one level down, at
+        # $WONDERFUL_TOOLCHAIN/toolchain/gcc-arm-none-eabi/bin/, same
+        # "env var set, PATH not updated" shape as PSPDEV/DEVKITARM above,
+        # not the devkitA64 "var not even exported" shape.
+        run: |
+          export PATH="${WONDERFUL_TOOLCHAIN}/toolchain/gcc-arm-none-eabi/bin:${PATH}"
+          which arm-none-eabi-gcc
+          arm-none-eabi-gcc --version
+          echo 'int f(void){return 1;}' > /tmp/t.c
+          arm-none-eabi-gcc -c /tmp/t.c -o /tmp/t.o
           echo "OK"

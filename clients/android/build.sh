@@ -64,11 +64,32 @@ APK="${HERE}/app/build/outputs/apk/debug/app-debug.apk"
 # reporting libapad 0.3.0-dev and 1018 cases while the tree said 0.5.0-rc2 and
 # 1141. A test that can pass without running what you built is worse than no
 # test, so this resolves the id from the artifact and dies if it cannot.
-apk_package() {
+aapt2_bin() {
   local aapt2
   aapt2="$(ls "${ANDROID_SDK_ROOT}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
   [[ -x "${aapt2}" ]] || die "no aapt2 under ${ANDROID_SDK_ROOT}/build-tools -- cannot determine the APK's package id, and guessing it is how a self-test comes back green against the wrong app"
-  "${aapt2}" dump packagename "${APK}" 2>/dev/null | tr -d '\r' | head -1
+  printf '%s' "${aapt2}"
+}
+
+apk_package() {
+  "$(aapt2_bin)" dump packagename "${APK}" 2>/dev/null | tr -d '\r' | head -1
+}
+
+# The FULLY QUALIFIED launcher activity, not `${PKG}/.MainActivity` — that
+# shorthand resolves the leading dot against the APPLICATION ID, and
+# applicationIdSuffix (".debug") makes that ${PKG} != the manifest's
+# declared `namespace` ("net.atticpad", never suffixed). `am start -n
+# net.atticpad.debug/.MainActivity` therefore looked for
+# net.atticpad.debug.MainActivity, which does not exist, and failed with
+# "Activity class ... does not exist" on every debug build once the suffix
+# was added -- this is the second half of the bug apk_package()'s own
+# comment above describes fixing; deriving the package id alone was not
+# enough because the component name has the exact same suffix trap in a
+# different spot. `aapt2 dump badging`'s launchable-activity line is
+# authoritative and already fully qualified, so there is nothing to derive.
+apk_launchable_activity() {
+  "$(aapt2_bin)" dump badging "${APK}" 2>/dev/null \
+    | sed -n "s/^launchable-activity: name='\([^']*\)'.*/\1/p" | head -1
 }
 
 adb_() {
@@ -104,12 +125,14 @@ case "${ACTION}" in
     do_build
     PKG="$(apk_package)"
     [[ -n "${PKG}" ]] || die "aapt2 returned no package id for ${APK}"
+    ACTIVITY="$(apk_launchable_activity)"
+    [[ -n "${ACTIVITY}" ]] || die "aapt2 returned no launchable-activity for ${APK}"
     log "package under test: ${PKG} (read from the APK, not assumed)"
     adb_ install -r "${APK}" >/dev/null
     log "running apad_selftest_run() on the device"
     adb_ shell am force-stop "${PKG}" || true
     adb_ logcat -c || true
-    adb_ shell am start -n "${PKG}/.MainActivity" --ez selftest true >/dev/null
+    adb_ shell am start -n "${PKG}/${ACTIVITY}" --ez selftest true >/dev/null
     # POLL, do not sleep-and-hope. A freshly installed app can take well over
     # four seconds to reach onCreate on a cold emulator, and a fixed sleep
     # turns that into "the self-test did not run" — the same mistake made

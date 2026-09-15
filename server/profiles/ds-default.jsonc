@@ -1,0 +1,127 @@
+{
+  // Nintendo DS / DSi default profile. Matches any HELLO whose decoded
+  // device_name CONTAINS "AtticPad DS" (server/src/profiles.c:
+  // apad_profiles_match() does a plain substring test against the whole
+  // device_name field). The DS client sends "AtticPad DS"; DSi mode sends
+  // "AtticPad DSi", which also contains "AtticPad DS" as a substring, so
+  // one file covers both without a second entry.
+  //
+  // TWO NAMING TRAPS, both load-bearing -- read profiles.c's own comment
+  // above apad_profiles_load() before renaming this file or loosening the
+  // match string:
+  //
+  // 1. FILENAME SORT ORDER. apad_profiles_match() returns the FIRST loaded
+  //    profile whose match_device matches, and the Linux host loads profiles
+  //    in filename-sorted order (server/src/profiles.c's comment above
+  //    apad_profiles_load()). generic-default.jsonc's match_device is ""
+  //    (an unconditional wildcard) -- so ANY device-specific profile whose
+  //    filename sorts AFTER "generic-default.jsonc" is dead code, silently
+  //    shadowed by the wildcard before it is ever tried. A more "natural"
+  //    name for this file, "nds-default.jsonc", falls exactly into that
+  //    trap: 'n' > 'g' in ASCII, so "generic-default.jsonc" would load
+  //    first and this profile would never be reached, no error, no log line
+  //    to say so. "ds-default.jsonc" was chosen because 'd' < 'g', which
+  //    sorts it before generic-default.jsonc regardless of what else ships
+  //    in this directory -- the same reason "3ds-default.jsonc" already
+  //    works ('3' < 'g' too).
+  //
+  // 2. MATCH-STRING SPECIFICITY. The match string here is "AtticPad DS",
+  //    not the bare substring "DS". "DS" alone would also match the 3DS
+  //    client's own device_name ("AtticPad 3DS" contains "DS" inside
+  //    "3DS") and any future device whose name happens to contain those two
+  //    letters -- an accident waiting for the next profile added to this
+  //    directory. It happens to be harmless FOR THE 3DS TODAY only because
+  //    "3ds-default.jsonc" sorts before this file ('3' < 'd') and therefore
+  //    wins the race regardless -- that is filename-order luck, not a
+  //    property of the match string, and the next profile someone adds
+  //    might not sort so conveniently. "AtticPad DS" is specific to this
+  //    device family's actual advertised name and matches nothing else.
+  "profile": "ds-default",
+  "match": { "device": "AtticPad DS" },
+
+  // Identity button naming, same reasoning as 3ds-default.jsonc: every DS
+  // game tells the player to "press A", and the DS's face-button layout is
+  // already the same diamond as an Xbox pad's (A right, B bottom, X top,
+  // Y left) -- unlike the 3DS, this isn't even overriding anything the
+  // physical-position default would have picked differently by coincidence
+  // of geometry, but it is spelled out explicitly rather than left to the
+  // built-in default so a reader doesn't have to go check.
+  "buttons": {
+    "A": "A", "B": "B", "X": "X", "Y": "Y",
+    "L": "LB", "R": "RB"
+    // L3/R3/START/SELECT/HOME left at the built-in default mapping
+    // (LTHUMB/RTHUMB/START/BACK/GUIDE) -- a DS HELLO never sets the L3/R3
+    // bits (no clickable sticks on the hardware, same as the 3DS) and
+    // START/SELECT are the DS's own labelled buttons, not stand-ins for
+    // anything else.
+  },
+
+  // No "sticks" or "triggers" section: this device's caps
+  // (DPAD|FACE4|SHOULDER|TOUCH, +BATTERY on DSi) never set APAD_CAP_STICK_L,
+  // APAD_CAP_STICK_R or APAD_CAP_TRIGGERS, so those profile sections would
+  // be inert (mapping.c's compute_stick()/apply_trigger_axis() gate every
+  // one of them on the client's own capability bit regardless of what a
+  // profile asks for) and are omitted rather than shipped as decoration.
+  //
+  // The bottom touchscreen is the DS's ONLY stick-shaped input, so it
+  // substitutes for the left stick (mapping.c's compute_stick(): touch
+  // substitute only activates when APAD_CAP_STICK_L is ABSENT and
+  // APAD_CAP_TOUCH is present -- exactly this device's caps). "mode":
+  // "absolute_stick" was chosen over "delta_stick", and that choice is
+  // specific to THIS device rather than a general touch-stick default:
+  //
+  //   - absolute_stick reads the touch point's raw screen position as the
+  //     stick deflection directly (mapping.c's compute_touch_stick():
+  //     dx = touches[0].x / 32768.0, already centred at screen-centre = 0
+  //     by the wire's own normalisation, §5.2/§5.3) -- thumb position IS
+  //     stick position, release snaps straight back to centre because
+  //     touch_count drops to 0. This matches how a DS player already reads
+  //     the bottom screen: it is a fixed drawing surface with a printed or
+  //     imagined "stick" region, not a trackpad they expect to feel
+  //     relative motion on. Games designed around the stylus (the
+  //     touchscreen's actual original purpose) already train the player to
+  //     think in absolute screen position, not relative drag.
+  //   - delta_stick (anchor-on-first-touch, move-relative-from-there,
+  //     return-to-centre on release -- see profiles.h's apad_touch_profile
+  //     comment) is the alternative a user who dislikes this can switch to
+  //     by editing this file: it behaves more like the analog nub on a
+  //     laptop or the touch-stick corner of a Vita/PSP-style overlay, where
+  //     the FIRST contact point becomes "centre" rather than the screen's
+  //     geometric centre. That is a better fit for a player who rests their
+  //     thumb somewhere comfortable rather than aiming for the middle of
+  //     the screen every time -- worth trying if absolute mode feels too
+  //     demanding of precise thumb placement in the exact centre.
+  //   - Neither is "regions" (3ds-default.jsonc's touch use): the DS's
+  //     touchscreen is this profile's ONLY stick, not a supplemental
+  //     trigger surface next to a working circle pad, so there is nothing
+  //     left over to spend on soft LT/RT zones without taking the stick
+  //     away.
+  //
+  // deadzone 0.05 (small, not 0): a thumb resting near the screen's exact
+  // geometric centre without meaning to move at all is far more likely on a
+  // flat glass surface with no physical detent than on a spring-centred
+  // circle pad (3ds-default.jsonc's stick deadzone is 0.08 for the OPPOSITE
+  // reason -- a circle pad's rest position itself drifts) -- a small dead
+  // disc around centre absorbs that without needing a big one, since unlike
+  // a circle pad there is no spring pulling the thumb back to a known rest
+  // position to drift away from. sensitivity 1.15: full stick deflection is
+  // reached slightly before the touch point reaches the literal screen edge
+  // (at magnitude 1/1.15 = ~87% of the way out), because the last few
+  // millimetres of a 256x192 touchscreen sit under the bezel lip and are
+  // uncomfortable to hold a thumb against for sustained analog movement.
+  // GUESS, not measured against a real DS: both numbers are picked for the
+  // same reason 3ds-default.jsonc's gyro numbers are flagged as guesses --
+  // first things to tune against a real player if this feels dead near
+  // centre (lower the deadzone) or requires uncomfortable full-reach thumb
+  // stretches (raise the sensitivity further).
+  "touch": {
+    "mode": "absolute_stick",
+    "stick": "left",
+    "sensitivity": 1.15,
+    "deadzone": 0.05
+  },
+
+  // No gyro: the DS and DSi have none (APAD_CAP_GYRO is never set in this
+  // device's caps).
+  "gyro": { "mode": "none" }
+}

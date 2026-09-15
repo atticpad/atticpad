@@ -884,7 +884,12 @@ quirc_decode_error_t quirc_decode(const struct quirc_code *code,
 				  struct quirc_data *data)
 {
 	quirc_decode_error_t err;
-	struct datastream ds;
+	/* AtticPad local patch: static, not automatic. This struct carries an
+	 * 8896-byte payload buffer; as a stack frame it is 9.3 KB on the ARM9 and
+	 * the Nintendo DS user stack is ~15 KB of DTCM -- it overflowed on real
+	 * hardware (2026-09-10). One decode runs at a time on every AtticPad
+	 * client, so file-scope storage is safe. See clients/vendor/quirc/README. */
+	static struct datastream ds;
 
 	if (code->size > QUIRC_MAX_GRID_SIZE)
 		return QUIRC_ERROR_INVALID_GRID_SIZE;
@@ -934,7 +939,12 @@ quirc_decode_error_t quirc_decode(const struct quirc_code *code,
 
 void quirc_flip(struct quirc_code *code)
 {
-	struct quirc_code flipped = {0};
+	/* AtticPad local patch: static, not automatic -- a ~4 KB struct that was
+	 * a 3984-byte stack frame on the ARM9, on a DS user stack of ~15 KB of
+	 * DTCM (2026-09-10). Re-zeroed on every call because a static persists.
+	 * See clients/vendor/quirc/README.md. */
+	static struct quirc_code flipped;
+	memset(&flipped, 0, sizeof flipped);
 	unsigned int offset = 0;
 	for (int y = 0; y < code->size; y++) {
 		for (int x = 0; x < code->size; x++) {

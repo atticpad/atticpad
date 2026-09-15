@@ -105,3 +105,16 @@ by grepping every `#include` in `lib/`.
   `struct quirc *` handle, created once per scan session and reused frame to
   frame (`quirc_resize()` is a no-op once the size matches). `apad_qr.c`
   gives Android exactly one such handle per in-app scan.
+
+## Local patches (keep across re-vendoring)
+
+`lib/decode.c`, 2026-09-10: two large automatic variables became file-scope
+statics -- `struct datastream ds` in `quirc_decode()` (an 8896-byte payload
+buffer, a 9296-byte stack frame on the ARM9) and `struct quirc_code flipped`
+in `quirc_flip()` (3984 bytes, now memset per call). The Nintendo DS runs its
+user stack in ~15 KB of DTCM; upstream's frames overflowed it and crashed the
+console mid-decode, while melonDS (which does not fault on a DTCM overflow)
+decoded fine -- the difference that hid the bug. One decode runs at a time on
+every AtticPad client, so the statics are safe; they cost ~13 KB of .bss. Each
+patched line carries an "AtticPad local patch" comment. Measured with
+`arm-none-eabi-gcc -fstack-usage` before/after; re-run it after re-vendoring.

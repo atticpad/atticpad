@@ -203,11 +203,17 @@ static void ui_build_state_json(ui_strbuf *out, const apad_server *server,
         sb_json_string(out, addrs[i].ip);
         sb_append(out, ",\"kind\":");
         sb_json_string(out, host_addr_kind_name(addrs[i].kind));
+        /* The physical medium (wifi/ethernet/other) as well as the kind:
+         * every home NIC is "lan", so the UI needs this to label an address
+         * and to order the list the same way host_pick_default_addr() does. */
+        sb_append(out, ",\"medium\":");
+        sb_json_string(out, host_addr_medium_name(addrs[i].medium));
         sb_append(out, "}");
     }
     sb_append(out, "]");
     /* Which address a fresh QR/URI defaults to (ipaddr.h
-     * host_pick_default_addr(): first LAN-classified address, else the
+     * host_pick_default_addr(): best (kind, medium) pair -- LAN over
+     * Tailscale over virtual, and within LAN, Wi-Fi over Ethernet, else the
      * first Tailscale one, else the first virtual one) -- the UI's address
      * selector (assets.h) preselects this, but the choice is not locked in:
      * the operator can pick any entry in own_ips above and /api/pair/qr.svg

@@ -173,7 +173,7 @@ static const char ATTICPAD_EDITOR_HTML[] =
 "\n"
 "var WIRE_BUTTONS = [\"A\",\"B\",\"X\",\"Y\",\"L\",\"R\",\"L3\",\"R3\",\"START\",\"SELECT\",\"HOME\"];\n"
 "var WIRE_BITS    = [0x1,0x2,0x4,0x8,0x100,0x200,0x1000,0x2000,0x4000,0x8000,0x10000];\n"
-"var PAD_TARGETS  = [\"NONE\",\"A\",\"B\",\"X\",\"Y\",\"LB\",\"RB\",\"BACK\",\"START\",\"GUIDE\",\"LTHUMB\",\"RTHUMB\"];\n"
+"var PAD_TARGETS  = [\"NONE\",\"A\",\"B\",\"X\",\"Y\",\"LB\",\"RB\",\"LT\",\"RT\",\"BACK\",\"START\",\"GUIDE\",\"LTHUMB\",\"RTHUMB\"];\n"
 "var TOUCH_TARGETS = [\"NONE\",\"LT\",\"RT\",\"A\",\"B\",\"X\",\"Y\",\"LB\",\"RB\",\"BACK\",\"START\",\"GUIDE\",\"LTHUMB\",\"RTHUMB\"];\n"
 "var CURVES = [\"linear\",\"quadratic\",\"cubic\"];\n"
 "var AXES = [\"pitch\",\"roll\",\"yaw\"];\n"

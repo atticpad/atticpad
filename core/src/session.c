@@ -31,7 +31,38 @@ static int type_is_reliable(uint8_t type)
     case APAD_MSG_STATUS:
         return 1;
     default:
+        /* KEYBOARD, MOUSE, MEDIA and INPUTCAPS fall through here DELIBERATELY,
+         * and §6.20 forces it rather than merely permitting it: making any of
+         * the four RELIABLE would require the peer to ACK it, a peer that
+         * predates the addition discards it under §4 and never ACKs, and §9's
+         * retransmit ladder would then tear the session down for failing to
+         * answer a message the peer is behaving correctly by ignoring. That
+         * trades a lost keystroke for a lost session. Not an oversight; do not
+         * "complete" this list. */
         return 0;
+    }
+}
+
+/* Which §6.20 window a received type belongs to, or -1 for everything else.
+ * §6.20's four windows are independent of one another AND of §9's, so this
+ * maps a type to a slot rather than sharing rx_input_seq.
+ *
+ * INPUTCAPS has a slot (APAD_KBM_CLASS_INPUTCAPS) but deliberately no case
+ * HERE, and the distinction is the whole reason this comment is long. This
+ * function feeds apad_session_on_recv, which BOTH peers call; the server
+ * never receives an INPUTCAPS at all, and the client must judge that window
+ * where it acts on the caps (it does not treat on_recv's result as a verdict
+ * on the payload). Routing it here as well would run the window twice per
+ * datagram, and the second call would report every INPUTCAPS after the first
+ * as stale -- silently killing the whole facility. So: the WINDOW is core's,
+ * shared and single; the ROUTING is per-peer. See apad_session_accept_kbm. */
+static int kbm_class_for_type(uint8_t type)
+{
+    switch (type) {
+    case APAD_MSG_KEYBOARD: return APAD_KBM_CLASS_KEYBOARD;
+    case APAD_MSG_MOUSE:    return APAD_KBM_CLASS_MOUSE;
+    case APAD_MSG_MEDIA:    return APAD_KBM_CLASS_MEDIA;
+    default:                return -1;
     }
 }
 
@@ -137,6 +168,16 @@ int apad_session_server_accept(apad_session *s,
      * the next INPUT_STATE seen simply becomes the newest. */
     s->rx_input_valid = 0u;
     s->rx_input_seq   = 0u;
+
+    /* §6.20: the same reset, for the same reason, on every per-type window.
+     * A reused pad slot would otherwise reject the new occupant's first
+     * ~32767 KEYBOARD / MOUSE / MEDIA packets as stale. Sized off the arrays
+     * rather than a literal count, so the INPUTCAPS slot added later is
+     * covered without this line being revisited -- a server never fills that
+     * slot, but clearing state a new occupant inherits is not something to
+     * make conditional on who happens to use it. */
+    memset(s->rx_kbm_valid, 0, sizeof s->rx_kbm_valid);
+    memset(s->rx_kbm_seq,   0, sizeof s->rx_kbm_seq);
 
     /* §8/§11: the 3-second idle timer only runs in ACTIVE, so it starts here.
      * apad_session_tick would otherwise never time a server session out --
@@ -258,6 +299,43 @@ int apad_session_accept_input(apad_session *s, uint16_t seq)
     return APAD_OK;
 }
 
+/*
+ * §6.20 per-type staleness window, one per enum apad_kbm_class -- all four,
+ * including INPUTCAPS, which a client passes in directly (§6.19 "latest
+ * wins": a reordered copy must not revive stale features/status).
+ *
+ * Same shape as apad_session_accept_input above, and pointedly NOT the same
+ * storage. §9's window is INPUT_STATE compared against INPUT_STATE; §9's
+ * remark that a peer MAY track the other direction as one monotonic series is
+ * a MAY, and a receiver that read it as licence to run one shared window
+ * would let a KEYBOARD at sequence 101 shadow an INPUT_STATE still in flight
+ * at 100 -- discarding live stick data as "stale" when it was merely
+ * interleaved. That failure is silent and looks exactly like packet loss.
+ */
+int apad_session_accept_kbm(apad_session *s, int cls, uint16_t seq)
+{
+    if (s == NULL) {
+        return APAD_ERR_ARG;
+    }
+    if (cls < 0 || cls >= (int)APAD_KBM_CLASS_COUNT) {
+        return APAD_ERR_ARG;
+    }
+    if (!s->rx_kbm_valid[cls]) {
+        s->rx_kbm_valid[cls] = 1u;
+        s->rx_kbm_seq[cls]   = seq;
+        return APAD_OK;
+    }
+    /* Not strictly newer than the newest of THIS TYPE already accepted, so
+     * discard. Equal counts as stale -- it is a duplicate. A caller that
+     * ignored this would jerk the pointer backwards (§6.16's baseline rule)
+     * or apply an old snapshot and un-press keys the user is still holding. */
+    if (!apad_seq_newer(seq, s->rx_kbm_seq[cls])) {
+        return APAD_ERR_STALE;
+    }
+    s->rx_kbm_seq[cls] = seq;
+    return APAD_OK;
+}
+
 int apad_session_on_recv(apad_session *s, const apad_packet *pkt, uint32_t now)
 {
     if (s == NULL || pkt == NULL) {
@@ -279,6 +357,19 @@ int apad_session_on_recv(apad_session *s, const apad_packet *pkt, uint32_t now)
         int rc = apad_session_accept_input(s, pkt->header.sequence);
         if (rc != APAD_OK) {
             return rc;   /* caller drops the payload; the session stays alive */
+        }
+    }
+
+    /* §6.20: KEYBOARD, MOUSE and MEDIA each get their own window, judged the
+     * same way and after the same idle-timer refresh. Three types, one call,
+     * three independent slots -- see kbm_class_for_type. */
+    {
+        int cls = kbm_class_for_type(pkt->header.type);
+        if (cls >= 0) {
+            int rc = apad_session_accept_kbm(s, cls, pkt->header.sequence);
+            if (rc != APAD_OK) {
+                return rc;   /* stale: drop the payload, keep the session */
+            }
         }
     }
 

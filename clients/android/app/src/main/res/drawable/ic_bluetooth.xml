@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Bluetooth-controller card header glyph (MainActivity's fourth connect-
-  screen card, BtControllerActivity's own headers) — the classic Bluetooth
+  Bluetooth-controller header glyph (MainActivity's Bluetooth setup screen)
+  — the classic Bluetooth
   rune as a single continuous stroke, same 24x24 grid / 1.7 stroke / round
   caps as every other icon in this directory (see ic_scan.xml's header
   comment for why that consistency matters). Point layout follows the same

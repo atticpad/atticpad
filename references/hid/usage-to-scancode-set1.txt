@@ -1,0 +1,227 @@
+# HID Usage Page 0x07 (Keyboard/Keypad) -> PS/2 Scan Code Set 1
+#
+# THIS IS THE HIGHEST-RISK FILE IN references/hid/. There is no kernel array to
+# transcribe here the way usage-to-evdev.txt has one. Read references/hid/README.md
+# before using this file -- it explains the cross-check method below and names
+# every row this file could not fully resolve to a single clean value.
+#
+# PRIMARY SOURCE (authoritative for the byte values):
+#   Microsoft "Keyboard Scan Code Specification", Revision 1.3a, March 16 2000.
+#   Windows Platform Design Notes. Appendix A ("Windows Standard PS/2 Scan
+#   Codes" -- key location, Scan Code Set 1 make/break) cross-referenced
+#   against Appendix C ("USB Keyboard/Keypad Page (0x07)" -- usage id -> the
+#   SAME "AT-101 position" numbers Appendix A uses). This is the one document
+#   that ties a USB HID usage ID directly to a Set 1 byte through a shared key
+#   numbering scheme, rather than requiring this file to infer the
+#   correspondence itself.
+#   Downloaded directly from Microsoft: https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/scancode.doc
+#   (native .doc, Word 97 binary format; opened via `strings` extraction, see
+#   README for why). A PDF transcription of the same revision was cross-read
+#   for layout: https://christophervickery.com/babbage/courses/cs345/ms_scancodes.pdf
+#   Licence: no explicit licence grant in the document; Microsoft's standard
+#   "for informational purposes" disclaimer (see full text preserved in
+#   references/hid/README.md). Treated as freely readable reference
+#   documentation, not redistributed here beyond the derived byte values below.
+#   Fetched: 2026-08-25.
+#
+# INDEPENDENT CROSS-CHECK SOURCE:
+#   Andries Brouwer, "Keyboard scancodes", section 1 ("Scan code set 1").
+#   https://aeb.win.tue.nl/linux/kbd/scancodes-1.html (mirrors
+#   www.win.tue.nl/~aeb/linux/kbd/, the long-standing Linux keyboard-driver
+#   reference cited from the kernel's own Documentation/ historically).
+#   No licence statement found on the page; treated as reference documentation
+#   only, same as the Microsoft source -- only the specific byte values that
+#   matched were used to corroborate, nothing was copied verbatim.
+#   Fetched: 2026-08-25.
+#
+# Every row below marked "no" or "yes" in the Ext column was checked against
+# BOTH sources and they agreed exactly -- there is no unresolved value
+# disagreement between the two sources for any row in this file. What they did
+# NOT agree on, because it isn't really about scancode values: see "THE
+# ROW-DOUBLING ANOMALY" in README.md. Short version -- the primary Microsoft
+# .doc itself prints, for almost every key, a second "E0_"-prefixed copy of
+# that key's own byte values directly underneath the real row, including for
+# keys with no possible extended form (Backspace, Tab, digits, letters, Space).
+# This file uses ONLY the first (non-"E0_"-doubled) row for a key's base
+# value, and marks a key "Ext = yes" ONLY where the independent source
+# (Brouwer) *also* independently lists that exact key among its "escaped
+# scancodes", or where the Microsoft document's own prose/Notes 1-5 or a
+# key's SOLE row (Left Win, Right Win, Application, R Alt, R Ctrl -- which
+# print only the E0-prefixed row, no bare duplicate) settle it. Nobody should
+# take the doubled "E0_" rows in the primary .doc as data; this file didn't.
+#
+# Format: one row per usage, tab-separated:
+#   <usage hex>	<usage name>	<make bytes>	<break bytes>	<Ext>	<note>
+# "make"/"break" are the literal Set 1 byte sequence to send, MSB-first as
+# written (e.g. "E0 4B" means send 0xE0 then 0x4B). Ext=yes means this key's
+# host injector MUST set KEYEVENTF_EXTENDEDKEY (SendInput) / treat it as an
+# extended scancode; Ext=no means a plain single-byte scancode. Ext=- marks a
+# row that isn't a simple make/break pair at all (PrintScreen, Pause) -- see
+# the SPECIAL notes at the end; do not treat their "make"/"break" fields as a
+# literal two-value pair, read the note.
+#
+# THE EXTENDED-KEY RULE, stated plainly: Set 1 reused the plain keypad byte
+# range (0x47-0x53-ish) for the newer 101-key arrow/nav cluster, and
+# disambiguates the two physical keys that share a byte purely by whether an
+# 0xE0 prefix preceded it. A numeric keypad "4/Left" key press and a dedicated
+# arrow-cluster Left Arrow press can carry the IDENTICAL trailing byte (0x4B);
+# only the E0 prefix says which key it was. This is why several rows below
+# for usages 0x59-0x63 (the dual-function keypad digits) show the same
+# trailing byte as the corresponding arrow-cluster usage at 0x49-0x52, one
+# Ext=no and the other Ext=yes -- that is not a copy-paste error in this file,
+# it is Set 1's actual design, confirmed identically by both sources.
+#
+# Scope: usages 0x00-0x65 and 0xE0-0xE7, chosen per the task's guidance to
+# prioritise the keys a client will actually send (letters, digits, F1-F12,
+# modifiers, arrows, Enter/Space/Tab/Esc/Backspace/Delete, punctuation,
+# keypad) over exhaustive HID coverage. Usages 0x66-0xDF and 0xE8-0xFF
+# (locking Caps/Num/Scroll variants, F13-F24, Kanji/LANG IME keys,
+# Execute/Help/Menu/Select/Stop/Again/Undo/Cut/Copy/Paste/Find, Mute/Volume,
+# Power, Keypad =, etc.) have NO Scan Code Set 1 assignment in the Microsoft
+# document's Appendix A/C tables at all -- they were simply never given an
+# AT-101 position, so there is nothing to extract, not something this file
+# chose to omit. §6.15 of docs/PROTOCOL.md doesn't route media keys (mute,
+# volume) through KEYBOARD at all -- see §6.17 MEDIA -- so their absence here
+# does not create a gap for anything a client is expected to send under this
+# message type.
+#
+# Usage 0x00-0x03 have no scancode -- HID status conditions, not physical
+# keys (same reservation as docs/PROTOCOL.md §6.15 makes for `keys[]`).
+
+0x00	Reserved (no event)		no mapping (status, not a key)
+0x01	Keyboard ErrorRollOver		no mapping (status, not a key)
+0x02	Keyboard POSTFail		no mapping (status, not a key)
+0x03	Keyboard ErrorUndefined		no mapping (status, not a key)
+0x04	Keyboard a and A	1E	9E	no
+0x05	Keyboard b and B	30	B0	no
+0x06	Keyboard c and C	2E	AE	no
+0x07	Keyboard d and D	20	A0	no
+0x08	Keyboard e and E	12	92	no
+0x09	Keyboard f and F	21	A1	no
+0x0A	Keyboard g and G	22	A2	no
+0x0B	Keyboard h and H	23	A3	no
+0x0C	Keyboard i and I	17	97	no
+0x0D	Keyboard j and J	24	A4	no
+0x0E	Keyboard k and K	25	A5	no
+0x0F	Keyboard l and L	26	A6	no
+0x10	Keyboard m and M	32	B2	no
+0x11	Keyboard n and N	31	B1	no
+0x12	Keyboard o and O	18	98	no
+0x13	Keyboard p and P	19	99	no
+0x14	Keyboard q and Q	10	90	no
+0x15	Keyboard r and R	13	93	no
+0x16	Keyboard s and S	1F	9F	no
+0x17	Keyboard t and T	14	94	no
+0x18	Keyboard u and U	16	96	no
+0x19	Keyboard v and V	2F	AF	no
+0x1A	Keyboard w and W	11	91	no
+0x1B	Keyboard x and X	2D	AD	no
+0x1C	Keyboard y and Y	15	95	no
+0x1D	Keyboard z and Z	2C	AC	no
+0x1E	Keyboard 1 and !	02	82	no
+0x1F	Keyboard 2 and @	03	83	no
+0x20	Keyboard 3 and #	04	84	no
+0x21	Keyboard 4 and $	05	85	no
+0x22	Keyboard 5 and %	06	86	no
+0x23	Keyboard 6 and ^	07	87	no
+0x24	Keyboard 7 and &	08	88	no
+0x25	Keyboard 8 and *	09	89	no
+0x26	Keyboard 9 and (	0A	8A	no
+0x27	Keyboard 0 and )	0B	8B	no
+0x28	Keyboard Return (ENTER)	1C	9C	no
+0x29	Keyboard ESCAPE	01	81	no
+0x2A	Keyboard DELETE (Backspace)	0E	8E	no
+0x2B	Keyboard Tab	0F	8F	no
+0x2C	Keyboard Spacebar	39	B9	no
+0x2D	Keyboard - and _	0C	8C	no
+0x2E	Keyboard = and +	0D	8D	no
+0x2F	Keyboard [ and {	1A	9A	no
+0x30	Keyboard ] and }	1B	9B	no
+0x31	Keyboard \ and |	2B	AB	no	US layout only (MS Note *, key 29); International layout uses 0x32 for the physically equivalent key instead
+0x32	Keyboard Non-US # and ~	2B	AB	no	International layout only (MS Note **, key 42); same byte value as 0x31 -- the two usages are mutually exclusive by keyboard layout, not a duplicate mapping error
+0x33	Keyboard ; and :	27	A7	no
+0x34	Keyboard ' and "	28	A8	no
+0x35	Keyboard Grave Accent and Tilde	29	A9	no
+0x36	Keyboard , and <	33	B3	no
+0x37	Keyboard . and >	34	B4	no
+0x38	Keyboard / and ?	35	B5	no
+0x39	Keyboard CapsLock	3A	BA	no
+0x3A	Keyboard F1	3B	BB	no
+0x3B	Keyboard F2	3C	BC	no
+0x3C	Keyboard F3	3D	BD	no
+0x3D	Keyboard F4	3E	BE	no
+0x3E	Keyboard F5	3F	BF	no
+0x3F	Keyboard F6	40	C0	no
+0x40	Keyboard F7	41	C1	no
+0x41	Keyboard F8	42	C2	no
+0x42	Keyboard F9	43	C3	no
+0x43	Keyboard F10	44	C4	no
+0x44	Keyboard F11	57	D7	no
+0x45	Keyboard F12	58	D8	no
+0x46	Keyboard PrintScreen	-	-	-	SPECIAL: see PrintScreen note below, not a plain make/break pair
+0x47	Keyboard ScrollLock	46	C6	no
+0x48	Keyboard Pause	-	-	-	SPECIAL: see Pause note below, not a plain make/break pair, no break code at all
+0x49	Keyboard Insert	52	D2	yes
+0x4A	Keyboard Home	47	C7	yes
+0x4B	Keyboard PageUp	49	C9	yes
+0x4C	Keyboard Delete Forward	53	D3	yes
+0x4D	Keyboard End	4F	CF	yes
+0x4E	Keyboard PageDown	51	D1	yes
+0x4F	Keyboard RightArrow	4D	CD	yes
+0x50	Keyboard LeftArrow	4B	CB	yes
+0x51	Keyboard DownArrow	50	D0	yes
+0x52	Keyboard UpArrow	48	C8	yes
+0x53	Keypad NumLock and Clear	45	C5	no
+0x54	Keypad /	35	B5	yes	shares trailing byte with 0x38 "/ and ?"; E0 prefix is what disambiguates the keypad key from the main one
+0x55	Keypad *	37	B7	no
+0x56	Keypad -	4A	CA	no
+0x57	Keypad +	4E	CE	no
+0x58	Keypad ENTER	1C	9C	yes	shares trailing byte with 0x28 Return; E0 prefix is what disambiguates
+0x59	Keypad 1 and End	4F	CF	no	same trailing byte as 0x4D End (Ext=yes there) -- see the extended-key rule note above
+0x5A	Keypad 2 and Down Arrow	50	D0	no	same trailing byte as 0x51 DownArrow (Ext=yes there)
+0x5B	Keypad 3 and PageDn	51	D1	no	same trailing byte as 0x4E PageDown (Ext=yes there)
+0x5C	Keypad 4 and Left Arrow	4B	CB	no	same trailing byte as 0x50 LeftArrow (Ext=yes there)
+0x5D	Keypad 5	4C	CC	no
+0x5E	Keypad 6 and Right Arrow	4D	CD	no	same trailing byte as 0x4F RightArrow (Ext=yes there)
+0x5F	Keypad 7 and Home	47	C7	no	same trailing byte as 0x4A Home (Ext=yes there)
+0x60	Keypad 8 and Up Arrow	48	C8	no	same trailing byte as 0x52 UpArrow (Ext=yes there)
+0x61	Keypad 9 and PageUp	49	C9	no	same trailing byte as 0x4B PageUp (Ext=yes there)
+0x62	Keypad 0 and Insert	52	D2	no	same trailing byte as 0x49 Insert (Ext=yes there)
+0x63	Keypad . and Delete	53	D3	no	same trailing byte as 0x4C Delete Forward (Ext=yes there)
+0x64	Keyboard Non-US \ and |	56	D6	no	International layout only (MS "key 45**")
+0x65	Keyboard Application	5D	DD	yes	the Microsoft document's Appendix A only ever prints this key's row E0-prefixed; there is no meaningful bare "5D" form to fall back to
+0xE0	Keyboard LeftControl	1D	9D	no
+0xE1	Keyboard LeftShift	2A	AA	no
+0xE2	Keyboard LeftAlt	38	B8	no
+0xE3	Keyboard Left GUI	5B	DB	yes	Left Win; same reasoning as 0x65 -- Appendix A prints only the E0-prefixed row for this key
+0xE4	Keyboard RightControl	1D	9D	yes	same trailing bytes as 0xE0 LeftControl; E0 prefix is what disambiguates left/right
+0xE5	Keyboard RightShift	36	B6	no	NOT the same byte as LeftShift (0x2A) -- Right Shift has its own dedicated Set 1 byte, unlike Ctrl/Alt/GUI which reuse the left key's byte under an E0 prefix
+0xE6	Keyboard RightAlt	38	B8	yes	same trailing bytes as 0xE2 LeftAlt; E0 prefix is what disambiguates left/right
+0xE7	Keyboard Right GUI	5C	DC	yes	Right Win; same reasoning as 0x65 and 0xE3
+
+# --- SPECIAL: usages that are not a plain make/break pair ---
+#
+# 0x46 Keyboard PrintScreen (MS document Note 4, key 124). The byte sequence
+# actually sent depends on which modifier is already held, which a simple
+# usage->scancode table cannot express as one row:
+#   no modifier held:            make = E0 2A E0 37   break = E0 B7 E0 AA
+#   Ctrl or Shift already held:  make = E0 37          break = E0 B7
+#   Alt already held:            make = 54             break = D4   (NOT E0-prefixed at all)
+# Both sources agree on all three variants. Recommendation:
+# on the Windows backend, inject this via SendInput with VK_SNAPSHOT rather
+# than attempting to reproduce the modifier-dependent raw scancode sequence --
+# this is also how real-world PrintScreen injection is normally done, because
+# raw-scancode PrintScreen delivery is known to be unreliable across Windows
+# versions. That recommendation was not independently verified against
+# current Windows behaviour; flag it for whoever implements the Windows
+# keyboard backend to confirm.
+#
+# 0x48 Keyboard Pause (MS document Note 5, key 126). Not typematic, and has
+# NO break code at all -- the make sequence is the entire event:
+#   no modifier held:   make = E1 1D 45 E1 9D C5   (E1-prefixed, 6 bytes)
+#   Ctrl already held:  make = E0 46 E0 C6           ("Ctrl-Break", reuses
+#                        ScrollLock's byte 46/C6, E0-prefixed instead of E1)
+# Both sources agree exactly. Recommendation: use
+# VK_PAUSE via SendInput on Windows rather than the raw E1 sequence, for the
+# same reliability reason as PrintScreen above -- also unverified against
+# current Windows behaviour, flag for confirmation.

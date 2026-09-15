@@ -40,7 +40,7 @@ import android.util.Log
  * choice for the client on its own merits — the test docs/DESIGN.md §7.2 sets for
  * whether "designing with X in mind" is foresight or speculation.
  */
-class AtticPadService : Service() {
+class AtticPadService : Service(), SessionTransport {
 
     companion object {
         private const val TAG = "AtticPadService"
@@ -89,7 +89,22 @@ class AtticPadService : Service() {
         val authState: Int = AtticPadNative.AUTH_NONE,
         /** §6.11 ERROR code, 0 if none. */
         val errorCode: Int = 0,
+        /** §6.19 INPUTCAPS — the mode bar's gate. 0 until the first one
+         *  arrives; see [AtticPadNative.OUT_KBM_SERIAL]'s doc. */
+        val kbmSerial: Int = 0,
+        /** APAD_KBM_FEATURE_*: which of §6.15-6.17 the server accepts. */
+        val kbmFeatures: Int = 0,
+        /** APAD_KBM_STATUS_*: what exists right now. */
+        val kbmStatus: Int = 0,
+        /** Which §6.18 controls the server will actually drive. */
+        val kbmMediaMask: Int = 0,
     ) {
+        /** The mode bar (MainActivity) is GONE until this is true — a v1
+         *  server, or one this client has not yet handshaken with, has no
+         *  INPUTCAPS at all and showing a keyboard it will silently drop
+         *  is worse than not showing one. */
+        val kbmAvailable: Boolean
+            get() = kbmSerial != 0 && kbmFeatures != 0
         /** The UI must ask for a PIN before this address will accept us. */
         val needsSecret: Boolean
             get() = authState == AtticPadNative.AUTH_NEED_SECRET ||
@@ -101,8 +116,15 @@ class AtticPadService : Service() {
         val service: AtticPadService get() = this@AtticPadService
     }
 
-    /** Every input source writes here; the session thread reads it. */
-    val input = InputSnapshot()
+    /** Every input source writes here; the session thread reads it. Also
+     *  [SessionTransport.input] — the UDP half of the one interface
+     *  [MainActivity]'s session UI binds to, alongside [BluetoothTransport]. */
+    override val input = InputSnapshot()
+
+    /** §6.15-6.17 keyboard/mouse/media — [KbmSnapshot]'s own producers
+     *  (TrackpadView, KeyGridView, TextEntryBar, MediaRemoteView) write
+     *  here; the session thread reads it every pump alongside [input]. */
+    override val kbm = KbmSnapshot()
 
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
@@ -394,6 +416,7 @@ class AtticPadService : Service() {
 
             while (running && !Thread.currentThread().isInterrupted) {
                 input.readInto(inArr)
+                kbm.readInto(inArr)
                 // 20 ms cap so a server that goes quiet still lets this loop
                 // notice `running` went false within one frame of the user
                 // pressing Disconnect.
@@ -431,6 +454,10 @@ class AtticPadService : Service() {
                         authRequired = outArr[AtticPadNative.OUT_AUTH_REQUIRED] == 1,
                         authState = outArr[AtticPadNative.OUT_AUTH_STATE],
                         errorCode = outArr[AtticPadNative.OUT_ERROR_CODE],
+                        kbmSerial = outArr[AtticPadNative.OUT_KBM_SERIAL],
+                        kbmFeatures = outArr[AtticPadNative.OUT_KBM_FEATURES],
+                        kbmStatus = outArr[AtticPadNative.OUT_KBM_STATUS],
+                        kbmMediaMask = outArr[AtticPadNative.OUT_KBM_MEDIA_MASK],
                     )
                     publish(s)
                     main.post { updateNotification() }

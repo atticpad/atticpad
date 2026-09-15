@@ -55,6 +55,45 @@ extern const char    *apad_profile_wire_btn_names[APAD_PROFILE_BTN_COUNT];
  * lookup over the existing, unmodified g_pad_btn_names table. */
 const char *apad_pad_btn_name(uint16_t bit);
 
+/*
+ * A wire button may target one of the two ANALOG triggers instead of a
+ * digital pad button ("buttons": { "L": "LT" }). apad_profile::btn_trigger[]
+ * holds one of these per wire button; APAD_BTN_TRIGGER_NONE is the normal
+ * case and the only value a profile that never says "LT"/"RT" ever has.
+ *
+ * Why this is not just another entry in g_pad_btn_names: LT/RT are not
+ * buttons at all on the backend side -- apad_pad_state carries them as
+ * int16 lt/rt, not as APAD_PADBTN_* bits (backend.h) -- so there is no bit
+ * to put in btn_pad_bit[]. A wire button mapped to a trigger therefore has
+ * btn_pad_bit == 0 AND a non-NONE btn_trigger, and mapping.c combines it
+ * with every other source of that trigger by taking the larger value.
+ *
+ * Devices this exists for: a PSP has L and R and nothing else in that
+ * corner (no ZL/ZR, no touchscreen), so before this the analog triggers
+ * were unreachable for it -- the §5.4 ZL/ZR fallback needs buttons it does
+ * not have and touch regions need a screen it does not have. A 3DS/DS user
+ * who prefers L on LT rather than LB is the same case with a choice in it.
+ */
+typedef enum {
+    APAD_BTN_TRIGGER_NONE = 0,
+    APAD_BTN_TRIGGER_LT,
+    APAD_BTN_TRIGGER_RT
+} apad_btn_trigger_t;
+
+/*
+ * The JSON spelling of wire button `index`'s target, over BOTH vocabularies
+ * at once: "LT"/"RT" when btn_trigger[index] says so, else
+ * apad_pad_btn_name(btn_pad_bit[index]) ("A", "LB", ..., "NONE").
+ *
+ * Anything that reports a profile's button map must go through this rather
+ * than apad_pad_btn_name(btn_pad_bit[i]) directly, which would report every
+ * trigger-mapped button as "NONE" -- silently, and (for the web editor)
+ * destructively, since such a report round-trips back through a PUT.
+ * Returns "NONE" for an out-of-range index.
+ */
+struct apad_profile;
+const char *apad_profile_btn_target_name(const struct apad_profile *p, int index);
+
 typedef enum {
     APAD_CURVE_LINEAR = 0,
     APAD_CURVE_QUADRATIC,
@@ -164,6 +203,11 @@ typedef struct apad_profile {
     char                  name[APAD_PROFILE_NAME_LEN];
     char                  match_device[APAD_PROFILE_NAME_LEN]; /* "" = matches anything */
     uint16_t              btn_pad_bit[APAD_PROFILE_BTN_COUNT]; /* 0 = dropped */
+    /* apad_btn_trigger_t per wire button; APAD_BTN_TRIGGER_NONE (0) except
+     * for a button a profile aimed at an analog trigger, which then has
+     * btn_pad_bit == 0. Stored narrow rather than as the enum so this array
+     * costs 11 bytes next to btn_pad_bit's 22. */
+    uint8_t               btn_trigger[APAD_PROFILE_BTN_COUNT];
     apad_stick_profile    left, right;
     apad_trigger_profile  trigger;
     apad_touch_profile    touch;

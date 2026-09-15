@@ -15,6 +15,7 @@
 
 #include "atticpad/protocol.h"
 #include "atticpad/input.h"
+#include "atticpad/kbm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,35 @@ int      apad_seq_newer(uint16_t a, uint16_t b);
 int      apad_seq_diff(uint16_t a, uint16_t b);
 /* Next sequence number. Present so callers never write `seq + 1` by hand. */
 uint16_t apad_seq_next(uint16_t s);
+
+/*
+ * §6.20 step 2 — how many trailing slots of an event ring to replay.
+ *
+ * `event_seq` is the ordinal the datagram carries, `last_seq` the highest
+ * this receiver has already acted on for that type, `ring_len` the ring's
+ * depth (APAD_KEYBOARD_RING_DEPTH, or APAD_MOUSE_/APAD_MEDIA_RING_DEPTH).
+ * Returns 0..ring_len; replay runs from slot (ring_len - result) to slot
+ * (ring_len - 1) ASCENDING, skipping "no event" slots. `out_overflow` may be
+ * NULL; it is set when the gap exceeded ring_len, i.e. events were lost that
+ * the ring cannot carry, which §6.20 requires be surfaced rather than
+ * swallowed.
+ *
+ * IT NEVER RETURNS A NEGATIVE OR AN ERROR, AND THAT IS A DELIBERATE API
+ * DECISION. §6.20 step 3 requires the caller to reconcile held state against
+ * the snapshot UNCONDITIONALLY — including when nothing is new, and including
+ * on overflow — because that is the whole convergence argument: it makes
+ * every divergence from a non-conforming sender last exactly one packet
+ * instead of forever. A function that returned APAD_ERR_STALE here would
+ * invite `if (n < 0) return;`, which skips the reconcile and reintroduces
+ * precisely the permanent-divergence bug. So a gap of zero or less returns 0,
+ * meaning "replay nothing" — and the caller still reconciles.
+ *
+ * Do NOT call this for the FIRST accepted message of a type. §6.20 step 1
+ * makes that case set last_applied = event_seq, apply NO events and apply the
+ * snapshot: the ring's contents predate the receiver's interest in them.
+ */
+int      apad_event_ring_new(uint16_t event_seq, uint16_t last_seq,
+                             int ring_len, int *out_overflow);
 
 /* true if a is strictly after b, correct across the 2^32 wrap (~49.7 days). */
 int      apad_time_after(uint32_t a, uint32_t b);
@@ -200,7 +230,8 @@ typedef struct {                       /* §6.7 RUMBLE, 8 bytes */
     uint16_t duration_ms;              /* 0 = until superseded */
 } apad_rumble;
 
-/* v2 EXPERIMENT (branch experiment/touchmap-v2) -- TOUCHMAP 0x43.
+/* TOUCHMAP 0x43 -- docs/PROTOCOL.md §6.12, added after the v1 freeze under
+ * the §6.14 additivity ruling.
  *
  * Lets the server tell a client what its touchscreen currently maps to, so a
  * client can DRAW the real layout instead of a hardcoded guess. The 3DS
@@ -286,7 +317,7 @@ int apad_encode_bye        (uint8_t *b, size_t cap, const apad_bye        *in);
 int apad_decode_bye        (const uint8_t *b, size_t len, apad_bye        *out);
 int apad_encode_ping       (uint8_t *b, size_t cap, const apad_ping       *in);
 int apad_decode_ping       (const uint8_t *b, size_t len, apad_ping       *out);
-/* v2 EXPERIMENT (experiment/touchmap-v2) */
+/* §6.12 */
 int apad_encode_touchmap   (uint8_t *b, size_t cap, const apad_touchmap   *in);
 int apad_decode_touchmap   (const uint8_t *b, size_t len, apad_touchmap   *out);
 
@@ -316,6 +347,43 @@ int apad_decode_error      (const uint8_t *b, size_t len, apad_error      *out);
  */
 int apad_encode_input_state(uint8_t *b, size_t cap, const apad_input_state *in);
 int apad_decode_input_state(const uint8_t *b, size_t len, apad_input_state *out);
+
+/*
+ * §6.15-§6.19 KEYBOARD, MOUSE, MEDIA and INPUTCAPS. The structs are in
+ * atticpad/kbm.h; the same return convention and the same reserved-field
+ * discipline as every pair above.
+ *
+ * The decoders apply, and the encoders do NOT, these value normalisations —
+ * the §6.0 split again, and for the reason battery and player_index are
+ * decode-only: each is a reserved NUMERIC RANGE, so a caller that puts one on
+ * the wire has a bug that should stay visible rather than be laundered.
+ *   - KEYBOARD: an events[] slot whose usage is 0..3 decodes as usage 0 AND
+ *     flags 0 (§6.15)
+ *   - MOUSE: a button outside 1..5 decodes as button 0 AND flags 0 (§6.16)
+ *   - MEDIA: a control outside §6.18's assigned 1..24 decodes as control 0
+ *     AND flags 0 (§6.17)
+ * "AND flags 0" is not incidental: it is what makes a "no event" slot decode
+ * byte-identically whatever a non-conforming sender transmitted, which is
+ * what lets a conformance vector compare two decoded structures for exact
+ * equality (§6.15).
+ *
+ * Reserved BITS are masked on both sides as everywhere else (§2): keys[0]
+ * bits 0-3, event flags bits 1-7, MOUSE.buttons bits 5-15, MEDIA.held and
+ * INPUTCAPS.media_mask bits 24-31, features bits 3-31, status bits 4-31.
+ *
+ * What a decoder deliberately does NOT touch: HID usages 0xA5-0xAF,
+ * 0xDE-0xDF and 0xE8-0xFF, which HID 1.12 leaves reserved. §6.15 requires
+ * them passed through unchanged so a frozen decoder does not hard-code one
+ * revision of the HID specification.
+ */
+int apad_encode_keyboard   (uint8_t *b, size_t cap, const apad_keyboard   *in);
+int apad_decode_keyboard   (const uint8_t *b, size_t len, apad_keyboard   *out);
+int apad_encode_mouse      (uint8_t *b, size_t cap, const apad_mouse      *in);
+int apad_decode_mouse      (const uint8_t *b, size_t len, apad_mouse      *out);
+int apad_encode_media      (uint8_t *b, size_t cap, const apad_media      *in);
+int apad_decode_media      (const uint8_t *b, size_t len, apad_media      *out);
+int apad_encode_inputcaps  (uint8_t *b, size_t cap, const apad_inputcaps  *in);
+int apad_decode_inputcaps  (const uint8_t *b, size_t len, apad_inputcaps  *out);
 
 /* ======================================================================== */
 /* §10 SHA-256 / HMAC / PBKDF2                                               */
@@ -349,7 +417,9 @@ void apad_hmac_sha256(const uint8_t *key, size_t key_len,
                       uint8_t out[APAD_SHA256_DIGEST_LEN]);
 
 /* §10 — PBKDF2-HMAC-SHA256. `iterations` must be >= 1. No allocation: the
- * whole derivation runs in about 200 bytes of stack. */
+ * whole derivation runs in a fixed frame — about 700 bytes for the driver
+ * (two saved SHA-256 contexts plus a working copy), ~1.2 KB peak including
+ * the SHA-256 message schedule. */
 void apad_pbkdf2_sha256(const uint8_t *pw, size_t pw_len,
                         const uint8_t *salt, size_t salt_len,
                         uint32_t iterations,
@@ -419,6 +489,44 @@ enum apad_session_close {
 };
 
 /*
+ * §6.20 — the receive windows for KEYBOARD, MOUSE, MEDIA and INPUTCAPS are
+ * INDEPENDENT of one another and of §9's INPUT_STATE window, so each needs
+ * its own slot. This enum indexes rx_kbm_seq[] / rx_kbm_valid[] below and is
+ * the `cls` argument of apad_session_accept_kbm.
+ *
+ * ALL FOUR OF §6.20'S WINDOWS LIVE HERE, INCLUDING THE SERVER->CLIENT ONE.
+ * INPUTCAPS was left out when the first three landed, on the reasoning that
+ * core windows only what core routes and the server never receives an
+ * INPUTCAPS. That produced the wrong outcome: §6.20 states ONE rule for four
+ * types, nothing in the tree implemented the fourth, and a reordered
+ * INPUTCAPS would have revived stale `features`/`status` — which §6.19's
+ * "latest wins" forbids, and whose observable cost is a cleared feature bit
+ * coming back and a client resuming a type the server has stopped accepting.
+ * One rule, one implementation (the argument §9 makes for its own helpers);
+ * a client passes APAD_KBM_CLASS_INPUTCAPS and gets the identical window.
+ *
+ * A SESSION USES EITHER THE FIRST THREE SLOTS OR THE FOURTH, NEVER BOTH: the
+ * three client->server types can only be received by a server, the one
+ * server->client type only by a client. Three bytes of the four-slot array
+ * are therefore always idle on any given peer. That is deliberate — the cost
+ * is measured (see the size note on apad_session below) and it buys a single
+ * shared implementation instead of a private copy of the same window living
+ * in client code, out of reach of anything core can test.
+ *
+ * Appending a value is safe: this enum is NOT wire-visible (it indexes
+ * internal arrays and nothing else), so it does not touch the v1 freeze —
+ * the same precedent as APAD_CLOSE_PEER_ERROR above. Do NOT renumber the
+ * first three.
+ */
+enum apad_kbm_class {
+    APAD_KBM_CLASS_KEYBOARD = 0,
+    APAD_KBM_CLASS_MOUSE,
+    APAD_KBM_CLASS_MEDIA,
+    APAD_KBM_CLASS_INPUTCAPS,   /* §6.19, server->client: the client's slot */
+    APAD_KBM_CLASS_COUNT
+};
+
+/*
  * One session. Caller-owned, zero allocation, ~80 bytes. The server keeps an
  * array of APAD_MAX_SESSIONS of these; a client keeps one.
  *
@@ -436,6 +544,15 @@ typedef struct {
     uint16_t rx_input_seq;     /* newest INPUT_STATE sequence accepted      */
     uint8_t  rx_input_valid;
     uint8_t  pad_slot;
+
+    /* §6.20 per-type receive windows, one per enum apad_kbm_class — four of
+     * them, the fourth being the client's INPUTCAPS slot. These MUST NOT
+     * share rx_input_seq above: a KEYBOARD at sequence 101 would advance a
+     * shared window past an INPUT_STATE still in flight at 100, and live stick
+     * data would be discarded as stale when it was merely interleaved. The
+     * failure is silent and looks exactly like packet loss. */
+    uint16_t rx_kbm_seq[APAD_KBM_CLASS_COUNT];
+    uint8_t  rx_kbm_valid[APAD_KBM_CLASS_COUNT];
 
     uint16_t input_rate_hz;
     uint16_t peer_rate_hz;
@@ -520,6 +637,27 @@ int apad_session_tick(apad_session *s, uint32_t now);
 
 /* §9 receive window, exposed for the server's per-pad fast path. */
 int apad_session_accept_input(apad_session *s, uint16_t seq);
+
+/*
+ * §6.20 receive window for one of KEYBOARD / MOUSE / MEDIA / INPUTCAPS.
+ * `cls` is an enum apad_kbm_class. Returns APAD_OK to accept, APAD_ERR_STALE
+ * to discard the datagram, or APAD_ERR_ARG.
+ *
+ * apad_session_on_recv calls this itself for the three CLIENT->SERVER types,
+ * which are the only ones it can route: it is shared by both peers, and a
+ * client's INPUTCAPS window has to be judged at the point the client acts on
+ * the caps, so routing it here as well would apply the window twice and
+ * silently discard every INPUTCAPS after the first. A client therefore calls
+ * this directly with APAD_KBM_CLASS_INPUTCAPS, which is also why the function
+ * is public — the same reason apad_session_accept_input is.
+ *
+ * A discard here matters beyond dropping the packet: §6.16 requires that a
+ * stale MOUSE MUST NOT advance the motion baseline, or a reordered packet
+ * becomes a backwards jerk followed by a compensating forward one; and a
+ * stale INPUTCAPS would revive `features`/`status` the server has already
+ * moved on from (§6.19 "latest wins").
+ */
+int apad_session_accept_kbm(apad_session *s, int cls, uint16_t seq);
 
 /* Install the PBKDF2-derived session key (§10). */
 void apad_session_set_key(apad_session *s, const uint8_t key[APAD_SESSION_KEY_LEN]);

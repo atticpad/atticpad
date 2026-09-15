@@ -57,3 +57,14 @@ tools/secret-length-check/secret-length-check
 # committed and publish.sh's identity check caught it in the staged tree, not
 # a human. Every one of these entries is one tool named after the fact, so:
 tools/qr-url/qr-url
+
+# clients/psp/build.sh: which dev hooks the current objects were built with
+clients/psp/.hooks
+clients/psp/atticpad-psp.zip
+clients/psp/.zipstage/
+clients/psp/atticpad-psp-diag.zip
+clients/psp/*-diag.PBP
+clients/psp/*.prx
+
+# local-only QA hardware-run dashboard (see its README) -- never shipped
+tools/qa-dashboard/

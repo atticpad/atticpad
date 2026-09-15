@@ -58,6 +58,50 @@
  * that wanted two servers alive at once. Reported as a finding.
  * ======================================================================== */
 
+/*
+ * §6.15-§6.19 additions (docs/DESIGN.md follow-on to §6.1): backend.h's five KBM
+ * hooks (kbm_caps, create_kbm, kbm_events, mouse_motion, destroy_kbm),
+ * recorded the same way update_pad/destroy_pad already are above, plus a
+ * SETTABLE kbm_caps_value so a scenario can present a KBM-incapable backend
+ * (the default, 0 -- unchanged behaviour for every scenario above this
+ * addition) or one that advertises KEYBOARD/MOUSE/MEDIA. server.c reads
+ * kbm_caps() exactly ONCE, at apad_server_create() time (§6.19: "computed
+ * once here, never per session") -- so a scenario that wants KBM support
+ * MUST set g_backend.kbm_caps_value BEFORE calling apad_server_create(), via
+ * make_server_kbm()/make_server_kbm_pairing() below, not after.
+ *
+ * `next_seq` is one monotonic counter shared across EVERY backend call this
+ * harness records (pad and KBM alike), so a scenario can assert ORDERING
+ * between two different hook calls -- §6.20's "release everything held...
+ * BEFORE it destroys or detaches whatever it injects into" is an ordering
+ * claim, not a presence claim, and a call count alone cannot distinguish
+ * "released then destroyed" from "destroyed then released".
+ */
+#define MAX_KBM_CREATE   16
+#define MAX_KBM_DESTROY  16
+#define MAX_KBM_BATCHES  32   /* one entry per kbm_events() CALL, not per event */
+#define MAX_KBM_EVENTS_PER_BATCH 32
+#define MAX_MOUSE_MOTION 32
+
+typedef struct {
+    int seq;
+    int slot;
+    apad_kbm_device dev;
+} kbm_dev_call;
+
+typedef struct {
+    int seq;
+    int slot;
+    size_t n;
+    apad_kbm_event_out ev[MAX_KBM_EVENTS_PER_BATCH];
+} kbm_events_call;
+
+typedef struct {
+    int seq;
+    int slot;
+    apad_mouse_motion m;
+} mouse_motion_call;
+
 typedef struct {
     int init_calls;
     int create_calls;
@@ -67,6 +111,24 @@ typedef struct {
     int shutdown_calls;
     int last_slot;
     apad_pad_state last_state;
+
+    int next_seq;   /* shared ordering counter, every hook below included */
+
+    uint32_t kbm_caps_value;   /* what kbm_caps() returns; set BEFORE create */
+    int      kbm_caps_calls;
+
+    kbm_dev_call kbm_creates[MAX_KBM_CREATE];
+    int          kbm_create_count;
+    int          kbm_create_fail;  /* 1: create_kbm() always fails (rc != 0) */
+
+    kbm_events_call kbm_batches[MAX_KBM_BATCHES];
+    int             kbm_batch_count;
+
+    mouse_motion_call mouse_motions[MAX_MOUSE_MOTION];
+    int               mouse_motion_count;
+
+    kbm_dev_call kbm_destroys[MAX_KBM_DESTROY];
+    int          kbm_destroy_count;
 } backend_state;
 
 static backend_state g_backend;
@@ -101,6 +163,49 @@ static void rec_shutdown(void) {
     g_backend.shutdown_calls++;
 }
 
+/* ---- §6.15-§6.19 KBM hooks, backend.h ---------------------------------- */
+
+static uint32_t rec_kbm_caps(void) {
+    g_backend.kbm_caps_calls++;
+    return g_backend.kbm_caps_value;
+}
+static int rec_create_kbm(int slot, apad_kbm_device dev) {
+    if (g_backend.kbm_create_count < MAX_KBM_CREATE) {
+        kbm_dev_call *c = &g_backend.kbm_creates[g_backend.kbm_create_count++];
+        c->seq  = g_backend.next_seq++;
+        c->slot = slot;
+        c->dev  = dev;
+    }
+    return g_backend.kbm_create_fail ? -1 : 0;
+}
+static int rec_kbm_events(int slot, const apad_kbm_event_out *ev, size_t n) {
+    if (g_backend.kbm_batch_count < MAX_KBM_BATCHES) {
+        kbm_events_call *c = &g_backend.kbm_batches[g_backend.kbm_batch_count++];
+        c->seq  = g_backend.next_seq++;
+        c->slot = slot;
+        c->n    = (n > MAX_KBM_EVENTS_PER_BATCH) ? MAX_KBM_EVENTS_PER_BATCH : n;
+        memcpy(c->ev, ev, c->n * sizeof *ev);
+    }
+    return 0;
+}
+static int rec_mouse_motion(int slot, const apad_mouse_motion *m) {
+    if (g_backend.mouse_motion_count < MAX_MOUSE_MOTION) {
+        mouse_motion_call *c = &g_backend.mouse_motions[g_backend.mouse_motion_count++];
+        c->seq  = g_backend.next_seq++;
+        c->slot = slot;
+        c->m    = *m;
+    }
+    return 0;
+}
+static void rec_destroy_kbm(int slot, apad_kbm_device dev) {
+    if (g_backend.kbm_destroy_count < MAX_KBM_DESTROY) {
+        kbm_dev_call *c = &g_backend.kbm_destroys[g_backend.kbm_destroy_count++];
+        c->seq  = g_backend.next_seq++;
+        c->slot = slot;
+        c->dev  = dev;
+    }
+}
+
 static const apad_backend kRecordingBackend = {
     .init          = rec_init,
     .create_pad    = rec_create_pad,
@@ -108,11 +213,23 @@ static const apad_backend kRecordingBackend = {
     .poll_feedback = rec_poll_feedback,
     .destroy_pad   = rec_destroy_pad,
     .shutdown      = rec_shutdown,
-    .name          = "recording-test-backend"
+    .name          = "recording-test-backend",
     /* .health left NULL (backend.h: optional) -- this harness never
      * exercises apad_server_backend_status()'s "backend reports a problem"
      * path; server-dev agent memory server-ui-* covers that live against
      * the real uinput backend instead. */
+
+    /* §6.15-§6.19: present (unlike a backend that predates the feature,
+     * which leaves these five NULL), but kbm_caps_value defaults to 0 in a
+     * zeroed backend_state -- every scenario ABOVE this addition runs with
+     * caps 0, byte-identical to "no KBM support at all" (backend.h: "NULL
+     * means 0 (nothing) without being called"), so nothing pre-existing
+     * changes behaviour by this struct gaining these five pointers. */
+    .kbm_caps      = rec_kbm_caps,
+    .create_kbm    = rec_create_kbm,
+    .kbm_events    = rec_kbm_events,
+    .mouse_motion  = rec_mouse_motion,
+    .destroy_kbm   = rec_destroy_kbm
 };
 
 /* ========================================================================
@@ -135,6 +252,8 @@ typedef struct {
     int       send_rc;      /* what fake_send returned for this call        */
 } recorded_send;
 
+#define MAX_LOG_LINES 64
+
 typedef struct {
     recorded_send sends[MAX_RECORDED_SENDS];
     int count;
@@ -145,6 +264,15 @@ typedef struct {
                               * interface -- apadserver.h treats all of
                               * these identically to a datagram lost in
                               * transit). */
+
+    /* Captured on_log lines, in addition to the printf() every scenario
+     * above already got -- added for the §6.20 event-ring overflow
+     * scenario, which needs to check whether ANY diagnostic channel
+     * observed a lost-event condition (see scenario_key_ring_overflow()).
+     * fake_log() already receives cfg.user == this pointer; it simply was
+     * not using it before. */
+    char log_lines[MAX_LOG_LINES][200];
+    int  log_count;
 } harness_state;
 
 static int fake_send(void *user, const apad_addr *to, const uint8_t *buf, size_t len) {
@@ -172,14 +300,32 @@ static int fake_send(void *user, const apad_addr *to, const uint8_t *buf, size_t
 }
 
 static void fake_log(void *user, apad_log_level level, const char *msg) {
+    harness_state *hs = (harness_state *)user;
     const char *lvl;
-    (void)user;
     switch (level) {
     case APAD_LOG_ERROR: lvl = "ERROR"; break;
     case APAD_LOG_WARN:  lvl = "WARN";  break;
     default:              lvl = "INFO";  break;
     }
     printf("    [server %s] %s\n", lvl, msg);
+    if (hs != NULL && hs->log_count < MAX_LOG_LINES) {
+        snprintf(hs->log_lines[hs->log_count], sizeof hs->log_lines[0],
+                 "%s: %s", lvl, msg);
+        hs->log_count++;
+    }
+}
+
+/* True if any captured on_log line contains `needle` (case-sensitive, plain
+ * substring). Used only by the §6.20 event-ring overflow scenario to check
+ * whether ANY diagnostic channel observed a lost-event condition. */
+static int any_log_contains(const harness_state *hs, const char *needle) {
+    int i;
+    for (i = 0; i < hs->log_count; i++) {
+        if (strstr(hs->log_lines[i], needle) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static apad_server *make_server(harness_state *hs) {
@@ -223,6 +369,30 @@ static apad_server *make_server_with_broadcasts(harness_state *hs,
     cfg.profile_count         = 0;
     cfg.broadcast_addrs       = bcast;
     cfg.broadcast_addr_count  = bcast_count;
+    return apad_server_create(&cfg, &kRecordingBackend);
+}
+
+/* Like make_server(), but with g_backend.kbm_caps_value set to `caps`
+ * (APAD_KBM_CAP_* bits, backend.h) BEFORE apad_server_create() runs.
+ * server.c reads kbm_caps() exactly once, at create time (§6.19: "computed
+ * once here, never per session") -- setting it after creation would have no
+ * effect on that server instance's s->kbm_features at all. */
+static apad_server *make_server_kbm(harness_state *hs, uint32_t caps) {
+    apad_server_cfg cfg;
+
+    memset(hs, 0, sizeof *hs);
+    hs->fail_call_index = -1;
+    memset(&g_backend, 0, sizeof g_backend);
+    g_backend.kbm_caps_value = caps;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.on_send        = fake_send;
+    cfg.on_log         = fake_log;
+    cfg.user           = hs;
+    cfg.server_port    = (uint16_t)APAD_DEFAULT_PORT;
+    cfg.server_name    = "server-harness";
+    cfg.profiles       = NULL;
+    cfg.profile_count  = 0;
     return apad_server_create(&cfg, &kRecordingBackend);
 }
 
@@ -327,6 +497,73 @@ static int build_input_state(uint8_t *buf, size_t cap, uint16_t session_id,
                      payload, (uint16_t)n);
 }
 
+/* ---- §6.15-§6.19 datagram builders -------------------------------------- */
+
+static int build_keyboard(uint8_t *buf, size_t cap, uint16_t session_id,
+                          uint16_t sequence, const apad_keyboard *kb) {
+    uint8_t payload[APAD_LEN_KEYBOARD];
+    int n = apad_encode_keyboard(payload, sizeof payload, kb);
+    if (n < 0) {
+        return n;
+    }
+    return build_raw(buf, cap, (uint8_t)APAD_MSG_KEYBOARD, session_id, sequence,
+                     payload, (uint16_t)n);
+}
+
+static int build_mouse(uint8_t *buf, size_t cap, uint16_t session_id,
+                       uint16_t sequence, const apad_mouse *mo) {
+    uint8_t payload[APAD_LEN_MOUSE];
+    int n = apad_encode_mouse(payload, sizeof payload, mo);
+    if (n < 0) {
+        return n;
+    }
+    return build_raw(buf, cap, (uint8_t)APAD_MSG_MOUSE, session_id, sequence,
+                     payload, (uint16_t)n);
+}
+
+static int build_media(uint8_t *buf, size_t cap, uint16_t session_id,
+                       uint16_t sequence, const apad_media *me) {
+    uint8_t payload[APAD_LEN_MEDIA];
+    int n = apad_encode_media(payload, sizeof payload, me);
+    if (n < 0) {
+        return n;
+    }
+    return build_raw(buf, cap, (uint8_t)APAD_MSG_MEDIA, session_id, sequence,
+                     payload, (uint16_t)n);
+}
+
+static int build_bye(uint8_t *buf, size_t cap, uint16_t session_id,
+                     uint16_t sequence, uint8_t reason) {
+    apad_bye bye;
+    uint8_t payload[APAD_LEN_BYE];
+    int n;
+
+    memset(&bye, 0, sizeof bye);
+    bye.reason = reason;
+    n = apad_encode_bye(payload, sizeof payload, &bye);
+    if (n < 0) {
+        return n;
+    }
+    return build_raw(buf, cap, (uint8_t)APAD_MSG_BYE, session_id, sequence,
+                     payload, (uint16_t)n);
+}
+
+/* Decode the payload of a recorded INPUTCAPS send. Returns 1 on success. */
+static int inputcaps_of(const recorded_send *r, apad_inputcaps *out) {
+    apad_packet pkt;
+    memset(&pkt, 0, sizeof pkt);
+    if (apad_packet_parse(r->buf, r->len, &pkt) < 0
+        || pkt.header.type != (uint8_t)APAD_MSG_INPUTCAPS) {
+        return 0;
+    }
+    return apad_decode_inputcaps(pkt.payload, pkt.payload_len, out) >= 0;
+}
+
+/* Set bit for HID usage `u` in a 32-byte §6.15 keys[] bitmap. */
+static void key_set(uint8_t keys[APAD_KEY_BITMAP_BYTES], uint8_t usage) {
+    keys[APAD_KEY_BYTE(usage)] |= APAD_KEY_MASK(usage);
+}
+
 static int decode_error_code(const recorded_send *r, uint16_t *code_out) {
     apad_packet pkt;
     apad_error e;
@@ -367,6 +604,37 @@ static int establish_hello(apad_server *srv, harness_state *hs, apad_addr peer,
     }
     *session_id_out  = hs->sends[hs->count - 1].session_id;
     *welcome_seq_out = hs->sends[hs->count - 1].sequence;
+    return 1;
+}
+
+/* establish_hello() + the ACK that discharges WELCOME, in one call -- every
+ * §6.15-§6.20 scenario below needs a fully-open, unauthenticated session
+ * before it can send its first KEYBOARD/MOUSE/MEDIA datagram, and this is
+ * the same three-step dance scenario_idle_timeout()/scenario_ui_query_api()
+ * above already repeat inline. `ack_seq` is the client's own header sequence
+ * for the ACK (distinct from hello_seq -- §9 spends a whole session's
+ * sequence counter, so reusing hello_seq here would be a datagram this
+ * harness would never actually construct as a real client). Returns 1 on
+ * success and fills *session_id_out. */
+static int establish_and_ack(apad_server *srv, harness_state *hs, apad_addr peer,
+                             uint32_t t0, uint8_t seed, const char *device_name,
+                             uint16_t hello_seq, uint16_t ack_seq,
+                             uint16_t *session_id_out) {
+    uint8_t hello_buf[APAD_MAX_DATAGRAM];
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    int hello_len, n;
+    uint16_t sid = 0, wseq = 0;
+
+    if (!establish_hello(srv, hs, peer, t0, seed, device_name, hello_seq,
+                         hello_buf, &hello_len, &sid, &wseq)) {
+        return 0;
+    }
+    n = build_ack(buf, sizeof buf, sid, ack_seq, wseq);
+    if (n < 0) {
+        return 0;
+    }
+    (void)apad_server_on_datagram(srv, t0, &peer, buf, (size_t)n);
+    *session_id_out = sid;
     return 1;
 }
 
@@ -1047,6 +1315,28 @@ static apad_server *make_server_pairing(harness_state *hs) {
     memset(hs, 0, sizeof *hs);
     hs->fail_call_index = -1;
     memset(&g_backend, 0, sizeof g_backend);
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.on_send        = fake_send;
+    cfg.on_log         = fake_log;
+    cfg.on_random      = scripted_random;
+    cfg.user           = hs;
+    cfg.server_port    = (uint16_t)APAD_DEFAULT_PORT;
+    cfg.server_name    = "server-harness";
+    return apad_server_create(&cfg, &kRecordingBackend);
+}
+
+/* make_server_pairing() + make_server_kbm(): both cfg.on_random and a
+ * nonzero kbm_caps_value, for scenario_inputcaps_auth_waits_for_verified_tag
+ * -- the one §6.19 Delivery rule that needs BOTH a pairing window and a
+ * backend that has something to advertise. */
+static apad_server *make_server_kbm_pairing(harness_state *hs, uint32_t caps) {
+    apad_server_cfg cfg;
+
+    memset(hs, 0, sizeof *hs);
+    hs->fail_call_index = -1;
+    memset(&g_backend, 0, sizeof g_backend);
+    g_backend.kbm_caps_value = caps;
 
     memset(&cfg, 0, sizeof cfg);
     cfg.on_send        = fake_send;
@@ -1867,6 +2157,1179 @@ static void scenario_ui_query_api(void) {
 
     apad_server_destroy(srv);
 }
+/* ========================================================================
+ * §6.15-§6.20 KEYBOARD / MOUSE / MEDIA / INPUTCAPS scenarios.
+ *
+ * docs/PROTOCOL.md §15 item 10: "§6.20's 10 Hz repeat floor and 1000 ms
+ * watchdog are measured against a clock, and core has none by design...
+ * unpinned by conformance data and needs a server-side test with a
+ * controllable clock." This harness has one. The clock-dependent scenarios
+ * (kbm_watchdog_*, kbm_teardown_releases_before_destroy) are the reason this
+ * whole section exists; everything else pins what core's own vectors.h
+ * cannot reach because it requires driving server.c's dispatch, lazy device
+ * creation and §6.19 delivery schedule, not just codec.c's encode/decode.
+ *
+ * Every scenario below uses make_server_kbm()/make_server_kbm_pairing() (not
+ * plain make_server()) because server.c reads backend->kbm_caps() exactly
+ * once, at apad_server_create() time (§6.19: "computed once here, never per
+ * session") -- s->kbm_features cannot be changed after the fact.
+ * ======================================================================== */
+
+/* Scan the recorded sends for the Nth (0-based) datagram of `type`, or NULL. */
+static const recorded_send *nth_send_of_type(const harness_state *hs, uint8_t type, int n) {
+    int i, seen = 0;
+    for (i = 0; i < hs->count; i++) {
+        if (hs->sends[i].type == type) {
+            if (seen == n) {
+                return &hs->sends[i];
+            }
+            seen++;
+        }
+    }
+    return NULL;
+}
+
+static int count_sends_of_type(const harness_state *hs, uint8_t type) {
+    int i, n = 0;
+    for (i = 0; i < hs->count; i++) {
+        if (hs->sends[i].type == type) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* ------------------------------------------------------------------------
+ * Dispatch and lifecycle
+ * ------------------------------------------------------------------------ */
+
+static void scenario_kbm_lazy_create(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    apad_mouse mo;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- kbm_lazy_create: first 0x21 creates KEYBOARD once; 0x22 creates "
+           "MOUSE, not KEYBOARD again --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD | APAD_KBM_CAP_MOUSE
+                                | APAD_KBM_CAP_MEDIA);
+    check(srv != NULL, "apad_server_create with KEYBOARD|MOUSE|MEDIA caps");
+    apad_addr_set(&peer, 10, 2, 0, 1, 41100);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x50u, "harness-lazy", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    kb.event_seq = 0u;
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    check(n > 0, "build first KEYBOARD");
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1
+              && g_backend.kbm_creates[0].dev == APAD_KBM_DEV_KEYBOARD,
+          "exactly one create_kbm(KEYBOARD) after the first 0x21");
+
+    n = build_keyboard(buf, sizeof buf, sid, 4, &kb);
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1,
+          "a second 0x21 draws NO further create_kbm (already created)");
+
+    memset(&mo, 0, sizeof mo);
+    n = build_mouse(buf, sizeof buf, sid, 5, &mo);
+    check(n > 0, "build MOUSE");
+    (void)apad_server_on_datagram(srv, 30u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 2
+              && g_backend.kbm_creates[1].dev == APAD_KBM_DEV_MOUSE,
+          "a 0x22 creates MOUSE, and only MOUSE (not KEYBOARD again)");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_kbm_not_advertised(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    apad_client_info info[APAD_MAX_SESSIONS];
+    int n, before;
+
+    printf("\n-- kbm_not_advertised: kbm_caps()==0 -> datagram dropped, zero "
+           "create_kbm, no ERROR (S8's amplifier argument, applied to KBM) --\n");
+    srv = make_server_kbm(&hs, 0u);
+    check(srv != NULL, "apad_server_create with caps=0 (kbm_caps() hook present, "
+                       "returns 0 -- distinct from a NULL hook, same net effect)");
+    apad_addr_set(&peer, 10, 2, 0, 2, 41101);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x51u, "harness-noadv", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    check(n > 0, "build KEYBOARD");
+    before = hs.count;
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 0,
+          "zero create_kbm calls: this backend has nothing to advertise");
+    check(hs.count == before,
+          "zero datagrams sent in reply -- specifically no ERROR (S8's "
+          "reflection-amplifier argument for INPUT_STATE applies verbatim: "
+          "'§8 already forbids' this for unknown-session INPUT_STATE, and "
+          "handle_keyboard()'s own comment extends the same reasoning here)");
+    check(apad_server_list_clients(srv, info, APAD_MAX_SESSIONS) == 1,
+          "the session itself is untouched by the drop");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_kbm_stale_dropped(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    apad_client_info info[APAD_MAX_SESSIONS];
+    int n, batches_before;
+
+    printf("\n-- kbm_stale_dropped: seq 100 then 99 -> no backend call, session "
+           "stays ALIVE (S8 liveness vs S9/S6.20 freshness are different "
+           "questions) --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 0, 3, 41102);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x52u, "harness-stale", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    n = build_keyboard(buf, sizeof buf, sid, 100, &kb);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1, "seq 100 accepted: device created");
+    batches_before = g_backend.kbm_batch_count;
+
+    memset(&kb, 0, sizeof kb);
+    kb.event_seq = 5u;
+    key_set(kb.keys, APAD_HID_KEY_B);
+    n = build_keyboard(buf, sizeof buf, sid, 99, &kb);
+    check(n > 0, "build stale KEYBOARD (seq 99, older than 100)");
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1,
+          "seq 99 does not even reach the create-device check again");
+    check(g_backend.kbm_batch_count == batches_before,
+          "...and kbm.c is never called for it -- discarded at S6.20's "
+          "per-type window, exactly like a stale INPUT_STATE at S9");
+    check(apad_server_list_clients(srv, info, APAD_MAX_SESSIONS) == 1,
+          "the session is NOT torn down by a stale KEYBOARD");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_C);
+    n = build_keyboard(buf, sizeof buf, sid, 101, &kb);
+    (void)apad_server_on_datagram(srv, 30u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count > batches_before,
+          "...and a genuinely newer KEYBOARD (seq 101) is still accepted "
+          "afterward -- the session is not merely alive, it is functional");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_kbm_class_windows(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- kbm_class_windows, part A (literal case): INPUT_STATE seq 100 / "
+           "KEYBOARD seq 101 / INPUT_STATE seq 102, in that ARRIVAL order -- "
+           "all three applied --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 0, 4, 41103);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x53u, "harness-windows", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    n = build_input_state(buf, sizeof buf, sid, 100, 10u);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.update_calls == 1, "INPUT_STATE seq 100 applied");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    n = build_keyboard(buf, sizeof buf, sid, 101, &kb);
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1, "KEYBOARD seq 101 applied (device created)");
+
+    n = build_input_state(buf, sizeof buf, sid, 102, 30u);
+    (void)apad_server_on_datagram(srv, 30u, &peer, buf, (size_t)n);
+    check(g_backend.update_calls == 2, "INPUT_STATE seq 102 applied");
+    apad_server_destroy(srv);
+
+    /* Part B: the actual adversarial case §6.20 names in its own prose ("a
+     * KEYBOARD at sequence 101 would shadow an INPUT_STATE still in flight
+     * at 100" -- a REORDERED arrival, not the in-order case above). Part A's
+     * monotonically increasing sequence numbers pass under a shared window
+     * exactly as easily as under per-type ones, so it cannot by itself
+     * distinguish the two; this part can and does. Added beyond the task's
+     * literal list because the literal case does not exercise the failure
+     * mode §6.20 describes -- documented here rather than silently. */
+    printf("\n-- kbm_class_windows, part B (the adversarial case §6.20 itself "
+           "names): KEYBOARD seq 101 arrives FIRST, then INPUT_STATE seq 100 "
+           "-- INPUT_STATE must NOT be shadowed as stale --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x54u, "harness-windows-b", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    n = build_keyboard(buf, sizeof buf, sid, 101, &kb);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1, "KEYBOARD seq 101 applied first");
+
+    n = build_input_state(buf, sizeof buf, sid, 100, 20u);
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.update_calls == 1,
+          "INPUT_STATE seq 100, arriving AFTER a KEYBOARD at seq 101, is "
+          "still applied -- a single SHARED window would have discarded it "
+          "as stale (100 < 101); the independent per-type windows do not "
+          "(S6.20: 'Per-type windows, and nothing shared')");
+    apad_server_destroy(srv);
+}
+
+static void scenario_kbm_wrong_peer_address(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer, spoofed;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    apad_client_info info[APAD_MAX_SESSIONS];
+    int n;
+
+    printf("\n-- kbm_wrong_peer_address: a datagram for a live session from a "
+           "different address is ignored --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 0, 5, 41104);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x55u, "harness-wrongpeer", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    apad_addr_set(&spoofed, 10, 2, 0, 99, 41199);
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    check(n > 0, "build KEYBOARD, valid session_id, wrong source address");
+    (void)apad_server_on_datagram(srv, 10u, &spoofed, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 0, "no create_kbm from the spoofed source");
+    check(g_backend.kbm_batch_count == 0, "no kbm.c call at all");
+    check(apad_server_list_clients(srv, info, APAD_MAX_SESSIONS) == 1,
+          "the real session is untouched, not torn down");
+
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1,
+          "the SAME bytes from the REAL peer are accepted -- proves the "
+          "rejection above was about the address, not the payload");
+
+    apad_server_destroy(srv);
+}
+
+/* ------------------------------------------------------------------------
+ * The §6.20 receiver algorithm: watchdog, teardown release ordering
+ * ------------------------------------------------------------------------ */
+
+static void scenario_kbm_watchdog_releases(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    apad_mouse mo;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n, batches_at_wd_start;
+
+    printf("\n-- kbm_watchdog_releases: keys held, then 1000ms of silence -> "
+           "release-all for THAT facility, and ONLY that facility --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD | APAD_KBM_CAP_MOUSE);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 1, 1, 41110);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x60u, "harness-wd-releases", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK, t=0");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    kb.event_seq = 1u;
+    kb.events[7].usage = APAD_HID_KEY_A;
+    kb.events[7].flags = APAD_KBM_EVENT_DOWN;
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 1 && g_backend.kbm_batch_count == 1,
+          "KEYBOARD holding A at t=0: device created, one press batch");
+
+    memset(&mo, 0, sizeof mo);
+    mo.buttons = APAD_MOUSEBTN_BIT(APAD_MOUSEBTN_LEFT);
+    mo.event_seq = 1u;
+    mo.events[3].button = (uint8_t)APAD_MOUSEBTN_LEFT;
+    mo.events[3].flags = APAD_KBM_EVENT_DOWN;
+    n = build_mouse(buf, sizeof buf, sid, 4, &mo);
+    (void)apad_server_on_datagram(srv, 500u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_create_count == 2,
+          "MOUSE holding LEFT at t=500: device created too");
+    batches_at_wd_start = g_backend.kbm_batch_count;
+
+    (void)apad_server_tick(srv, 999u);
+    check(g_backend.kbm_batch_count == batches_at_wd_start,
+          "t=999: neither facility's OWN 1000ms has elapsed yet (KEYBOARD's "
+          "last accept was t=0, MOUSE's was t=500) -- no release");
+
+    (void)apad_server_tick(srv, 1000u);
+    check(g_backend.kbm_batch_count == batches_at_wd_start + 1,
+          "t=1000: KEYBOARD's watchdog fires (1000-0=1000ms) -- exactly ONE "
+          "new batch");
+    if (g_backend.kbm_batch_count == batches_at_wd_start + 1) {
+        const kbm_events_call *rel = &g_backend.kbm_batches[g_backend.kbm_batch_count - 1];
+        check(rel->n == 1 && rel->ev[0].device == (uint8_t)APAD_KBM_DEV_KEYBOARD
+                  && rel->ev[0].code == APAD_HID_KEY_A && rel->ev[0].down == 0u,
+              "...and it is A released (down=0), not a MOUSE event -- ONLY "
+              "the keyboard facility, not mouse (S6.20: 'a receiver that "
+              "believes something is held for A facility... release "
+              "everything it holds for THAT facility')");
+    }
+    check(g_backend.kbm_destroy_count == 0,
+          "watchdog releases; it does not destroy the device");
+
+    (void)apad_server_tick(srv, 1500u);
+    check(g_backend.kbm_batch_count == batches_at_wd_start + 2,
+          "t=1500: MOUSE's watchdog now fires too (1500-500=1000ms)");
+    if (g_backend.kbm_batch_count == batches_at_wd_start + 2) {
+        const kbm_events_call *rel = &g_backend.kbm_batches[g_backend.kbm_batch_count - 1];
+        check(rel->n == 1 && rel->ev[0].device == (uint8_t)APAD_KBM_DEV_MOUSE
+                  && rel->ev[0].code == (uint16_t)APAD_MOUSEBTN_LEFT
+                  && rel->ev[0].down == 0u,
+              "...and it is LEFT released, on its own independent 1000ms clock");
+    }
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_kbm_watchdog_not_early(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    uint16_t seq;
+    uint32_t t;
+    int n;
+
+    printf("\n-- kbm_watchdog_not_early: held key refreshed at the 10Hz floor "
+           "-> watchdog never fires, across several seconds --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 1, 2, 41111);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x61u, "harness-wd-notearly", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK, t=0");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    kb.event_seq = 1u;
+    kb.events[7].usage = APAD_HID_KEY_A;
+    kb.events[7].flags = APAD_KBM_EVENT_DOWN;
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 1, "t=0: initial press, one batch");
+
+    /* Same snapshot (A still held, event_seq unchanged -- no NEW events),
+     * refreshed exactly at the S6.20 MUST floor: every 100ms (10Hz), from
+     * t=100 through t=4900 -- comfortably past several 1000ms watchdog
+     * boundaries. Header sequence still advances every send (S9: every
+     * datagram consumes the direction's sequence counter), event_seq does
+     * not (nothing NEW happened -- the key is still simply held). */
+    seq = 4;
+    for (t = 100u; t <= 4900u; t += 100u) {
+        (void)apad_server_tick(srv, t - 1u);
+        n = build_keyboard(buf, sizeof buf, sid, seq++, &kb);
+        (void)apad_server_on_datagram(srv, t, &peer, buf, (size_t)n);
+    }
+    (void)apad_server_tick(srv, 4999u);   /* just under last_accept(4900)+1000 */
+
+    check(g_backend.kbm_batch_count == 1,
+          "still exactly ONE batch (the original press) after ~5s of a "
+          "conforming 10Hz repeat -- the watchdog never fires for a sender "
+          "that meets S6.20's MUST floor");
+    check(g_backend.kbm_destroy_count == 0, "...and nothing was ever destroyed");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_kbm_watchdog_boundary(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- kbm_watchdog_boundary: release at exactly 1000ms, not 900, "
+           "not 1500 --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 1, 3, 41112);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x62u, "harness-wd-boundary", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK, t=0");
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    kb.event_seq = 1u;
+    kb.events[7].usage = APAD_HID_KEY_A;
+    kb.events[7].flags = APAD_KBM_EVENT_DOWN;
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 1, "t=0: press, one batch");
+
+    (void)apad_server_tick(srv, 900u);
+    check(g_backend.kbm_batch_count == 1, "t=900: not yet (900 < 1000)");
+
+    (void)apad_server_tick(srv, 999u);
+    check(g_backend.kbm_batch_count == 1, "t=999: not yet (999 < 1000)");
+
+    (void)apad_server_tick(srv, 1000u);
+    check(g_backend.kbm_batch_count == 2,
+          "t=1000: release fires exactly here (S6.20: 'accepted no datagram "
+          "... for 1000ms MUST release', apad_time_since(now, last) >= 1000)");
+    if (g_backend.kbm_batch_count == 2) {
+        const kbm_events_call *rel = &g_backend.kbm_batches[1];
+        check(rel->n == 1 && rel->ev[0].down == 0u && rel->ev[0].code == APAD_HID_KEY_A,
+              "...A released");
+    }
+
+    (void)apad_server_tick(srv, 1500u);
+    check(g_backend.kbm_batch_count == 2,
+          "t=1500: no SECOND release -- already-empty shadow makes the "
+          "repeat watchdog check idempotent, not a duplicate release");
+
+    apad_server_destroy(srv);
+}
+
+/* Finds the seq of the first kbm_batches[] entry that released `dev`/`code`
+ * (down==0), or -1. Used to build the release-before-destroy ordering
+ * assertion below without caring WHICH code path (watchdog vs teardown)
+ * emitted the release -- see the scenario's own comment for why that
+ * distinction is structurally unavoidable for the idle-timeout sub-case. */
+static int first_release_seq(apad_kbm_device dev, uint16_t code) {
+    int i, j;
+    for (i = 0; i < g_backend.kbm_batch_count; i++) {
+        const kbm_events_call *c = &g_backend.kbm_batches[i];
+        for (j = 0; j < (int)c->n; j++) {
+            if (c->ev[j].device == (uint8_t)dev && c->ev[j].code == code
+                && c->ev[j].down == 0u) {
+                return c->seq;
+            }
+        }
+    }
+    return -1;
+}
+
+static int destroy_seq_of(apad_kbm_device dev) {
+    int i;
+    for (i = 0; i < g_backend.kbm_destroy_count; i++) {
+        if (g_backend.kbm_destroys[i].dev == dev) {
+            return g_backend.kbm_destroys[i].seq;
+        }
+    }
+    return -1;
+}
+
+/* Establishes a session with all three facilities created and holding
+ * something, for the teardown-ordering scenario below. Shared by both the
+ * BYE and idle-timeout sub-cases. */
+static int setup_all_three_held(apad_server *srv, harness_state *hs, apad_addr peer,
+                                 uint16_t *sid_out) {
+    apad_keyboard kb;
+    apad_mouse mo;
+    apad_media me;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    int n;
+
+    if (!establish_and_ack(srv, hs, peer, 0u, 0x63u, "harness-teardown", 1, 2, sid_out)) {
+        return 0;
+    }
+
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    kb.event_seq = 1u;
+    kb.events[7].usage = APAD_HID_KEY_A;
+    kb.events[7].flags = APAD_KBM_EVENT_DOWN;
+    n = build_keyboard(buf, sizeof buf, *sid_out, 3, &kb);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+
+    memset(&mo, 0, sizeof mo);
+    mo.buttons = APAD_MOUSEBTN_BIT(APAD_MOUSEBTN_LEFT);
+    mo.event_seq = 1u;
+    mo.events[3].button = (uint8_t)APAD_MOUSEBTN_LEFT;
+    mo.events[3].flags = APAD_KBM_EVENT_DOWN;
+    n = build_mouse(buf, sizeof buf, *sid_out, 4, &mo);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+
+    memset(&me, 0, sizeof me);
+    me.held = APAD_MEDIA_BIT(APAD_MEDIA_PLAY_PAUSE);
+    me.event_seq = 1u;
+    me.events[3].control = (uint8_t)APAD_MEDIA_PLAY_PAUSE;
+    me.events[3].flags = APAD_KBM_EVENT_DOWN;
+    n = build_media(buf, sizeof buf, *sid_out, 5, &me);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+
+    return g_backend.kbm_create_count == 3;
+}
+
+static void assert_release_before_destroy_all_three(const char *why) {
+    static const struct { apad_kbm_device dev; uint16_t code; const char *name; } facs[3] = {
+        { APAD_KBM_DEV_KEYBOARD, APAD_HID_KEY_A,               "KEYBOARD" },
+        { APAD_KBM_DEV_MOUSE,    (uint16_t)APAD_MOUSEBTN_LEFT, "MOUSE"    },
+        { APAD_KBM_DEV_MEDIA,    (uint16_t)APAD_MEDIA_PLAY_PAUSE, "MEDIA" }
+    };
+    int i;
+    char what[256];
+
+    check(g_backend.kbm_destroy_count == 3, "all three facilities destroyed");
+    for (i = 0; i < 3; i++) {
+        int rel_seq = first_release_seq(facs[i].dev, facs[i].code);
+        int dst_seq = destroy_seq_of(facs[i].dev);
+        snprintf(what, sizeof what,
+                 "%s: a release (down=0) was observed before its destroy_kbm "
+                 "call (%s) -- S6.20: 'before it destroys or detaches "
+                 "whatever it injects into'", facs[i].name, why);
+        check(rel_seq >= 0 && dst_seq >= 0 && rel_seq < dst_seq, what);
+    }
+}
+
+static void scenario_kbm_teardown_releases_before_destroy(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- kbm_teardown_releases_before_destroy, BYE at t=100 (well "
+           "under the 1000ms watchdog, so the release below is unambiguously "
+           "teardown's own, not a watchdog pre-emption) --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD | APAD_KBM_CAP_MOUSE
+                                | APAD_KBM_CAP_MEDIA);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 1, 4, 41113);
+    check(setup_all_three_held(srv, &hs, peer, &sid),
+          "all three facilities created and holding something, t=0");
+
+    n = build_bye(buf, sizeof buf, sid, 6, (uint8_t)APAD_BYE_NORMAL);
+    check(n > 0, "build BYE");
+    (void)apad_server_on_datagram(srv, 100u, &peer, buf, (size_t)n);
+    assert_release_before_destroy_all_three("BYE");
+    apad_server_destroy(srv);
+
+    /* Idle timeout. NOTE, stated up front rather than left implicit: S6.20's
+     * 1000ms watchdog is always <= S11's 3000ms idle timeout when both are
+     * measured from the same last-received instant with nothing else
+     * arriving in between (1000 < 3000, unconditionally) -- so the release
+     * this sub-case observes will, in this exact setup, already have been
+     * emitted by the WATCHDOG at t=1000, not by free_session()'s own
+     * apad_kbm_release_all() call at teardown (which is then a correct,
+     * idempotent no-op: nothing is left held). Both satisfy S6.20's ordering
+     * requirement identically -- by the time destroy_kbm runs, a release
+     * with a lower seq has been recorded either way -- and the assertion
+     * checks that ORDERING property, not which code path produced it. */
+    printf("\n-- kbm_teardown_releases_before_destroy, idle timeout at "
+           "t=3000 (S11) -- same ordering property, see the code comment on "
+           "why THIS release may be watchdog-sourced rather than "
+           "teardown-sourced --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD | APAD_KBM_CAP_MOUSE
+                                | APAD_KBM_CAP_MEDIA);
+    check(srv != NULL, "apad_server_create");
+    check(setup_all_three_held(srv, &hs, peer, &sid),
+          "all three facilities created and holding something, t=0");
+
+    (void)apad_server_tick(srv, 3000u);
+    assert_release_before_destroy_all_three("idle timeout");
+    apad_server_destroy(srv);
+}
+
+/* ------------------------------------------------------------------------
+ * INPUTCAPS delivery (§6.19), including the auth trap
+ * ------------------------------------------------------------------------ */
+
+static void scenario_inputcaps_after_ack(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    uint16_t sid = 0;
+    uint32_t t0 = 1000u, t, last_seen_at[8];
+    int seen_before, seen_after, i, n_new;
+
+    printf("\n-- inputcaps_after_ack: exactly 3 copies ~250ms apart after the "
+           "WELCOME-discharging ACK, 16 bytes, byte-exact, RELIABLE clear --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD | APAD_KBM_CAP_MOUSE
+                                | APAD_KBM_CAP_MEDIA);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 2, 1, 41120);
+    check(establish_and_ack(srv, &hs, peer, t0, 0x70u, "harness-ic-ack", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    seen_before = count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS);
+    check(seen_before == 0, "no INPUTCAPS sent by the ACK itself (only marked dirty)");
+
+    n_new = 0;
+    for (t = t0 + 1u; t <= t0 + 900u && n_new < 8; t++) {
+        int before = count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS);
+        (void)apad_server_tick(srv, t);
+        if (count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) > before) {
+            last_seen_at[n_new++] = t;
+        }
+    }
+    seen_after = count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS);
+    check(seen_after == 3, "exactly 3 copies land within the 900ms burst window");
+
+    if (seen_after == 3) {
+        for (i = 0; i < 3; i++) {
+            const recorded_send *r = nth_send_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS, i);
+            apad_packet pkt;
+            apad_inputcaps ic;
+            char what[128];
+
+            check(r != NULL && r->len == (size_t)(APAD_HEADER_SIZE + APAD_LEN_INPUTCAPS),
+                  "copy is header + 16 bytes, byte-exact fixed size (S6.19: "
+                  "'a fixed 16 bytes whatever features says')");
+            memset(&pkt, 0, sizeof pkt);
+            check(r != NULL && apad_packet_parse(r->buf, r->len, &pkt) >= 0,
+                  "parses");
+            check((pkt.header.flags & APAD_FLAG_RELIABLE) == 0u,
+                  "RELIABLE flag clear (S4: INPUTCAPS reliable=no)");
+            check(inputcaps_of(r, &ic)
+                      && ic.features == (APAD_KBM_FEATURE_KEYBOARD
+                                        | APAD_KBM_FEATURE_MOUSE
+                                        | APAD_KBM_FEATURE_MEDIA),
+                  "features matches this backend's kbm_caps()");
+            if (i > 0) {
+                uint32_t delta = last_seen_at[i] - last_seen_at[i - 1];
+                snprintf(what, sizeof what,
+                         "copy %d..%d is ~250ms after the previous one "
+                         "(observed %u ms, S6.19: 'Three copies about 250 "
+                         "ms apart')", i - 1, i, (unsigned)delta);
+                check(delta >= 250u && delta <= 255u, what);
+            }
+        }
+    }
+    apad_server_destroy(srv);
+}
+
+static void scenario_inputcaps_not_before_ack(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    uint8_t hello_buf[APAD_MAX_DATAGRAM];
+    int hello_len;
+    uint16_t sid = 0, wseq = 0;
+    uint32_t t;
+
+    printf("\n-- inputcaps_not_before_ack: none sent before the ACK that "
+           "discharges WELCOME --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 2, 2, 41121);
+    check(establish_hello(srv, &hs, peer, 0u, 0x71u, "harness-ic-noack", 1,
+                          hello_buf, &hello_len, &sid, &wseq),
+          "HELLO -> WELCOME (no ACK sent)");
+
+    for (t = 1u; t <= 5000u; t += 20u) {
+        (void)apad_server_tick(srv, t);
+    }
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) == 0,
+          "zero INPUTCAPS over 5s with no ACK ever received (S6.19 Delivery: "
+          "'Not before the ACK that discharges WELCOME')");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_inputcaps_auth_waits_for_verified_tag(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    uint8_t key[APAD_SESSION_KEY_LEN];
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    apad_ping ping;
+    uint8_t payload[APAD_LEN_PING];
+    uint16_t sid = 0;
+    uint32_t t;
+    int n, an;
+    apad_ack a;
+
+    printf("\n-- inputcaps_auth_waits_for_verified_tag: on an AUTH_REQUIRED "
+           "session, nothing is sent until a client datagram's tag verifies "
+           "(S6.19 Delivery / S10.2's ~1s PBKDF2 window) --\n");
+    srv = make_server_kbm_pairing(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create (pairing + KEYBOARD cap)");
+    random_script_reset();
+    g_random.prng = 0x5EED1u;
+    check(apad_server_begin_pairing(srv, 0u, 0) == APAD_OK, "begin_pairing");
+
+    apad_addr_set(&peer, 10, 2, 2, 3, 41122);
+    check(pair_and_hello(srv, &hs, peer, 0u, 1, 0x72u, key, &sid),
+          "HELLO -> AUTH_REQUIRED WELCOME, key derived as a real client would");
+
+    /* The exempted, deliberately UNAUTHENTICATED ACK that discharges
+     * WELCOME (S10's one exemption) -- this does NOT arm INPUTCAPS on an
+     * AUTH_REQUIRED session (handle_ack: "arm here ONLY when this session
+     * was never issued an AUTH_REQUIRED WELCOME"). */
+    memset(&a, 0, sizeof a);
+    a.sequence = hs.sends[hs.count - 1].sequence;
+    an = apad_encode_ack(payload, sizeof payload, &a);
+    n = build_raw(buf, sizeof buf, (uint8_t)APAD_MSG_ACK, sid, 1, payload, (uint16_t)an);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+
+    /* Simulate ~1s of PBKDF2 on the client (S10.2) -- the server hears
+     * nothing further, tagged or not, during this window. */
+    for (t = 20u; t <= 1000u; t += 20u) {
+        (void)apad_server_tick(srv, t);
+    }
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) == 0,
+          "zero INPUTCAPS across the ~1s PBKDF2 window -- this is exactly "
+          "the trap S6.19 spends a paragraph on: a naive 0/250/500ms "
+          "schedule from the ACK would land all three copies here, where "
+          "the client cannot yet decrypt them");
+
+    /* Now the client's key is ready and it sends its first AUTHENTICATED
+     * datagram -- an ordinary PING, tag verifies. */
+    memset(&ping, 0, sizeof ping);
+    ping.origin_ticks_ms = 1000u;
+    (void)apad_encode_ping(payload, sizeof payload, &ping);
+    n = build_raw_auth(buf, sizeof buf, (uint8_t)APAD_MSG_PING, sid, 2,
+                       payload, (uint16_t)sizeof payload, key);
+    (void)apad_server_on_datagram(srv, 1000u, &peer, buf, (size_t)n);
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) == 0,
+          "still zero right after the verifying tag: arming happens in "
+          "on_datagram, delivery happens in tick -- nothing has ticked yet");
+
+    /* The tick that CONSUMES inputcaps_dirty (resets next_ms to itself) does
+     * not also send in the same call (apad_time_after is strict -- see
+     * scenario_inputcaps_after_ack's own "no INPUTCAPS sent by the ACK
+     * itself" for the identical two-tick pattern on the non-auth path). */
+    (void)apad_server_tick(srv, 1001u);
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) == 0,
+          "still zero on the tick that arms the burst (next_ms == now_ms, "
+          "not yet due)");
+
+    (void)apad_server_tick(srv, 1002u);
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) >= 1,
+          "the burst begins on the FOLLOWING tick -- the first copy after "
+          "the first verifying tag, never before it");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_inputcaps_rearmed_on_status_change(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    uint32_t t;
+    int n, before, seen;
+    const recorded_send *r;
+    apad_inputcaps ic;
+
+    printf("\n-- inputcaps_rearmed_on_status_change: creating a device "
+           "re-arms the advertisement so the client sees *_READY promptly, "
+           "not after up to 5s --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 2, 4, 41123);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x73u, "harness-ic-rearm", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK, t=0");
+
+    for (t = 1u; t <= 900u; t++) {
+        (void)apad_server_tick(srv, t);
+    }
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) == 3,
+          "initial 3-copy burst completed");
+    r = nth_send_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS, 2);
+    check(r != NULL && inputcaps_of(r, &ic) && (ic.status & APAD_KBM_STATUS_KEYBOARD_READY) == 0u,
+          "...none of them show KEYBOARD_READY (nothing created yet)");
+
+    before = count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS);
+    memset(&kb, 0, sizeof kb);
+    key_set(kb.keys, APAD_HID_KEY_A);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    (void)apad_server_on_datagram(srv, 901u, &peer, buf, (size_t)n);
+
+    seen = 0;
+    for (t = 902u; t <= 910u && !seen; t++) {
+        int c0 = count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS);
+        (void)apad_server_tick(srv, t);
+        if (count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) > c0) {
+            seen = 1;
+        }
+    }
+    check(seen, "a fresh copy goes out within 10ms of device creation -- "
+                "re-armed, not waiting on the 5s slow repeat");
+    check(count_sends_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS) == before + 1,
+          "exactly one new copy so far");
+    r = nth_send_of_type(&hs, (uint8_t)APAD_MSG_INPUTCAPS, before);
+    check(r != NULL && inputcaps_of(r, &ic) && (ic.status & APAD_KBM_STATUS_KEYBOARD_READY) != 0u,
+          "...and THIS copy shows KEYBOARD_READY (S6.19: 'status is what "
+          "exists at this instant')");
+
+    apad_server_destroy(srv);
+}
+
+/* ------------------------------------------------------------------------
+ * MOUSE accumulator semantics (§6.16, §6.21)
+ * ------------------------------------------------------------------------ */
+
+static void scenario_mouse_baseline_zero(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_mouse mo;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- mouse_baseline_zero: first accepted MOUSE -> ZERO motion, "
+           "whatever the accumulator's raw value --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_MOUSE);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 3, 1, 41130);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x80u, "harness-baseline", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&mo, 0, sizeof mo);
+    mo.dx_accum = 12345u;
+    n = build_mouse(buf, sizeof buf, sid, 3, &mo);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 0,
+          "no mouse_motion() call at all for the baseline packet -- kbm.c "
+          "only calls the hook when motion is nonzero, and the first "
+          "accepted MOUSE always computes zero (S6.16 rule 1)");
+
+    mo.dx_accum = 12355u;   /* +10 from the baseline above */
+    n = build_mouse(buf, sizeof buf, sid, 4, &mo);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 1 && g_backend.mouse_motions[0].m.dx == 10,
+          "the SECOND packet's diff is +10, not +12355 -- proves 12345 was "
+          "correctly recorded as the baseline, not silently treated as 0");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_mouse_wrap(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_mouse mo;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- mouse_wrap: accumulator 0xFFFB -> 0x0005 gives dx +10, not "
+           "-65526 (S6.21's own worked example, applied through the server) --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_MOUSE);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 3, 2, 41131);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x81u, "harness-wrap", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&mo, 0, sizeof mo);
+    mo.dx_accum = 0xFFFBu;
+    n = build_mouse(buf, sizeof buf, sid, 3, &mo);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 0, "baseline packet: no motion call");
+
+    mo.dx_accum = 0x0005u;
+    n = build_mouse(buf, sizeof buf, sid, 4, &mo);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 1 && g_backend.mouse_motions[0].m.dx == 10,
+          "dx == +10 across the wrap, per apad_seq_diff(0x0005, 0xFFFB) "
+          "(S6.21)");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_mouse_gap_recovered(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_mouse mo;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- mouse_gap_recovered: deliver packets 1 and 3, drop 2 -- "
+           "total motion equals 1->3 exactly, nothing lost --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_MOUSE);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 3, 3, 41132);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x82u, "harness-gap", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&mo, 0, sizeof mo);
+    mo.dx_accum = 1000u;
+    n = build_mouse(buf, sizeof buf, sid, 3, &mo);   /* "packet 1" */
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 0, "packet 1: baseline, no motion call");
+
+    /* "packet 2" (dx_accum would have been e.g. 1015) is simply never sent. */
+
+    mo.dx_accum = 1030u;
+    n = build_mouse(buf, sizeof buf, sid, 5, &mo);   /* "packet 3" */
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 1 && g_backend.mouse_motions[0].m.dx == 30,
+          "packet 3's diff spans the gap: 1030-1000 = +30, exactly the "
+          "total displacement across all three, even though packet 2 was "
+          "never delivered (S6.16 rule 3: 'a dropped packet costs nothing')");
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_mouse_stale_no_baseline_advance(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_mouse mo;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- mouse_stale_no_baseline_advance: a discarded stale packet "
+           "must not move the baseline, or the next good packet jerks "
+           "backwards --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_MOUSE);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 3, 4, 41133);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x83u, "harness-stalebase", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&mo, 0, sizeof mo);
+    mo.dx_accum = 100u;
+    n = build_mouse(buf, sizeof buf, sid, 5, &mo);   /* header seq 5: baseline */
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 0, "baseline established at dx_accum=100");
+
+    mo.dx_accum = 500u;
+    n = build_mouse(buf, sizeof buf, sid, 3, &mo);   /* header seq 3: STALE (< 5) */
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 0,
+          "the stale packet (dx_accum=500) never reaches kbm.c at all -- "
+          "discarded at S6.20's window before apad_kbm_apply_mouse() runs");
+
+    mo.dx_accum = 110u;
+    n = build_mouse(buf, sizeof buf, sid, 6, &mo);   /* header seq 6: newer, ordinary +10 */
+    (void)apad_server_on_datagram(srv, 20u, &peer, buf, (size_t)n);
+    check(g_backend.mouse_motion_count == 1 && g_backend.mouse_motions[0].m.dx == 10,
+          "dx == +10 (110-100), NOT apad_seq_diff(110,500)==-390 -- the "
+          "baseline was never touched by the stale packet");
+
+    apad_server_destroy(srv);
+}
+
+/* ------------------------------------------------------------------------
+ * The event ring — receiver algorithm (§6.20)
+ * ------------------------------------------------------------------------ */
+
+static void scenario_key_ring_replay(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+    static const uint8_t k8[8] = {
+        APAD_HID_KEY_A, APAD_HID_KEY_B, APAD_HID_KEY_C, APAD_HID_KEY_D,
+        APAD_HID_KEY_E, APAD_HID_KEY_F, APAD_HID_KEY_G, APAD_HID_KEY_H
+    };
+
+    printf("\n-- key_ring_replay, gap of 3: exactly 3 events, oldest first --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 4, 1, 41140);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x90u, "harness-ring3", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);   /* baseline, event_seq=0, empty */
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 0, "baseline: empty snapshot, no batch at all");
+
+    memset(&kb, 0, sizeof kb);
+    kb.event_seq = 3u;   /* gap of 3 from last_applied=0 */
+    kb.events[5].usage = k8[0]; kb.events[5].flags = APAD_KBM_EVENT_DOWN;  /* A */
+    kb.events[6].usage = k8[1]; kb.events[6].flags = APAD_KBM_EVENT_DOWN;  /* B */
+    kb.events[7].usage = k8[2]; kb.events[7].flags = APAD_KBM_EVENT_DOWN;  /* C */
+    key_set(kb.keys, k8[0]); key_set(kb.keys, k8[1]); key_set(kb.keys, k8[2]);
+    n = build_keyboard(buf, sizeof buf, sid, 4, &kb);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 1, "exactly one batch call");
+    if (g_backend.kbm_batch_count == 1) {
+        const kbm_events_call *c = &g_backend.kbm_batches[0];
+        check(c->n == 3, "exactly 3 events (gap == depth used)");
+        check(c->n == 3 && c->ev[0].code == k8[0] && c->ev[1].code == k8[1]
+                  && c->ev[2].code == k8[2],
+              "oldest first: A, B, C in ring order");
+    }
+    apad_server_destroy(srv);
+
+    printf("\n-- key_ring_replay, gap of 0: none --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x91u, "harness-ring0", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+    memset(&kb, 0, sizeof kb);
+    kb.event_seq = 5u;
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 0, "baseline, empty");
+    n = build_keyboard(buf, sizeof buf, sid, 4, &kb);   /* same event_seq=5, same keys */
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 0,
+          "gap 0 (event_seq unchanged) and an unchanged snapshot -> NO batch call");
+    apad_server_destroy(srv);
+
+    printf("\n-- key_ring_replay, gap > depth (20 > 8): depth applied, and "
+           "the lost 12 events should be SURFACED, not swallowed --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x92u, "harness-ringover", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+    memset(&kb, 0, sizeof kb);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+
+    memset(&kb, 0, sizeof kb);
+    kb.event_seq = 20u;   /* gap of 20, depth is 8 -> overflow */
+    {
+        int i;
+        for (i = 0; i < 8; i++) {
+            kb.events[i].usage = k8[i];
+            kb.events[i].flags = APAD_KBM_EVENT_DOWN;
+            key_set(kb.keys, k8[i]);
+        }
+    }
+    n = build_keyboard(buf, sizeof buf, sid, 4, &kb);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 1, "exactly one batch call");
+    if (g_backend.kbm_batch_count == 1) {
+        const kbm_events_call *c = &g_backend.kbm_batches[0];
+        check(c->n == 8, "all 8 ring slots replayed (depth applied, not the "
+                         "full gap of 20)");
+    }
+    /* §6.20's receiver algorithm step 2 is normative -- "g > D ... Replay
+     * all D slots ... and surface the overflow rather than swallowing it."
+     * server/src/kbm.c now hands the lost-event count back to server.c,
+     * which reports it through the on_log sink (rate-limited -- see
+     * kbm_log_overflow() in server/src/server.c); this was previously a
+     * known, reported gap (server/src/kbm.c discarded `overflow` via
+     * `(void)overflow` at all three call sites) and is fixed now. */
+    check(
+              any_log_contains(&hs, "overflow") || any_log_contains(&hs, "lost")
+              || any_log_contains(&hs, "gap"),
+          "S6.20 step 2: the receiver surfaces an event-ring overflow "
+          "(here g=20, D=8, 12 events unrecoverably lost) via the on_log "
+          "sink rather than silently discarding it");
+    apad_server_destroy(srv);
+}
+
+static void scenario_key_bitmap_wins(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- key_bitmap_wins: a ring disagreeing with keys[] -> post-apply "
+           "state equals keys[] --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 4, 2, 41141);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x93u, "harness-bitmapwins", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);   /* baseline, A not held */
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+
+    memset(&kb, 0, sizeof kb);
+    kb.event_seq = 1u;
+    kb.events[7].usage = APAD_HID_KEY_A;
+    kb.events[7].flags = APAD_KBM_EVENT_DOWN;   /* ring says: A pressed */
+    /* keys[] disagrees: A is NOT set, i.e. the snapshot says A is not held. */
+    n = build_keyboard(buf, sizeof buf, sid, 4, &kb);
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+
+    check(g_backend.kbm_batch_count == 1, "one batch call for this datagram");
+    if (g_backend.kbm_batch_count == 1) {
+        const kbm_events_call *c = &g_backend.kbm_batches[0];
+        check(c->n == 2, "two events: the ring's press, then the "
+                         "reconcile's compensating release");
+        check(c->n == 2 && c->ev[0].code == APAD_HID_KEY_A && c->ev[0].down == 1u,
+              "event 0: ring replay says A pressed");
+        check(c->n == 2 && c->ev[1].code == APAD_HID_KEY_A && c->ev[1].down == 0u,
+              "event 1: step-3 reconcile immediately corrects it -- net "
+              "state (the LAST event for A in this batch) matches keys[] "
+              "(not held), not the ring");
+    }
+
+    apad_server_destroy(srv);
+}
+
+static void scenario_key_reconcile_without_events(void) {
+    harness_state hs;
+    apad_server *srv;
+    apad_addr peer;
+    apad_keyboard kb;
+    uint8_t buf[APAD_MAX_DATAGRAM];
+    uint16_t sid = 0;
+    int n;
+
+    printf("\n-- key_reconcile_without_events: snapshot changes while "
+           "event_seq does NOT -- still converges in one packet --\n");
+    srv = make_server_kbm(&hs, APAD_KBM_CAP_KEYBOARD);
+    check(srv != NULL, "apad_server_create");
+    apad_addr_set(&peer, 10, 2, 4, 3, 41142);
+    check(establish_and_ack(srv, &hs, peer, 0u, 0x94u, "harness-reconcile", 1, 2, &sid),
+          "HELLO -> WELCOME -> ACK");
+
+    memset(&kb, 0, sizeof kb);
+    n = build_keyboard(buf, sizeof buf, sid, 3, &kb);   /* baseline: event_seq=0, A not held */
+    (void)apad_server_on_datagram(srv, 0u, &peer, buf, (size_t)n);
+    check(g_backend.kbm_batch_count == 0, "baseline: empty, no batch");
+
+    memset(&kb, 0, sizeof kb);
+    kb.event_seq = 0u;          /* UNCHANGED -- a non-conforming sender */
+    key_set(kb.keys, APAD_HID_KEY_A);   /* but the snapshot now holds A */
+    n = build_keyboard(buf, sizeof buf, sid, 4, &kb);   /* newer HEADER sequence */
+    (void)apad_server_on_datagram(srv, 10u, &peer, buf, (size_t)n);
+
+    check(g_backend.kbm_batch_count == 1,
+          "converges in exactly this one packet, via step 3's UNCONDITIONAL "
+          "reconcile -- not the ring (gap <= 0 replays nothing). Under a "
+          "buggy 'reconcile only on overflow' implementation this would "
+          "disagree PERMANENTLY (S6.20's own stated failure mode)");
+    if (g_backend.kbm_batch_count == 1) {
+        const kbm_events_call *c = &g_backend.kbm_batches[0];
+        check(c->n == 1 && c->ev[0].code == APAD_HID_KEY_A && c->ev[0].down == 1u,
+              "the single event is A pressed, from the reconcile alone");
+    }
+
+    apad_server_destroy(srv);
+}
 
 int main(void) {
     printf("== AtticPad server-harness: libapadserver via apadserver.h, no sockets, "
@@ -1920,6 +3383,34 @@ int main(void) {
     scenario_pairing_ack_discharges();
 
     scenario_ui_query_api();
+
+    /* §6.15-§6.20 KEYBOARD/MOUSE/MEDIA/INPUTCAPS. docs/PROTOCOL.md §15 item
+     * 10: the watchdog/repeat-floor scenarios are the reason this whole
+     * group exists -- core has no clock, this harness does. */
+    scenario_kbm_lazy_create();
+    scenario_kbm_not_advertised();
+    scenario_kbm_stale_dropped();
+    scenario_kbm_class_windows();
+    scenario_kbm_wrong_peer_address();
+
+    scenario_kbm_watchdog_releases();
+    scenario_kbm_watchdog_not_early();
+    scenario_kbm_watchdog_boundary();
+    scenario_kbm_teardown_releases_before_destroy();
+
+    scenario_inputcaps_after_ack();
+    scenario_inputcaps_not_before_ack();
+    scenario_inputcaps_auth_waits_for_verified_tag();
+    scenario_inputcaps_rearmed_on_status_change();
+
+    scenario_mouse_baseline_zero();
+    scenario_mouse_wrap();
+    scenario_mouse_gap_recovered();
+    scenario_mouse_stale_no_baseline_advance();
+
+    scenario_key_ring_replay();
+    scenario_key_bitmap_wins();
+    scenario_key_reconcile_without_events();
 
     printf("\n%d failure(s)\n", g_failures);
     return g_failures != 0;

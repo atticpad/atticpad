@@ -55,6 +55,10 @@ Three pieces, only one of which you write from scratch:
   an `apad_addr` you must render back to text.
 - STATUS and ERROR share a serial in the stats snapshot.
 - The handshake has no progress callback (blank screen up to ~4 s).
+- `probe()` refuses `255.255.255.255` (`APAD_ERR_ARG`): its socket has no
+  `SO_BROADCAST`, and on DSWiFi's lwIP that send never returns. Tier-2
+  broadcast is the platform's job on its own shim socket, as
+  `clients/3ds/source/main.c`'s `app_discover()` does it.
 
 If your port needs one of these, fix it in the engine — a workaround in
 platform code recreates the drift the engine exists to kill.

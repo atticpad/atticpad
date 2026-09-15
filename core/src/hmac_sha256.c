@@ -2,11 +2,15 @@
  *
  * Written from FIPS 180-4 (SHA-256), FIPS 198-1 (HMAC) and RFC 8018 (PBKDF2).
  * No third-party code, no allocation, no floating point, no stdio. Fixed
- * stack cost: the PBKDF2 driver below uses about 200 bytes plus the contexts.
+ * stack cost: the PBKDF2 driver below holds two saved SHA-256 contexts and a
+ * working copy, ~700 bytes of frame (measured, gcc -O2 x86-64), ~1.2 KB peak
+ * once sha256_block's message schedule is counted.
  *
  * Everything here must run on a 67 MHz ARM9. PBKDF2 at the 10,000 iterations
  * §10 mandates costs roughly one second there, which is the whole reason the
- * iteration count is 10,000 and not 600,000 (docs/DESIGN.md D3).
+ * iteration count is 10,000 and not 600,000 (docs/DESIGN.md D3). The driver hoists
+ * the two key-derived compressions out of the iteration loop for the same
+ * reason — see the comment on pbkdf2_prf_finish().
  *
  * The security of this protocol does not come from any of this code; it comes
  * from the 120-second pairing window, the five-attempt limit, and LAN-only
@@ -189,6 +193,21 @@ void apad_sha256(const void *data, size_t len, uint8_t out[APAD_SHA256_DIGEST_LE
 
 /* ---- HMAC-SHA256 (FIPS 198-1) ------------------------------------------ */
 
+/* K0 (FIPS 198-1 §4 steps 1-3): a short key is zero-padded to the block
+ * length, a long one is hashed first. Factored out so apad_hmac_sha256_init()
+ * and the PBKDF2 driver below cannot drift apart on the key expansion — they
+ * must agree byte for byte or PBKDF2 stops matching HMAC. */
+static void hmac_key_block(uint8_t k0[APAD_SHA256_BLOCK_LEN],
+                           const uint8_t *key, size_t key_len)
+{
+    memset(k0, 0, (size_t)APAD_SHA256_BLOCK_LEN);
+    if (key_len > (size_t)APAD_SHA256_BLOCK_LEN) {
+        apad_sha256(key, key_len, k0);          /* K0 = H(K), zero-padded */
+    } else if (key_len != 0u && key != NULL) {
+        memcpy(k0, key, key_len);
+    }
+}
+
 void apad_hmac_sha256_init(apad_hmac_ctx *c, const uint8_t *key, size_t key_len)
 {
     uint8_t k0[APAD_SHA256_BLOCK_LEN];
@@ -198,12 +217,7 @@ void apad_hmac_sha256_init(apad_hmac_ctx *c, const uint8_t *key, size_t key_len)
     if (c == NULL) {
         return;
     }
-    memset(k0, 0, sizeof k0);
-    if (key_len > (size_t)APAD_SHA256_BLOCK_LEN) {
-        apad_sha256(key, key_len, k0);          /* K0 = H(K), zero-padded */
-    } else if (key_len != 0u && key != NULL) {
-        memcpy(k0, key, key_len);
-    }
+    hmac_key_block(k0, key, key_len);
 
     for (i = 0; i < (unsigned)APAD_SHA256_BLOCK_LEN; i++) {
         ipad[i]    = (uint8_t)(k0[i] ^ 0x36u);
@@ -256,26 +270,80 @@ void apad_hmac_sha256(const uint8_t *key, size_t key_len,
 
 /* ---- PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) -------------------------------- */
 
+/* PBKDF2 calls HMAC with the SAME key `iterations` times. FIPS 198-1's two
+ * key-derived blocks — H(K0^ipad ...) and H(K0^opad ...) — are therefore
+ * identical in every one of those calls, and re-running them per iteration is
+ * half the work of a derivation. So the two contexts are built once here and
+ * copied per iteration: 2 SHA-256 compressions per iteration instead of 4.
+ *
+ * This is arithmetic, not a protocol change: the bytes produced are exactly
+ * those of the naive loop (the PBKDF2, secret-length and §10.2 derive vectors
+ * in core/testdata/vectors.h are the proof, Appendix A included). It exists
+ * because on a 67 MHz ARM9 the 10,000-iteration derive of §10.2 has to finish
+ * inside the server's 3 s idle window (§11) or the paired connect never
+ * completes.
+ *
+ * Contexts are copied by struct assignment — never by casting a pointer onto a
+ * buffer — so no unaligned access is possible on the ARM9. */
+static void pbkdf2_prf_finish(const apad_sha256_ctx *outer0,
+                              apad_sha256_ctx *inner,
+                              uint8_t out[APAD_SHA256_DIGEST_LEN])
+{
+    apad_sha256_ctx c;
+    uint8_t inner_digest[APAD_SHA256_DIGEST_LEN];
+
+    apad_sha256_final(inner, inner_digest);     /* wipes the caller's copy */
+
+    c = *outer0;                                /* saved opad block, not re-run */
+    apad_sha256_update(&c, inner_digest, sizeof inner_digest);
+    apad_sha256_final(&c, out);
+
+    apad_secure_zero(inner_digest, sizeof inner_digest);
+}
+
 void apad_pbkdf2_sha256(const uint8_t *pw, size_t pw_len,
                         const uint8_t *salt, size_t salt_len,
                         uint32_t iterations,
                         uint8_t *out, size_t out_len)
 {
+    apad_sha256_ctx inner0;                     /* K0^ipad already absorbed */
+    apad_sha256_ctx outer0;                     /* K0^opad already absorbed */
+    uint8_t k0[APAD_SHA256_BLOCK_LEN];
+    uint8_t pad[APAD_SHA256_BLOCK_LEN];
     uint8_t u[APAD_SHA256_DIGEST_LEN];
     uint8_t t[APAD_SHA256_DIGEST_LEN];
     uint8_t counter[4];
     uint32_t block = 1u;
     size_t done = 0u;
+    unsigned i;
 
     if (out == NULL || out_len == 0u || iterations == 0u) {
         return;
     }
 
+    /* Key schedule, once per call. Identical expansion to
+     * apad_hmac_sha256_init(), which is why both go through hmac_key_block(). */
+    hmac_key_block(k0, pw, pw_len);
+
+    for (i = 0; i < (unsigned)APAD_SHA256_BLOCK_LEN; i++) {
+        pad[i] = (uint8_t)(k0[i] ^ 0x36u);
+    }
+    apad_sha256_init(&inner0);
+    apad_sha256_update(&inner0, pad, sizeof pad);
+
+    for (i = 0; i < (unsigned)APAD_SHA256_BLOCK_LEN; i++) {
+        pad[i] = (uint8_t)(k0[i] ^ 0x5Cu);
+    }
+    apad_sha256_init(&outer0);
+    apad_sha256_update(&outer0, pad, sizeof pad);
+
+    apad_secure_zero(k0, sizeof k0);
+    apad_secure_zero(pad, sizeof pad);
+
     while (done < out_len) {
-        apad_hmac_ctx c;
+        apad_sha256_ctx c;
         uint32_t iter;
         size_t take;
-        unsigned i;
 
         /* INT(block), big-endian per RFC 8018. */
         counter[0] = (uint8_t)((block >> 24) & 0xFFu);
@@ -283,14 +351,18 @@ void apad_pbkdf2_sha256(const uint8_t *pw, size_t pw_len,
         counter[2] = (uint8_t)((block >> 8) & 0xFFu);
         counter[3] = (uint8_t)(block & 0xFFu);
 
-        apad_hmac_sha256_init(&c, pw, pw_len);
-        apad_hmac_sha256_update(&c, salt, salt_len);
-        apad_hmac_sha256_update(&c, counter, sizeof counter);
-        apad_hmac_sha256_final(&c, u);
+        /* U_1 = PRF(P, S || INT(i)) */
+        c = inner0;
+        apad_sha256_update(&c, salt, salt_len);
+        apad_sha256_update(&c, counter, sizeof counter);
+        pbkdf2_prf_finish(&outer0, &c, u);
         memcpy(t, u, sizeof t);
 
+        /* U_n = PRF(P, U_{n-1}); T = U_1 ^ ... ^ U_iterations */
         for (iter = 1u; iter < iterations; iter++) {
-            apad_hmac_sha256(pw, pw_len, u, sizeof u, u);
+            c = inner0;
+            apad_sha256_update(&c, u, sizeof u);
+            pbkdf2_prf_finish(&outer0, &c, u);
             for (i = 0; i < (unsigned)APAD_SHA256_DIGEST_LEN; i++) {
                 t[i] = (uint8_t)(t[i] ^ u[i]);
             }
@@ -307,6 +379,8 @@ void apad_pbkdf2_sha256(const uint8_t *pw, size_t pw_len,
 
     apad_secure_zero(u, sizeof u);
     apad_secure_zero(t, sizeof t);
+    apad_secure_zero(&inner0, sizeof inner0);
+    apad_secure_zero(&outer0, sizeof outer0);
 }
 
 void apad_derive_session_key(const char *pin,

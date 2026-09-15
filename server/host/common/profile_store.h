@@ -99,7 +99,7 @@ typedef struct {
  * call site -- so adding a third shipped profile later is a one-line change
  * in exactly one place. */
 static const char *const profile_store_shipped_names[] = {
-    "3ds-default", "generic-default"
+    "3ds-default", "ds-default", "generic-default"
 };
 #define PROFILE_STORE_SHIPPED_COUNT \
     (int)(sizeof profile_store_shipped_names / sizeof profile_store_shipped_names[0])

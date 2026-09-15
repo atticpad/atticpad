@@ -82,8 +82,18 @@ int apad_qr_decode(apad_qr *d, const uint8_t *y, int width, int height,
 
     count = quirc_count(d->q);
     for (i = 0; i < count; i++) {
-        struct quirc_code code;
-        struct quirc_data data;
+        /* STATIC, NOT ON THE STACK. struct quirc_code is ~4 KB and
+         * struct quirc_data ~9 KB (QUIRC_MAX_PAYLOAD 8896 plus headers): as
+         * automatic variables that was ~13 KB of stack in one frame, which
+         * the DS cannot afford -- BlocksDS puts the ARM9 user stack in the
+         * 16 KB DTCM. A QR whose payload or version drove quirc_decode()
+         * deeper than the small pairing code does blew that stack and took
+         * the console down mid-decode (seen on a DSi scanning an older
+         * server build's QR, 2026-09-10). One decode runs at a time on every
+         * client, so file-scope storage is safe; it costs 13 KB of .bss on
+         * the phone and the 3DS, which is nothing there. */
+        static struct quirc_code code;
+        static struct quirc_data data;
 
         quirc_extract(d->q, i, &code);
         if (quirc_decode(&code, &data) != QUIRC_SUCCESS) {

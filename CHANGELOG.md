@@ -8,6 +8,83 @@ it and play a game, which is what 1.0 will mean.
 The **product version** and the **protocol version** move independently. The
 wire format is AtticPad protocol **v1, frozen** — see `docs/PROTOCOL.md`.
 
+## [0.6.0] — 2026-09-15
+
+### Added
+
+- **Keyboard, mouse and media remote control**, on top of the gamepad. Four
+  new additive message types — `KEYBOARD` 0x21, `MOUSE` 0x22, `MEDIA` 0x23,
+  `INPUTCAPS` 0x44 — allocated after the v1 freeze under the rule
+  `docs/PROTOCOL.md` §6.14 states and audits them against: nothing that
+  existed before changed size, position or meaning, and `caps` (§6.3) is
+  untouched on purpose. A server advertises which of the three it accepts via
+  `INPUTCAPS`; a client shows nothing until it hears that, and an old client
+  or an old server simply never speaks the new types at all. See
+  [`docs/KBM.md`](docs/KBM.md) for the full picture, including the Windows
+  `SendInput` limitations and the 10 of 24 §6.18 media controls that backend
+  cannot drive.
+  - **Android** — a mode bar (PAD/MOUSE/KEYBOARD/MEDIA): a trackpad view, a
+    real physical-style key grid with genuine multi-finger chord support, a
+    curated text-entry bar, and a media remote.
+  - **3DS** — the same four modes on the bottom screen, adapted to a
+    resistive, single-contact touchscreen: a sticky SHIFT/CTRL latch for
+    KEYS mode, plus physical L/R as always-live modifiers on top of it.
+  - **Linux server** — three `uinput` nodes per session, created lazily on
+    first use and torn down in spec order (release held state, then destroy
+    the device) before a session closes.
+  - **Windows server** — a `SendInput`-based backend. Built and compiled in
+    CI on every push; **never run on real Windows hardware as of this
+    writing** — see `docs/KBM.md` for the specific, permanent limitations
+    (UIPI elevation, the secure desktop, anti-cheat rejection, pointer
+    ballistics, and one shared system keyboard/mouse across sessions) and
+    `docs/QA.md` §11 for the hardware checklist this still needs.
+  - `docs/PROTOCOL.md` §6.22 reserves message type `0x24` for a future
+    `TEXT` type, because today's `KEYBOARD` carries HID usage IDs (physical
+    key positions) and text entry therefore assumes a US-QWERTY host layout
+    — see `docs/KBM.md`.
+
+- **PlayStation Portable client** (`EBOOT.PBP`, in `atticpad-psp.zip`).
+  Analog nub, every button, an on-screen keypad for the address and the
+  PIN, PIN pairing, the server and network remembered, and the self-test.
+  Hardware-proven — see `docs/SUPPORT-TIERS.md` and `docs/INSTALL.md`.
+- **Nintendo DS / DSi client** (`atticpad-nds.nds`). The 3DS screens on a
+  DS: a network picker with WEP keys typed on the touch keyboard, typed
+  address and PIN, the four PAD / MOUSE / KEYS / MEDIA modes, the
+  self-test, and the last server and network remembered. In DSi mode it
+  joins WPA2, reports the battery, and pairs by scanning the server's QR
+  with the camera. The server ships a `ds-default` profile that drives the
+  left stick from the touchscreen. Hardware-proven in both modes — see
+  `docs/SUPPORT-TIERS.md`, `docs/INSTALL.md` and `docs/SETUP-DS.md` for
+  the open-or-WEP constraint of DS mode.
+
+- **A profile can map a button to a trigger.** `"L": "LT"` in a profile's
+  buttons map gives a device with no analog triggers, such as the PSP, a
+  full-pull LT while the button is held; the web editor offers LT and RT
+  in the button dropdown.
+
+### Changed
+
+- **Discovery on the 3DS and DS prefers the server you last used.** When
+  more than one server answers a LAN DISCOVER, the console now picks the one
+  whose address it saved after its last session (or picked last time) rather
+  than whichever answered first; the first responder only wins when the
+  remembered one stays silent for the whole window. On a LAN with two
+  servers the faster machine used to win every boot and look hardcoded.
+  Nothing is hardcoded: a fresh unit still starts empty. The Android
+  address field's placeholder no longer looks like a real address.
+
+### Fixed
+
+- **A sticky Shift on the 3DS typed a lowercase letter.** The server applied
+  a report's keys in usage order, so a letter arriving in the same report as
+  Shift was pressed before it. Modifiers now go first, as a host treats a
+  real HID keyboard report.
+- **The 3DS never updated its remembered server after the first save.** The
+  console's filesystem refuses a rename onto an existing file; the old file
+  is removed first now.
+- **The PSP rejoins the network after a suspend.** A power callback re-runs
+  the network bring-up on resume.
+
 ## [0.5.0] — 2026-08-17
 
 **First public release.** AtticPad was built over several months before this
@@ -142,4 +219,5 @@ SD card.
 - PS Vita, PSP, DS/DSi, Switch and desktop clients are designed but not built.
   The Vita toolchain is additionally blocked upstream.
 
+[0.6.0]: https://github.com/atticpad/atticpad/releases/tag/v0.6.0
 [0.5.0]: https://github.com/atticpad/atticpad/releases/tag/v0.5.0

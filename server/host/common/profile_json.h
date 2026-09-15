@@ -157,7 +157,11 @@ static void profile_json_serialize(ui_strbuf *sb, const apad_profile *p,
         }
         sb_json_string(sb, apad_profile_wire_btn_names[i]);
         sb_append(sb, ":");
-        sb_json_string(sb, apad_pad_btn_name(p->btn_pad_bit[i]));
+        /* apad_profile_btn_target_name(), not apad_pad_btn_name(): a wire
+         * button aimed at an analog trigger has btn_pad_bit == 0 and would
+         * otherwise serialise as "NONE" -- and this GET response is a valid
+         * PUT body, so that would erase the mapping on the next save. */
+        sb_json_string(sb, apad_profile_btn_target_name(p, i));
     }
     sb_append(sb, "},\"sticks\":{\"left\":");
     profile_json_write_stick(sb, &p->left);

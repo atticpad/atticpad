@@ -4,15 +4,17 @@
 M1. Every constant, offset, bit position, payload size, normalisation rule and
 the reliability contract in §8/§9 are now fixed. **Any change to them is a v2
 change** — stop and report rather than making one. Adding a NEW message type is
-the one additive exception, ruled and bounded in §6.14; §6.12 was added that way
-and the format is otherwise unchanged.
+the one additive exception, ruled and bounded in §6.14. Five types have been
+added that way — §6.12 in 2026-08-16, and §6.15–§6.19 in 2026-08-25 — and the
+format is otherwise unchanged.
 
 Frozen against, **as of 2026-08-09**: 193 conformance vectors derived from this
 document by an author who never read the codec, 990 self-test cases, 675 + 46
 cross-validation checks with zero disagreements, a clean libFuzzer run, and two
 independent audits. Those are the figures the freeze was taken against and are
-left as the historical record; the suite has grown since (239 vectors, 1141
-self-test cases at 0.5.0) without any wire-visible change. §15 tracks what has
+left as the historical record; the suite has grown since — 1987 self-test
+cases across 34 vector tables as of 2026-08-25 — without any wire-visible
+change to v1. §15 tracks what has
 been verified since — including, at §15.9, the one message type that has no
 independently derived vectors.
 
@@ -117,12 +119,16 @@ mitigations. Checks 4 and 6 are separate and both mandatory.
 | `0x11` | `WELCOME` | server → client | yes | 60 bytes (§6.4) |
 | `0x12` | `BYE` | either | yes | 4 bytes (§6.5) |
 | `0x20` | `INPUT_STATE` | client → server | **no** | 56 bytes (§5) |
+| `0x21` | `KEYBOARD` | client → server | **no** | 56 bytes (§6.15) |
+| `0x22` | `MOUSE` | client → server | **no** | 24 bytes (§6.16) |
+| `0x23` | `MEDIA` | client → server | **no** | 20 bytes (§6.17) |
 | `0x30` | `PING` | either | no | 8 bytes (§6.6) |
 | `0x31` | `PONG` | either | no | 8 bytes (§6.6) |
 | `0x40` | `RUMBLE` | server → client | yes | 8 bytes (§6.7) |
 | `0x41` | `LED` | server → client | yes | 4 bytes (§6.8) |
 | `0x42` | `STATUS` | server → client | yes | 64 bytes (§6.9) |
 | `0x43` | `TOUCHMAP` | server → client | no | 68 bytes (§6.12) |
+| `0x44` | `INPUTCAPS` | server → client | no | 16 bytes (§6.19) |
 | `0x50` | `ACK` | either | no | 4 bytes (§6.10) |
 | `0x51` | `ERROR` | either | no | 64 bytes (§6.11) |
 
@@ -281,11 +287,15 @@ battery level.
 
 ### 6.0 Out-of-range values in this section
 
-Three fields carry an explicit receive-side normalisation rule —
+Some fields carry an explicit receive-side normalisation rule — at v1,
 `ANNOUNCE.pairing_required` (§6.2), `LED.player_index` (§6.8) and, in §5,
-`battery`. They share a property: each drives something a consumer acts on, so
-an out-of-range value has to become a defined one before it reaches
-application code.
+`battery`; §6.15–§6.17 later added the event codes of `KEYBOARD`, `MOUSE` and
+`MEDIA` on the same reasoning, and specify them there. They share a property:
+each drives something a consumer acts on, so an out-of-range value has to
+become a defined one before it reaches application code.
+
+**The rule below is unchanged from v1** — only the list of fields it governs
+has grown, and it grew additively with the types that brought them.
 
 **The enumerated fields are deliberately different.** `BYE.reason` (§6.5),
 `STATUS.code` (§6.9) and `ERROR.code` (§6.11) list their defined values but
@@ -536,6 +546,623 @@ that, and a conformance vector caught it.
 `docs/V2-NOTES.md` inventories what the remaining extension space can absorb
 under this ruling and what would genuinely require a v2. It is non-normative
 and may lag; this section is the ruling.
+
+### 6.15 `KEYBOARD` (0x21) — 56 bytes
+
+**Added after the v1 freeze, additively.** See §6.14 for why that is permitted,
+and §6.20 for the audit of these four types against it.
+
+Carries a client's keyboard. Optional in both directions: a client need never
+send one, and a server that does not understand it discards it under §4 like
+any unknown type. A client MUST NOT send `KEYBOARD` unless a server has
+advertised `APAD_KBM_FEATURE_KEYBOARD` in `INPUTCAPS` (§6.19).
+
+| Off | Size | Field |
+|---|---|---|
+| 0 | 32 | `keys[32]` — held-key bitmap, below |
+| 32 | 2 | `event_seq` — total key events generated this session; wraps |
+| 34 | 1 | `reserved0` |
+| 35 | 1 | `reserved1` |
+| 36 | 16 | `events[8]` — 2 bytes each, **oldest at index 0, newest at index 7** |
+| 52 | 4 | `client_ticks_ms` — client monotonic clock at sample time, as §5 |
+
+Each event, at `36 + 2*i`:
+
+| Off | Size | Field |
+|---|---|---|
+| +0 | 1 | `usage` — HID usage. **0 = no event.** 0x01–0x03 reserved |
+| +1 | 1 | `flags` — bit 0 `DOWN` (1 press, 0 release); bits 1–7 reserved |
+
+**Keycodes are USB HID Usage Page 0x07 usage IDs, and `keys[]` is a 256-bit
+bitmap in which the bit index IS the usage ID.** Usage `u` is byte `u >> 3`,
+bit `u & 7`, counting from the least significant bit within a byte — the same
+LSB-first rule §5.1 uses for `buttons`.
+
+Three properties earn the bitmap its 32 bytes. It sidesteps the six-key
+rollover limit a real HID boot report has, which a device holding
+W+A+Shift+Ctrl+Space+two more would otherwise hit. Modifiers are usages
+`0xE0`–`0xE7`, so they ride inside the same bitmap and there is no second
+modifier byte for two implementations to disagree about. And the mapping from
+usage ID to a host keycode is published by every operating system that speaks
+USB, so a server translates from a table it can obtain rather than one it must
+invent.
+
+**Reserved:** `keys[0]` bits 0–3 (HID defines usages `0x00`–`0x03` as
+no-event, ErrorRollOver, POSTFail and ErrorUndefined — conditions, not keys),
+`reserved0`, `reserved1`, and `flags` bits 1–7. Zero on send, scrubbed on
+receive per §2.
+
+**One further normalisation, and it is mandatory.** An `events[i]` whose
+`usage` decodes to 0 — either because it was sent as 0, or because it was
+sent as a reserved 0x01–0x03 and normalised — MUST also have its `flags`
+forced to 0. A "no event" slot therefore decodes byte-identically whatever a
+non-conforming sender put in it, which is what lets a conformance vector
+compare two decoded structures for exact equality. `usage` is a control input
+under §6.0, not a diagnostic label, so normalising it is correct where
+preserving `BYE.reason` is correct.
+
+**Usages the receiver does NOT normalise.** HID 1.12 leaves `0xA5`–`0xAF`,
+`0xDE`–`0xDF` and `0xE8`–`0xFF` reserved. A decoder MUST pass them through
+unchanged. A full validity mask would freeze one revision of the HID
+specification into a decoder that cannot be changed, and an unmapped usage is
+already harmless: a server has no table entry for it and emits nothing.
+
+**Sender obligations.** A sender SHOULD emit a `KEYBOARD` whenever `keys[]` or
+`event_seq` changes, and SHOULD send three copies about 50 ms apart after the
+last key releases. **While any key is held it MUST repeat at 10 Hz or
+faster** — see §6.20, which specifies that obligation, the receiver's watchdog
+that measures against it, and the release rules that go with both. The repeat
+is a MUST rather than a SHOULD because a change-only sender is
+indistinguishable from a dead one, and the watchdog cannot tell them apart
+without it.
+
+**Staleness.** A receiver MUST apply the per-type window in §6.20 before
+anything else in this section.
+
+**Unreliable, deliberately** — see §6.20 for the argument, which is §6.12's
+and applies to all four of these types.
+
+### 6.16 `MOUSE` (0x22) — 24 bytes
+
+Relative pointer motion, buttons and wheels. A client MUST NOT send `MOUSE`
+unless a server has advertised `APAD_KBM_FEATURE_MOUSE` (§6.19).
+
+| Off | Size | Field |
+|---|---|---|
+| 0 | 2 | `dx_accum` — wrapping accumulator, **+ = right** |
+| 2 | 2 | `dy_accum` — wrapping accumulator, **+Y down** |
+| 4 | 2 | `wheel_accum` — wrapping, detents, **+ = away from the user** |
+| 6 | 2 | `hwheel_accum` — wrapping, detents, **+ = right** |
+| 8 | 2 | `buttons` — held-button bitmask, below |
+| 10 | 2 | `event_seq` — total button events this session; wraps |
+| 12 | 8 | `events[4]` — 2 bytes each, oldest at index 0 |
+| 20 | 4 | `client_ticks_ms` |
+
+Each event, at `12 + 2*i`: `+0` `button` (u8, **0 = no event**, otherwise the
+index below), `+1` `flags` (bit 0 `DOWN`, bits 1–7 reserved). `button` above 5
+normalises to 0, and — the same "no event decodes byte-identically" rule as
+§6.15 — **a slot whose `button` *decodes* to 0, whether it was sent as 0 or
+normalised to it, MUST have its `flags` forced to 0 as well.** Stated that way
+on purpose: "outside 0..5" would leave a slot sent as `(0, DOWN)` uncovered,
+and that is precisely the slot the byte-identity property depends on.
+
+Buttons, used both as the `buttons` bit position and as the event index:
+
+| Bit | Index | Button |
+|---|---|---|
+| 0 | 1 | LEFT |
+| 1 | 2 | RIGHT |
+| 2 | 3 | MIDDLE |
+| 3 | 4 | BACK |
+| 4 | 5 | FORWARD |
+| 5–15 | — | reserved, MUST be zero |
+
+**`+Y` is down here, not up.** This is screen space, matching §5.3's touch
+convention rather than its stick convention, because every client that will
+drive this surface drives it from a touchscreen where the finger and the
+pointer must move the same way.
+
+#### Accumulator semantics — normative
+
+**The absolute value of an accumulator carries no meaning.** A receiver
+computes motion as `apad_seq_diff(now, previous)` (§6.21) against the last
+**accepted** sample, and MUST NOT interpret the value any other way.
+
+Three rules make this correct:
+
+1. **The first accepted `MOUSE` of a session — or the first after the
+   receiver's pointer device is created — establishes the baseline and MUST
+   produce zero motion.** Without this the opening packet injects a jump of up
+   to 32767 counts in an arbitrary direction.
+2. **A packet discarded as stale under §6.20's per-type window MUST NOT
+   advance the baseline.** Advancing it would turn a reordered packet into a
+   backwards jerk and then a compensating forward one. Note the window this
+   cites is §6.20's, not §9's: §9's sliding window is `INPUT_STATE`-only by its
+   own wording and says nothing about this type.
+3. A dropped packet costs nothing. The gap it left is recovered in the next
+   accepted packet's diff, because the diff spans it.
+
+This is the same reasoning §9 applies to sequence numbers, using the same
+helper, and for the same reason: a naive subtraction is correct until the
+accumulator wraps and then it is catastrophically wrong. 16 bits gives an
+unambiguous ±32767 counts between consecutive accepted samples; a fast flick
+across a phone screen covers on the order of 2000.
+
+Wheels accumulate in **detents**, not pixels or fractions. Smooth or
+high-resolution scrolling is not v1.
+
+**Staleness, ring replay, held-repeat and release** are all §6.20's, shared
+with §6.15 and §6.17. `MOUSE`'s ring depth is 4. Note that the held-repeat
+obligation covers `buttons` only — motion needs no repeat, because an
+accumulator that has not changed encodes "no motion" exactly.
+
+### 6.17 `MEDIA` (0x23) — 20 bytes
+
+Transport, volume and navigation controls, for a client acting as a remote. A
+client MUST NOT send `MEDIA` unless a server has advertised
+`APAD_KBM_FEATURE_MEDIA` (§6.19).
+
+| Off | Size | Field |
+|---|---|---|
+| 0 | 4 | `held` — control `c` (1..32) is bit `c-1` |
+| 4 | 2 | `event_seq` — total control events this session; wraps |
+| 6 | 1 | `reserved0` |
+| 7 | 1 | `reserved1` |
+| 8 | 8 | `events[4]` — 2 bytes each, oldest at index 0 |
+| 16 | 4 | `client_ticks_ms` |
+
+Each event, at `8 + 2*i`: `+0` `control` (u8, **0 = no event**, otherwise
+1..32), `+1` `flags` (bit 0 `DOWN`). `control` above 32, and any control index
+§6.18 leaves unassigned, normalises to 0; and **a slot whose `control`
+*decodes* to 0, whether sent as 0 or normalised to it, MUST have its `flags`
+forced to 0 as well** — §6.15's byte-identity rule, which a bare "outside
+0..32" would leave a slot sent as `(0, DOWN)` outside of.
+
+Bits of `held` for unassigned control indices are reserved and scrubbed.
+
+**Staleness, ring replay, held-repeat and release** are all §6.20's, shared
+with §6.15 and §6.16. `MEDIA`'s ring depth is 4.
+
+**Both a held mask and an event ring, because the two answer different
+questions.** `held` lets VOLUME_UP be held down for a ramp and self-heals
+after loss the way §5's `buttons` does. The ring lets a single NEXT_TRACK tap
+— which begins and ends between two samples — survive a dropped packet.
+
+**Its own message type, not a corner of §6.15.** Three reasons, and the first
+is the one that would otherwise be discovered too late. A host's keyboard API
+and its consumer-control API are frequently different calls with incompatible
+arguments, so folding media into the keyboard message puts a conditional in
+one handler that exists only because two operating systems disagree. Second, a
+client acting purely as a remote should cause exactly one input device to
+appear on the host, not a full keyboard it will never press. Third, HID's
+Consumer Page usages are 16 bits and sparse, so they cannot be carried by the
+bit-index-is-the-usage-ID rule that makes §6.15's bitmap work; keeping them
+apart preserves that rule for the message that benefits from it.
+
+### 6.18 Media control index
+
+`MEDIA.held`, `MEDIA.events[].control` and `INPUTCAPS.media_mask` all name a
+control by **this index**, which is AtticPad's own dense vocabulary and not a
+HID usage. A dense small index is what lets `held` be one fixed-width mask;
+a sparse 16-bit usage would force a variable-length held *list* and destroy
+the self-healing property that mask has.
+
+The precedent is §6.13's: a wire field whose constants live only in server
+code cannot be read by a client, so the vocabulary lives here.
+
+| Idx | Control | Idx | Control |
+|---|---|---|---|
+| 1 | PLAY_PAUSE | 13 | RECORD |
+| 2 | PLAY | 14 | BRIGHTNESS_UP |
+| 3 | PAUSE | 15 | BRIGHTNESS_DOWN |
+| 4 | STOP | 16 | LAUNCH_BROWSER |
+| 5 | NEXT_TRACK | 17 | LAUNCH_MAIL |
+| 6 | PREV_TRACK | 18 | LAUNCH_CALC |
+| 7 | FAST_FORWARD | 19 | SEARCH |
+| 8 | REWIND | 20 | NAV_HOME |
+| 9 | VOLUME_UP | 21 | NAV_BACK |
+| 10 | VOLUME_DOWN | 22 | NAV_FORWARD |
+| 11 | MUTE | 23 | REFRESH |
+| 12 | EJECT | 24 | BOOKMARKS |
+| | | 25–32 | reserved, MUST be zero |
+
+**Thirty-two slots are allocated now, not twenty-four**, and — this is the
+part that actually makes them usable — **a control index assigned in a future
+revision MUST NOT be sent unless the server has set that index's bit in
+`INPUTCAPS.media_mask` (§6.19).** Reserving the room alone would buy nothing:
+indices 25–32 are scrubbed by a receiver that predates their assignment
+exactly as §6.14 describes for `caps`, so a sender that simply started using
+index 25 would be silently ignored. `media_mask` is the gate that closes that
+hole, which is why it is on the wire and not merely implied — the server
+states which indices it will honour, and a client sends only those.
+
+**No text crosses the wire.** An index names a control and the client renders
+its own label, so a 3DS may print "VOL+" where a phone prints a speaker glyph
+from the identical packet, and no encoding, truncation or localisation
+question ever reaches the protocol — §6.12's rule, restated because it is the
+one most easily forgotten.
+
+### 6.19 `INPUTCAPS` (0x44) — 16 bytes
+
+Tells a client which of §6.15–§6.17 this server will accept, so it can show
+the matching UI instead of guessing. Optional in both directions: a server
+need never send one, and a client that does not understand it discards it
+under §4.
+
+**A client that has not received an `INPUTCAPS` MUST NOT send `KEYBOARD`,
+`MOUSE` or `MEDIA`.** Absence is the negotiation: a v1 server, which cannot
+send this message and would discard those three anyway, therefore never
+receives them.
+
+| Off | Size | Field |
+|---|---|---|
+| 0 | 4 | `features` — which types the server accepts |
+| 4 | 4 | `status` — what exists for this session right now |
+| 8 | 4 | `media_mask` — which §6.18 controls this server will drive |
+| 12 | 2 | `mouse_rate_hz` — rate the server wants `MOUSE` at; **0 = use the session's `input_rate_hz`** |
+| 14 | 2 | `reserved0` |
+
+`features`:
+
+| Bit | Meaning |
+|---|---|
+| 0 | `KEYBOARD` — the server accepts 0x21 |
+| 1 | `MOUSE` — accepts 0x22 |
+| 2 | `MEDIA` — accepts 0x23 |
+| 3–31 | reserved, MUST be zero |
+
+```c
+#define APAD_KBM_FEATURE_KEYBOARD  (1u << 0)
+#define APAD_KBM_FEATURE_MOUSE     (1u << 1)
+#define APAD_KBM_FEATURE_MEDIA     (1u << 2)
+/* bits 3..31 reserved, MUST be zero */
+```
+
+`status`:
+
+| Bit | Meaning |
+|---|---|
+| 0 | `KEYBOARD_READY` — a keyboard device exists for this session now |
+| 1 | `MOUSE_READY` |
+| 2 | `MEDIA_READY` |
+| 3 | `SYNTHETIC` — input is injected into the host's input stream rather than delivered by a device, and some applications may ignore it |
+| 4–31 | reserved, MUST be zero |
+
+```c
+#define APAD_KBM_STATUS_KEYBOARD_READY (1u << 0)
+#define APAD_KBM_STATUS_MOUSE_READY    (1u << 1)
+#define APAD_KBM_STATUS_MEDIA_READY    (1u << 2)
+#define APAD_KBM_STATUS_SYNTHETIC      (1u << 3)
+/* bits 4..31 reserved, MUST be zero */
+```
+
+**`mouse_rate_hz` is a request, not an authorisation.** A client MUST NOT
+exceed §11's maximum input rate whatever this field says; a client that reads a
+value above that ceiling MUST send at the ceiling instead.
+
+**This is an obligation on the client's send rate, not a decode
+normalisation.** A decoder MUST preserve the value verbatim — it is not in
+§6.0's normalisation list, it has no reserved numeric range for §2 to scrub,
+and clamping it would destroy a server's ability to observe that it asked for
+something impossible. The field exists so a server can
+ask for *less* than the session rate — a pointer rarely needs 125 Hz — not so
+it can raise a limit §11 sets.
+
+`features` and `status` are separate because they answer different questions
+at different times: `features` is what the server will accept and is known
+before anything is created, `status` is what exists at this instant and
+changes as devices are created on first use.
+
+The payload is a fixed 16 bytes whatever `features` says, so a decoder has no
+length arithmetic to get wrong — §6.12's argument, and the reason that section
+spends 68 bytes on eight region slots it may not use.
+
+**`SYNTHETIC` is a bit, not a sentence.** It names a condition and the client
+writes its own warning, for the same reason §6.13 puts a button index on the
+wire instead of a label.
+
+#### Delivery
+
+**Not before the `ACK` that discharges `WELCOME`.** A server MUST NOT send
+`INPUTCAPS` earlier. Until that `ACK` arrives the server has no evidence the
+client exists at all, and every copy sent into that gap is spent on a session
+that may never open.
+
+**On an authenticated session, not before the first datagram whose tag
+verifies.** This rule exists because the obvious schedule silently destroys the
+feature on the exact hardware this protocol was written for. §10.2 requires a
+client to derive its key **after** acknowledging `WELCOME`, and budgets about
+one second of PBKDF2 on a 67 MHz ARM9. A server that starts a 0/250/500 ms
+schedule on the `ACK` therefore lands **all three copies inside the window
+where the client does not yet hold the key**; each fails §3.1 check 7 and is
+discarded, there is no re-request message, and a client that repeats on
+`status` change alone never hears another. The session runs correctly and the
+whole facility is invisible. So: where `WELCOME` set `AUTH_REQUIRED`, the
+server MUST wait for a client datagram whose tag verifies — which it already
+observes — before arming the schedule.
+
+**Schedule.** Three copies about 250 ms apart when armed, re-armed whenever
+`features` or `status` changes, and a slow repeat — **at least one copy every 5
+seconds while the session is open**. The slow repeat is 16 bytes per 5 seconds
+and it is what makes the facility recoverable rather than one-shot: any
+future arming bug, or a burst that swallows all three copies, costs a few
+seconds instead of the session.
+
+**Latest wins.** A client MUST treat the most recently accepted `INPUTCAPS` as
+current, applying §6.20's per-type window so a reordered copy cannot revive
+stale contents. **If a `features` bit clears, the client MUST stop sending that
+type**, and MUST first release everything it holds for that facility under
+§6.20's release rule — otherwise the last thing the server saw held stays held
+with nothing left able to lift it.
+
+### 6.20 Shared rules for §6.15–§6.19
+
+These four types share a delivery model, and the rules it needs are written
+once here rather than three times with three chances to drift.
+
+#### Additivity under §6.14
+
+§6.15–§6.19 were added on 2026-08-25, after the v1 freeze. The audit §6.14
+demands, for each of the four types:
+
+- A new `type` value is allocated and its payload specified. Nothing else.
+- No existing constant, offset, bit position, payload size or normalisation
+  rule changes.
+- The §8/§9 reliability contract is unchanged. The per-type windows below are
+  **new receive semantics for new types**, specified here; they neither amend
+  §9 nor depend on amending it (see below).
+- **`caps` (§6.3) is untouched.** No capability bit is defined for keyboard,
+  mouse or media, and none may be: §6.14 rules that widening `caps` is a v2
+  change because a v1 server *scrubs* a reserved capability bit rather than
+  ignoring it. `INPUTCAPS` exists precisely so that bit is never needed, and
+  the direction is reversed on purpose. A `caps` bit would have required a v1
+  server to **preserve** information §2 requires it destroy. Absence of an
+  `INPUTCAPS` is information a v1 server produces by doing nothing at all —
+  which is why the reversal solves the problem rather than relocating it.
+
+**What a v1 peer actually does with one.** It fails **§3.1 check 5** — `type`
+does not appear in its §4 table — and §3.1 requires it to stop at the first
+failure and **discard silently**, which is also what §4 requires. Check 6 never
+runs, and that matters: check 6's action is *reject with `ERROR` code 6*, so a
+peer that reached it would answer an unrecognised type with an error datagram
+rather than silence — the reflection behaviour §8 spends a paragraph
+preventing. A check-5 discard does not complete §3.1 and therefore does not
+refresh §8 liveness; harmless here, because no session depends on these types
+to stay alive.
+
+#### Per-type staleness windows
+
+**A receiver MUST keep a separate sliding window for each of `KEYBOARD`,
+`MOUSE`, `MEDIA` and `INPUTCAPS`, and MUST discard a datagram of one of those
+types whose header `sequence` is not `apad_seq_newer()` (§9) than the newest
+datagram of the same type it has already accepted.** The four windows are
+independent of one another.
+
+**They are also independent of §9's window, which is `INPUT_STATE`-only.** §9
+says a receiver "MUST discard any `INPUT_STATE` older than the newest one
+already seen" — `INPUT_STATE` compared against `INPUT_STATE`. §9 separately
+notes that every datagram in a session consumes that direction's sequence
+counter and that a peer **may** therefore track it as one monotonic series;
+that is a MAY, and a receiver that took it as licence to run one shared window
+would let a `KEYBOARD` at sequence 101 shadow an `INPUT_STATE` still in flight
+at 100, discarding live stick data as "stale" when it was merely interleaved.
+The failure is silent and looks exactly like packet loss. **Per-type windows,
+and nothing shared.**
+
+Without these windows §6.16's "a stale packet MUST NOT advance the baseline"
+would name a rule that does not exist, a reordered `MOUSE` would jerk the
+pointer backwards, and a reordered `KEYBOARD` would apply an old snapshot and
+un-press keys the user is still holding.
+
+#### Unreliable, and why that is forced rather than chosen
+
+Making any of the four RELIABLE would require the peer to `ACK` it. A peer that
+predates the addition discards it under §4 and so never `ACK`s — and §9's
+retransmit ladder would then tear the session down for failing to answer a
+message the peer is behaving correctly by ignoring. That trades a lost
+advertisement, or a lost keystroke, for a lost session. §6.12 made this
+argument for one message; it holds for every additive type, in both
+directions, and should be treated as the default for anything added under
+§6.14.
+
+#### What unreliability costs, and how these payloads pay for it
+
+A dropped state snapshot is harmless — `keys[]`, `buttons` and `held` are
+complete truths, so the next packet repairs them exactly as §9 describes for
+`INPUT_STATE`. A dropped *edge* is not: a keystroke or a NEXT_TRACK tap that
+began and ended between two samples has no representation in a state snapshot
+at all. Hence the two mechanisms these payloads share — wrapping accumulators
+(§6.16) for continuous quantities, and a fixed-depth event ring for discrete
+transitions.
+
+#### The event ring — layout
+
+`event_seq` counts **every event ever generated on this session for that
+type**, starting at 0 and incremented once per event, wrapping at 2^16. An
+event's **ordinal** is the value `event_seq` holds *after* that event has been
+counted, so the first event of a session has ordinal 1 and `event_seq` equals
+the ordinal of the newest event the datagram carries.
+
+**The ring is right-aligned, and this is normative because both alignments
+satisfy "oldest first" and they disagree byte for byte.** For a ring of depth
+`D`, slot `i` (0-based) carries the event with ordinal
+`event_seq - (D - 1) + i`. The **newest** event is therefore always at slot
+`D - 1`, and slots whose ordinal falls before the session's first event are
+transmitted zeroed. Front-packing — newest immediately after the last real
+event, tail zeroed — is **not** conformant; gap replay depends on knowing
+where the newest event is without counting.
+
+A slot whose `usage`, `button` or `control` decodes to 0 is "no event" and MUST
+be skipped during replay. It is not an event with code zero.
+
+#### The event ring — receiver algorithm
+
+Normative. `last_applied` is the receiver's record of the highest `event_seq`
+it has acted on for that type.
+
+1. **First accepted message of a type**: set `last_applied = event_seq`, apply
+   **no** events, and apply the snapshot as state. The ring's contents predate
+   the receiver's interest in them. This mirrors §6.16's baseline rule and
+   exists for the same reason.
+2. Otherwise let `g = apad_seq_diff(event_seq, last_applied)` (§6.21).
+   - `g <= 0` — nothing new, or a duplicate. Replay no events.
+   - `1 <= g <= D` — replay slots `D - g` through `D - 1`, in ascending order,
+     skipping "no event" slots.
+   - `g > D` — events have been lost that the ring cannot carry. Replay all `D`
+     slots in ascending order. A receiver **SHOULD** make the overflow
+     observable through whatever diagnostic channel it has, and **MUST NOT**
+     treat step 3's reconcile as having absorbed it.
+
+     That last clause is the whole point, and it is the mistake the wording
+     invites. The reconcile restores *held state*; it cannot restore an
+     *edge*. A key pressed and released entirely inside the gap leaves the
+     snapshot byte-identical on both sides, so after the reconcile nothing
+     downstream can tell that a keystroke was dropped — the state is right and
+     the event is simply gone. Overflow is the only evidence it happened, and
+     the condition is worth reporting: a sender exceeding the ring depth is
+     either losing a burst of datagrams or generating events faster than it
+     ships them, and both are real problems a silent decoder would hide.
+3. **In every case, including `g <= 0` and including overflow, reconcile held
+   state against the snapshot**: emit whatever presses and releases make the
+   receiver's view of `keys[]` / `buttons` / `held` equal the one in the
+   datagram.
+4. Set `last_applied = event_seq`.
+
+**Step 3 runs unconditionally, and that is the whole convergence argument.** A
+sender that changes its snapshot without advancing `event_seq`, or advances
+`event_seq` by more than the events it actually shipped, is non-conforming —
+but under any rule that reconciled only on overflow, the receiver would
+disagree with it *permanently*. Reconciling every time makes every such
+divergence last exactly one packet. **The snapshot is always the authority;
+the ring only adds back what a snapshot cannot express.**
+
+Depth is 8 for `KEYBOARD` and 4 for `MOUSE` and `MEDIA`. At the 10 Hz repeat
+floor below, 8 slots cover a gap of 800 ms.
+
+#### Encoding an out-of-range value
+
+**A sender MUST NOT emit an out-of-range event code** — a `KEYBOARD.events[]`
+`usage` of 0x01–0x03, a `MOUSE.events[]` `button` above 5, or a
+`MEDIA.events[]` `control` above the assigned range. Those are sender errors.
+
+**An encoder is not required to normalise them, and SHOULD NOT.** The
+normalisation rules in §6.15–§6.17 are *receive-side*, following §6.0's
+treatment of `battery` and `LED.player_index`: a receiver must turn an
+out-of-range value into a defined one before it reaches anything that acts on
+it, and that is where the obligation ends. An encoder that silently corrected
+the same value would hide a sender's bug from the only party positioned to
+notice it — that sender's own test suite.
+
+**Reserved *bits* are different: they are masked on both sides**, because §2
+requires them zero on send and ignored on receive.
+
+The asymmetry is deliberate, it is the one §6.0 already establishes, and it is
+restated here because it is exactly the kind of rule two independent
+implementations otherwise resolve differently and only discover at the vector
+stage.
+
+#### Held state — repeats, watchdog, and release
+
+**Repeat.** While a sender holds anything in a facility — any bit set in
+`keys[]`, in `MOUSE.buttons`, or in `MEDIA.held` — it **MUST** send that type
+at **10 Hz or faster**. This is a MUST, not a SHOULD, because a change-only
+sender and a sender that has died are otherwise indistinguishable, and the
+watchdog below has nothing to measure.
+
+**Watchdog.** A receiver that believes something is held for a facility and has
+accepted no datagram of that type for **1000 ms MUST release everything it
+holds for that facility.** 1000 ms is ten missed repeats at the mandated floor,
+so a conforming sender never trips it.
+
+**Release on teardown.** A receiver **MUST release everything it holds for all
+three facilities before a session ends**, for any reason — `BYE` (§6.5), the
+§11 idle timeout, or a revoked slot — and before it destroys or detaches
+whatever it injects into. A sender **MUST** release before it stops sending:
+on leaving the mode, on a `features` bit clearing (§6.19), and before `BYE`.
+
+**Why this is specified rather than left to implementations.** A physical
+keyboard releases its keys when it is unplugged. An injected one does not:
+where `INPUTCAPS.status` reports `SYNTHETIC` there is no device to unplug, and
+a held Ctrl simply stays held on the user's desktop until something explicitly
+lifts it. The one failure this whole section exists to prevent is a client
+dying mid-chord and leaving a modifier down with nothing able to release it.
+
+### 6.21 Wrap-safe difference — `apad_seq_diff`
+
+§6.16's accumulators and §6.20's event ring both compute a **signed distance**
+between two 16-bit values, which §9's `apad_seq_newer()` cannot express — it
+answers "newer?" and this needs "by how much, and which way?". The function is
+therefore specified here, additively, rather than by amending §9's frozen
+helper block.
+
+```c
+/* signed distance from b to a, correct across wrap; result in [-32768, 32767] */
+int apad_seq_diff(uint16_t a, uint16_t b) {
+    uint16_t d = (uint16_t)((unsigned)a - (unsigned)b);
+    if (d < 0x8000u) {
+        return (int)d;                        /* 0 .. 32767   */
+    }
+    return -(int)(uint16_t)(0x10000u - d);    /* -32768 .. -1 */
+}
+```
+
+**Normative.** Every accumulator delta and every `event_seq` gap in every
+implementation MUST route through it, and it carries §9's two deliberate
+details for the same reasons. **The arithmetic is unsigned throughout**: the
+shorter `(int16_t)(a - b)` is what most references show, but converting an
+out-of-range value to a signed type is *implementation-defined* under C99
+6.3.1.3p3 — correct on every two's-complement target, yet a conforming
+compiler is permitted to raise a signal. And it is an **extern function in
+`core/src/seq.c`**, not a `static inline` in a header, so one copy is shared by
+every platform and `nm` can prove there is only one.
+
+Worked values, which §13 requires as vectors: `(0x0005, 0xFFFB)` is `+10`;
+`(0xFFFB, 0x0005)` is `-10`; `(0x8000, 0x0000)` is `-32768`; `(0x7FFF,
+0x0000)` is `+32767`; `(0x0000, 0x0000)` is `0`.
+
+### 6.22 Reserved — `0x24` `TEXT`, and what the `0x2x` range means
+
+`0x20`–`0x2F` is the client→server input range. Four of its sixteen slots are
+spent (`INPUT_STATE`, `KEYBOARD`, `MOUSE`, `MEDIA`). This section records what
+the range means and reserves one more slot, because a range meaning is cheap to
+respect and expensive to reclaim.
+
+**`0x24` is reserved for `TEXT` and MUST NOT be allocated to anything else.**
+Nothing is specified here beyond the reservation; the rest of this section is
+the reasoning, and is not normative.
+
+**Why a separate type is the right shape, rather than widening §6.15.** A HID
+usage names a *physical key position*, not a character. What that position
+produces is decided by the keyboard layout the host has configured, which the
+client cannot see. That is exactly right for a game — W is the key above S
+wherever you are — and exactly wrong for typing, because a client whose text
+arrives from a phone IME or a system soft keyboard has **characters and no key
+positions at all**, and must work backwards through an assumed layout to
+invent them. §6.15 therefore carries an unavoidable assumption: text sent as
+usages is correct only when the host's layout matches the one the client
+guessed. `TEXT` would remove the guess by sending what the user actually meant.
+
+It cannot be folded into §6.15 for the same reason §6.17 could not: the host
+call is different in kind. A keystroke names a position and is a press and a
+release; a character names a codepoint and has no press or release at all.
+
+**The shape it would take**, when someone builds it: UTF-8, with §6.20's
+`event_seq` ring discipline applied to codepoints rather than transitions, so
+a dropped datagram costs at worst a repeat rather than a hole in a sentence.
+State-snapshot self-healing does not apply — a character is purely an edge —
+so the ring is the only mechanism available and its depth is the whole design.
+The 236-byte authenticated payload (§11) bounds a single datagram's worth;
+anything longer is a sequence of them, which the ring already handles.
+
+**The cost is on the server, and it is uneven.** Injecting a codepoint the
+host has no key for is a solved problem on some platforms and an unsolved one
+on others: a Windows backend using `SendInput` already has a native path for
+it, whereas `uinput` has no notion of a character and would need a scratch
+keycode remapped per codepoint, or a generated keymap handed to the
+compositor. Whoever picks this up should establish that the hard half works
+before specifying the easy half — the same order §6.14's ruling recommends,
+and the opposite of the order that is tempting.
+
 
 
 ---
@@ -796,7 +1423,7 @@ layer provides nothing and the protocol carries its own authentication.
   **entire datagram, header included, with the 8 tag bytes zeroed** during
   computation. Comparison MUST be constant-time.
 - The PIN itself MUST NEVER appear on the wire.
-- Replay is prevented by the sequence window in §9.
+- Replay is prevented by the sequence window in §9 and, for the §6.15–§6.19 types, by §6.20's per-type windows.
 
 ### 10.1 The secret's length depends on how it reaches the client
 
@@ -1001,6 +1628,24 @@ User-facing documentation MUST NOT imply the two are equivalent.
 decoded values. Every client ships a hidden self-test screen (hold L+R+Start at
 launch) that runs them on-device.
 
+**Three vector shapes, because §6.16 and §6.20 specify behaviour a single
+packet cannot pin.** The shape is named here so that the author deriving
+vectors from this document does not have to invent one — an invented shape is
+where independence quietly dies.
+
+1. **Packet vectors** — the original and still the majority: wire bytes in,
+   expected decoded structure out, compared byte for byte.
+2. **Function vectors** — an input tuple and an expected integer result, no
+   packet involved. Required for `apad_seq_diff` (§6.21) and for the event-ring
+   gap computation of §6.20, both of which are pure arithmetic whose wrap
+   behaviour is the entire point.
+3. **Sequence vectors** — an ordered list of packets with the expected receiver
+   state after **each** one. Required for anything that is only wrong across
+   two or more datagrams: the §6.16 baseline rule, a stale packet not advancing
+   the baseline, gap replay, overflow, and the §6.20 step-3 reconcile that must
+   run even when no events are replayed. A sequence vector asserts after every
+   step, not only at the end, or a design that converges by accident passes.
+
 Vectors are derived **from this document only**, by an author who has not read
 `core/src/codec.c` (`DESIGN.md` §9.1). If the same person writes both, they encode
 the same misunderstanding twice and the self-test passes on a broken build.
@@ -1022,6 +1667,26 @@ Mandatory coverage:
 - truncation at every byte offset
 - `battery` = 255 (unknown), `touch_count` > 2 (clamped)
 - `axes[4]`/`axes[5]` negative (clamped to 0)
+- **§6.15–§6.19**: every reserved field of each of the four types set to ones —
+  the decoded structure MUST be byte-identical to the one decoded from the
+  clean packet
+- `KEYBOARD.events[].usage` of 0x01, 0x02 and 0x03, `MOUSE.events[].button`
+  above 5 and `MEDIA.events[].control` above 24 — each MUST normalise to 0 and
+  MUST force that entry's `flags` to 0
+- a `KEYBOARD` holding seven keys at once, which a HID boot report could not
+  express
+- the §6.16 accumulator diff across a wrap in both directions
+  (`0xFFFB` → `0x0005` is +10, not −65526), and at both extremes
+  (`0x0000` → `0x8000` is −32768; `0x0000` → `0x7FFF` is +32767)
+- an `event_seq` gap larger than the ring, one of exactly the ring depth, one
+  of zero, and one that is not newer than what was last applied
+- the §6.20 step-3 reconcile running when **no** events are replayed: a
+  snapshot that disagrees with the receiver's held state while `event_seq` is
+  unchanged MUST still converge in one packet
+- the §6.20 right-alignment rule: a ring carrying fewer events than its depth,
+  proving the newest sits at slot `D-1` and the leading slots are zero
+- a first accepted message of a type whose `event_seq` is far from zero —
+  no events replayed, no overflow surfaced, snapshot applied as state
 
 ## 14. Appendix A — normative authentication test values
 
@@ -1121,3 +1786,25 @@ unsigned helper form, §11 payload caps, §13 coverage, and Appendix A.
    verification. What it has instead: a live 3DS drawing the regions a real
    server sent, and the §4 discard rule keeping an older client unaffected
    either way. Deriving its vectors independently is the outstanding work.
+10. **§6.15–§6.19 (keyboard, mouse, media, `INPUTCAPS`) have independently
+   derived vectors — the thing item 9 records `TOUCHMAP` never got.** Specified
+   2026-08-25 and implemented the same day by one author, with vectors derived
+   from this document alone by a second who did not read `codec.c`, `seq.c` or
+   `session.c`. **The two readings agreed on every offset, mask, normalisation
+   and wrap boundary on the first run — zero disagreements**, decode, encode
+   and round trip alike. The suite went 1141 → 1987 cases and gained the two
+   shapes §13 now names: function vectors for §6.21's arithmetic, and sequence
+   vectors asserting receiver state after every step.
+
+   Because a suite that has never failed is not known to be able to fail, all
+   21 assertion families were mutation-tested from the vector side and every
+   one was caught — including front-packing the ring, a stale `MOUSE`
+   advancing the baseline, and an `event_seq` written big-endian.
+
+   **What this does NOT cover, and cannot:** §6.20's 10 Hz repeat floor and
+   1000 ms watchdog are measured against a clock, and core has none by design.
+   The single failure §6.20 exists to prevent — a client dying mid-chord and
+   leaving a modifier held on the user's desktop — is therefore unpinned by
+   conformance data and needs a server-side test with a controllable clock.
+   Nothing here has run on a big-endian host, on ARM9, or on hardware of any
+   kind.

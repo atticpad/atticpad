@@ -7,9 +7,15 @@
 # talks over a real UDP socket.
 #
 # Usage:
-#   tools/engine-client/build.sh              # build + run self-loopback
+#   tools/engine-client/build.sh              # build + run the serverless checks
 #   tools/engine-client/build.sh build-only    # just build
-#   tools/engine-client/build.sh run           # build + run self-loopback
+#   tools/engine-client/build.sh run           # build + run the serverless checks
+#
+# "run" executes the two modes that need NO SERVER -- --inputcaps-reorder and
+# --release-on-clear, which bring their own fake peer up on a scratch port.
+# The --kbm mode is not among them: it needs a live server and a human (or a
+# script) watching evtest, so it stays a manual/integration step exactly as
+# the default --target run does.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,8 +29,13 @@ OUT="${HERE}/engine-client"
 CC="${CC:-cc}"
 
 echo "== tools/engine-client/build.sh: compiling ${OUT} =="
+# -pthread: the --inputcaps-reorder mode runs a fake peer in a second thread
+# so it can deliver two INPUTCAPS out of order without needing a server binary
+# or a second process. Linux-only tool; the engine itself is still
+# single-threaded and says so in apad_client.h.
 "${CC}" -std=c99 -g -O0 \
     -fsanitize=address,undefined \
+    -pthread \
     -Wall -Wextra \
     -I"${CORE_INC}" \
     -I"${CLIENT_COMMON}" \
@@ -36,5 +47,16 @@ echo "== tools/engine-client/build.sh: compiling ${OUT} =="
     -o "${OUT}"
 echo "built ${OUT}"
 
-# No self-loopback mode: engine-client needs a live server (see
-# scripts/build.sh's integration loop). build.sh only builds.
+# Two of the three modes need no server at all, so they can run right here in
+# the build loop -- and they are the two that pin rules nothing else in the
+# tree can reach: §6.20's fourth per-type window (INPUTCAPS reordering) and
+# §6.19's release-before-stop. Scratch ports, never 21100.
+#
+# scripts/build.sh still invokes this with "build-only", so CI's behaviour is
+# unchanged until whoever owns that file decides to flip it.
+if [ "${1:-run}" != "build-only" ]; then
+    echo "== tools/engine-client/build.sh: --inputcaps-reorder (§6.20 fourth window) =="
+    ASAN_OPTIONS=detect_leaks=0 "${OUT}" --inputcaps-reorder 21187
+    echo "== tools/engine-client/build.sh: --release-on-clear (§6.19 release, §6.20 repeat floor) =="
+    ASAN_OPTIONS=detect_leaks=0 "${OUT}" --release-on-clear 21188
+fi

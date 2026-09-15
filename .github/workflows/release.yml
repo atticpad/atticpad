@@ -92,12 +92,20 @@ jobs:
           collect artifacts/atticpad-android-release-apk/app-release.apk atticpad-android.apk
           collect artifacts/atticpad-server-linux/atticpad-server       atticpad-server-linux-x86_64
           collect artifacts/atticpad-server-windows/atticpad-server.exe atticpad-server-windows-x86_64.exe
+          collect artifacts/atticpad-psp/atticpad-psp.zip              atticpad-psp.zip
+          collect artifacts/atticpad-nds/atticpad-nds.nds              atticpad-nds.nds
           if [ "$MISSING" -ne 0 ]; then
             echo "--- what the ci run actually uploaded: ---"
             find artifacts -type f | sort
             echo "::error::refusing to publish a partial release (docs/DESIGN.md §8.2)"
             exit 1
           fi
+          # The FBI install QR travels WITH the release, not only in the repo:
+          # someone on the releases page should be able to point a console at
+          # it without first going looking in docs/. It is copied from the repo
+          # rather than generated here because it encodes the /latest/download/
+          # URL, which is identical for every release -- see tools/qr-url.
+          cp docs/img/fbi-install-qr.png dist/atticpad-3ds-install-qr.png
           cd dist && sha256sum ./* > SHA256SUMS && cat SHA256SUMS
 
       - name: extract this version's changelog section
@@ -119,6 +127,27 @@ jobs:
             echo "::error::CHANGELOG.md has no '## [${CHANGELOG_VER}]' section to use as release notes"
             exit 1
           fi
+          # Install steps belong in the BODY, not only in docs/INSTALL.md.
+          # Someone on a release page has already decided to try this; making
+          # them open another file to learn which of five downloads they want
+          # is where people are lost. The text lives in
+          # .github/release-notes-install.md so it can be read and reviewed AS
+          # markdown instead of as escaped shell inside YAML.
+          #
+          # @RAW@ is substituted with a raw.githubusercontent URL pinned to
+          # THIS TAG, because release-asset downloads are served as
+          # attachments -- an <img> pointing at one renders nothing -- and
+          # pinning the tag stops the image drifting from the notes that
+          # describe it.
+          RAW="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}"
+          DOCS="https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs"
+          sed -e "s|@RAW@|${RAW}|g" -e "s|@DOCS@|${DOCS}|g" \
+              .github/release-notes-install.md >> release-notes.md
+          if grep -q '@RAW@\|@DOCS@' release-notes.md; then
+            echo "::error::a placeholder survived substitution in the release notes"
+            exit 1
+          fi
+
           if [ "$APAD_VERSION" != "$CHANGELOG_VER" ]; then
             printf '\n---\n\n**This is a release candidate for %s, not a final release.** Please report anything that behaves differently from the notes above.\n' \
               "$CHANGELOG_VER" >> release-notes.md

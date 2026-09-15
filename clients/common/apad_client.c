@@ -47,6 +47,7 @@ struct apad_client {
     uint32_t ping_origin_ms;
     int      awaiting_pong;
     int32_t  rtt_ms;
+    uint32_t derive_ms;      /* apad_client_stats.derive_ms; see there   */
 
     uint32_t tx_packets;
     uint32_t rx_packets;
@@ -59,9 +60,62 @@ struct apad_client {
     uint32_t status_serial;
     int32_t  status_code;
     char     message[APAD_TEXT_LEN + 1];
-    /* v2 EXPERIMENT: last TOUCHMAP the server sent (experiment/touchmap-v2). */
+    /* Last TOUCHMAP the server sent (§6.12). */
     uint32_t      touchmap_serial;
     apad_touchmap touchmap;
+
+    /* §6.19 INPUTCAPS. `inputcaps_serial == 0` is the negotiation itself:
+     * until one has been accepted this client MUST NOT send KEYBOARD, MOUSE
+     * or MEDIA at all. Everything below it is send-side §6.15-§6.17 state. */
+    uint32_t       inputcaps_serial;
+    apad_inputcaps inputcaps;
+
+    /*
+     * §6.15-§6.17 SEND STATE. One block per facility, all the same shape:
+     *   kb_keys, mo_buttons + the mo_ accumulators, me_held -- the held
+     *             snapshot that goes on the wire, and which §6.20 makes the
+     *             receiver's authority
+     *   *_seq     §6.20 event_seq: every event ever generated this session
+     *   *_ring    the RIGHT-ALIGNED ring, newest always in the last slot
+     *   *_tx_ms   when the last datagram of this type went out
+     *   *_trail   trailing copies still owed after going idle
+     *   *_dirty   something changed and has not been sent yet
+     *   *_engaged the caller has driven this facility at least once, so a
+     *             baseline packet is worth sending; until then this client
+     *             creates no device on the server and sends nothing
+     *
+     * The ring is NOT cleared after a send. §6.20 requires each datagram to
+     * carry the last D events regardless of whether they have already been
+     * transmitted -- that redundancy is the entire mechanism by which a
+     * dropped datagram costs nothing.
+     */
+    uint8_t          kb_keys[APAD_KEY_BITMAP_BYTES];
+    uint16_t         kb_seq;
+    apad_key_event   kb_ring[APAD_KEYBOARD_RING_DEPTH];
+    uint32_t         kb_tx_ms;
+    uint32_t         kb_trail_due_ms;
+    uint8_t          kb_trail;
+    uint8_t          kb_dirty;
+    uint8_t          kb_engaged;
+
+    uint16_t         mo_dx, mo_dy, mo_wheel, mo_hwheel;
+    uint16_t         mo_buttons;
+    uint16_t         mo_seq;
+    apad_mouse_event mo_ring[APAD_MOUSE_RING_DEPTH];
+    uint32_t         mo_tx_ms;
+    uint32_t         mo_trail_due_ms;
+    uint8_t          mo_trail;
+    uint8_t          mo_dirty;
+    uint8_t          mo_engaged;
+
+    uint32_t         me_held;
+    uint16_t         me_seq;
+    apad_media_event me_ring[APAD_MEDIA_RING_DEPTH];
+    uint32_t         me_tx_ms;
+    uint32_t         me_trail_due_ms;
+    uint8_t          me_trail;
+    uint8_t          me_dirty;
+    uint8_t          me_engaged;
 
     /* §10. `secret` is the only key material this struct holds that outlives
      * a session; it is wiped in destroy(). The derived key lives in
@@ -182,6 +236,718 @@ static void ack_if_reliable(apad_client *c, const apad_packet *pkt)
     (void)send_msg(c, (uint8_t)APAD_MSG_ACK, payload, (uint16_t)sizeof payload, NULL);
 }
 
+/* ---- §6.15-§6.20 keyboard / mouse / media, send side -------------------- *
+ *
+ * Everything §6.19 and §6.20 ask of a SENDER lives in this block, once, so
+ * that no platform layer has to carry a copy of it (apad_client.h's charter,
+ * and docs/DESIGN.md §7.2). The three facilities are deliberately written out three
+ * times rather than folded behind a table of function pointers: the shapes
+ * differ in exactly the places that matter (256 bits vs 5 vs 32, a ring of 8
+ * vs 4, accumulators on one of them only), and a generic version would hide
+ * those differences behind casts on structs this file is forbidden to cast.
+ */
+
+/* §6.20's held-repeat floor is 10 Hz and it is a MUST: below it, a
+ * change-only sender is indistinguishable from a dead one and the receiver's
+ * 1000 ms watchdog releases the chord under the user's fingers. A 100 ms
+ * period sits exactly ON the floor, so any scheduling jitter puts this client
+ * under a MUST; 80 ms (12.5 Hz) costs two 56-byte datagrams a second while a
+ * key is held and cannot. */
+#define APAD_KBM_REPEAT_MS  80u
+
+/* §6.15: "three copies about 50 ms apart after the last key releases". They
+ * are what makes a release, and a tap that lives only in the ring, survive
+ * packet loss -- the one thing a state snapshot cannot repair by itself. */
+#define APAD_KBM_TRAIL_MS      50u
+#define APAD_KBM_TRAIL_COPIES   3u
+
+/* §11's ceiling, as a minimum spacing between two datagrams of one type. It
+ * is safe to delay a keyboard change by up to this long precisely BECAUSE of
+ * the ring: two transitions coalesced into one datagram both still reach the
+ * host, in order, which is not true of a snapshot-only protocol. */
+#define APAD_KBM_MIN_TX_MS  (1000u / APAD_MAX_RATE_HZ)
+
+/*
+ * §6.19's negotiation, in one place. No INPUTCAPS accepted yet -> nothing may
+ * be sent, full stop: a v1 server cannot send that message and would discard
+ * KEYBOARD/MOUSE/MEDIA anyway, so absence is how it declines without knowing
+ * the question was asked. Then the matching `features` bit, which is the
+ * server saying it will accept this type right now.
+ */
+static int kbm_gate(const apad_client *c, uint32_t feature)
+{
+    return (c->sess.state == (uint8_t)APAD_SESSION_ACTIVE
+            && c->inputcaps_serial != 0u
+            && (c->inputcaps.features & feature) != 0u) ? 1 : 0;
+}
+
+/*
+ * §6.19 mouse cadence. `mouse_rate_hz` is A REQUEST, NOT AN AUTHORISATION:
+ * the field exists so a server can ask for LESS than the session rate (a
+ * pointer rarely needs 125 Hz), and a client that reads a value above §11's
+ * ceiling MUST send at the ceiling instead. The decoder preserves whatever
+ * the server actually said -- clamping belongs here, at the send rate, and
+ * nowhere else.
+ */
+static uint32_t kbm_mouse_interval_ms(const apad_client *c)
+{
+    uint32_t hz = (uint32_t)c->inputcaps.mouse_rate_hz;
+    uint32_t ms;
+
+    if (hz == 0u) {                       /* §6.19: 0 = the session's rate */
+        hz = (uint32_t)c->sess.input_rate_hz;
+    }
+    if (hz == 0u) {
+        hz = (uint32_t)APAD_DEFAULT_RATE_HZ;
+    }
+    if (hz > (uint32_t)APAD_MAX_RATE_HZ) {
+        hz = (uint32_t)APAD_MAX_RATE_HZ;  /* §11 */
+    }
+    ms = 1000u / hz;
+    return (ms == 0u) ? 1u : ms;
+}
+
+/* ---- the §6.20 ring ---------------------------------------------------- *
+ *
+ * RIGHT-ALIGNED, and that is normative rather than a choice: for depth D,
+ * slot i carries the event with ordinal `event_seq - (D-1) + i`, so the
+ * NEWEST is always in slot D-1 and slots whose ordinal predates the session's
+ * first event are transmitted zeroed. Front-packing satisfies "oldest first"
+ * too and is explicitly NON-CONFORMANT, because gap replay finds the newest
+ * event by position rather than by counting.
+ *
+ * Shifting down by one and writing slot D-1 maintains that invariant for
+ * free, and `apad_seq_next` keeps the ordinal in step: the first event of a
+ * session lands in slot D-1 with event_seq == 1, which is its ordinal, and
+ * the D-1 zeroed slots above it are exactly the ordinals <= 0 that never
+ * existed.
+ */
+static void kbm_ring_push_key(apad_client *c, uint8_t usage, uint8_t flags)
+{
+    size_t i;
+
+    for (i = 0u; i + 1u < (size_t)APAD_KEYBOARD_RING_DEPTH; i++) {
+        c->kb_ring[i] = c->kb_ring[i + 1u];
+    }
+    c->kb_ring[APAD_KEYBOARD_RING_DEPTH - 1u].usage = usage;
+    c->kb_ring[APAD_KEYBOARD_RING_DEPTH - 1u].flags = flags;
+    c->kb_seq = apad_seq_next(c->kb_seq);
+    c->kb_dirty = 1u;
+}
+
+static void kbm_ring_push_mouse(apad_client *c, uint8_t button, uint8_t flags)
+{
+    size_t i;
+
+    for (i = 0u; i + 1u < (size_t)APAD_MOUSE_RING_DEPTH; i++) {
+        c->mo_ring[i] = c->mo_ring[i + 1u];
+    }
+    c->mo_ring[APAD_MOUSE_RING_DEPTH - 1u].button = button;
+    c->mo_ring[APAD_MOUSE_RING_DEPTH - 1u].flags  = flags;
+    c->mo_seq = apad_seq_next(c->mo_seq);
+    c->mo_dirty = 1u;
+}
+
+static void kbm_ring_push_media(apad_client *c, uint8_t control, uint8_t flags)
+{
+    size_t i;
+
+    for (i = 0u; i + 1u < (size_t)APAD_MEDIA_RING_DEPTH; i++) {
+        c->me_ring[i] = c->me_ring[i + 1u];
+    }
+    c->me_ring[APAD_MEDIA_RING_DEPTH - 1u].control = control;
+    c->me_ring[APAD_MEDIA_RING_DEPTH - 1u].flags   = flags;
+    c->me_seq = apad_seq_next(c->me_seq);
+    c->me_dirty = 1u;
+}
+
+/* ---- sending one datagram of each type --------------------------------- */
+
+static void kbm_send_keyboard(apad_client *c, uint32_t now)
+{
+    uint8_t       payload[APAD_LEN_KEYBOARD];
+    apad_keyboard kb;
+
+    memset(&kb, 0, sizeof kb);
+    memcpy(kb.keys, c->kb_keys, sizeof kb.keys);
+    kb.event_seq = c->kb_seq;
+    memcpy(kb.events, c->kb_ring, sizeof kb.events);
+    kb.client_ticks_ms = now;
+    if (apad_encode_keyboard(payload, sizeof payload, &kb)
+        == (int)APAD_LEN_KEYBOARD) {
+        (void)send_msg(c, (uint8_t)APAD_MSG_KEYBOARD, payload,
+                       (uint16_t)APAD_LEN_KEYBOARD, NULL);
+    }
+    c->kb_tx_ms = now;
+    c->kb_dirty = 0u;
+}
+
+static void kbm_send_mouse(apad_client *c, uint32_t now)
+{
+    uint8_t    payload[APAD_LEN_MOUSE];
+    apad_mouse mo;
+
+    memset(&mo, 0, sizeof mo);
+    mo.dx_accum     = c->mo_dx;
+    mo.dy_accum     = c->mo_dy;
+    mo.wheel_accum  = c->mo_wheel;
+    mo.hwheel_accum = c->mo_hwheel;
+    mo.buttons      = c->mo_buttons;
+    mo.event_seq    = c->mo_seq;
+    memcpy(mo.events, c->mo_ring, sizeof mo.events);
+    mo.client_ticks_ms = now;
+    if (apad_encode_mouse(payload, sizeof payload, &mo) == (int)APAD_LEN_MOUSE) {
+        (void)send_msg(c, (uint8_t)APAD_MSG_MOUSE, payload,
+                       (uint16_t)APAD_LEN_MOUSE, NULL);
+    }
+    c->mo_tx_ms = now;
+    c->mo_dirty = 0u;
+}
+
+static void kbm_send_media(apad_client *c, uint32_t now)
+{
+    uint8_t    payload[APAD_LEN_MEDIA];
+    apad_media me;
+
+    memset(&me, 0, sizeof me);
+    me.held      = c->me_held;
+    me.event_seq = c->me_seq;
+    memcpy(me.events, c->me_ring, sizeof me.events);
+    me.client_ticks_ms = now;
+    if (apad_encode_media(payload, sizeof payload, &me) == (int)APAD_LEN_MEDIA) {
+        (void)send_msg(c, (uint8_t)APAD_MSG_MEDIA, payload,
+                       (uint16_t)APAD_LEN_MEDIA, NULL);
+    }
+    c->me_tx_ms = now;
+    c->me_dirty = 0u;
+}
+
+/* ---- §6.19 / §6.20 release --------------------------------------------- *
+ *
+ * "A sender MUST release before it stops sending: on leaving the mode, on a
+ * `features` bit clearing (§6.19), and before BYE."
+ *
+ * The reason this is a MUST and not housekeeping: a physical keyboard
+ * releases its keys when it is unplugged and an injected one does not. Where
+ * INPUTCAPS.status reports SYNTHETIC there is no device to unplug, so a held
+ * Ctrl stays held on the user's desktop until something explicitly lifts it,
+ * and once this client has stopped sending there is nothing left that can.
+ * §6.20 calls that "the one failure this whole section exists to prevent".
+ *
+ * An UP event per held bit, then one datagram carrying the cleared snapshot.
+ * If more bits are held than the ring can carry, the ring overflows and the
+ * receiver's §6.20 step 3 reconcile against the all-zero snapshot finishes
+ * the job -- the snapshot is the authority, the ring only adds the edges.
+ *
+ * Sends unconditionally when something is held, INCLUDING from the
+ * features-cleared path: it must go out while the old `features` still
+ * permits it, which is why handle_packet() calls this BEFORE storing the new
+ * capabilities.
+ */
+static void kbm_release_keyboard(apad_client *c, uint32_t now)
+{
+    unsigned byte_i;
+    int      held = 0;
+
+    for (byte_i = 0u; byte_i < APAD_KEY_BITMAP_BYTES; byte_i++) {
+        unsigned bit;
+
+        if (c->kb_keys[byte_i] == 0u) {
+            continue;
+        }
+        for (bit = 0u; bit < 8u; bit++) {
+            uint8_t mask = (uint8_t)(1u << bit);
+
+            if ((c->kb_keys[byte_i] & mask) == 0u) {
+                continue;
+            }
+            kbm_ring_push_key(c, (uint8_t)(byte_i * 8u + bit), 0u /* UP */);
+            held = 1;
+        }
+        c->kb_keys[byte_i] = 0u;
+    }
+    if (held) {
+        kbm_send_keyboard(c, now);
+    }
+    c->kb_trail = 0u;
+    c->kb_engaged = 0u;
+}
+
+static void kbm_release_mouse(apad_client *c, uint32_t now)
+{
+    unsigned b;
+    int      held = 0;
+
+    for (b = 1u; b <= APAD_MOUSEBTN_MAX; b++) {
+        uint16_t bit = APAD_MOUSEBTN_BIT(b);
+
+        if ((c->mo_buttons & bit) == 0u) {
+            continue;
+        }
+        kbm_ring_push_mouse(c, (uint8_t)b, 0u /* UP */);
+        held = 1;
+    }
+    c->mo_buttons = 0u;
+    if (held) {
+        kbm_send_mouse(c, now);
+    }
+    c->mo_trail = 0u;
+    c->mo_engaged = 0u;
+}
+
+static void kbm_release_media(apad_client *c, uint32_t now)
+{
+    unsigned ctl;
+    int      held = 0;
+
+    for (ctl = 1u; ctl <= APAD_MEDIA_INDEX_MAX; ctl++) {
+        uint32_t bit = APAD_MEDIA_BIT(ctl);
+
+        if ((c->me_held & bit) == 0u) {
+            continue;
+        }
+        kbm_ring_push_media(c, (uint8_t)ctl, 0u /* UP */);
+        held = 1;
+    }
+    c->me_held = 0u;
+    if (held) {
+        kbm_send_media(c, now);
+    }
+    c->me_trail = 0u;
+    c->me_engaged = 0u;
+}
+
+/* Release every facility this client still holds, for a teardown that is not
+ * a capability change: §6.20's "before BYE", and the same call covers §11's
+ * idle timeout path because disconnect() runs on the way out of both. */
+static void kbm_release_all(apad_client *c, uint32_t now)
+{
+    if (kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_KEYBOARD)) {
+        kbm_release_keyboard(c, now);
+    }
+    if (kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_MOUSE)) {
+        kbm_release_mouse(c, now);
+    }
+    if (kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_MEDIA)) {
+        kbm_release_media(c, now);
+    }
+}
+
+/* ---- ingesting one pump's worth from the platform ---------------------- *
+ *
+ * Two sources of truth arrive together and the order between them is the
+ * whole contract (see apad_client.h): the caller's events[] QUEUE carries
+ * transitions that a snapshot cannot express -- above all the sub-frame tap,
+ * pressed and released between two pumps -- and the caller's snapshot is
+ * authoritative for what is held afterwards.
+ *
+ * So: replay the queue into the ring first, then diff the resulting shadow
+ * against the caller's snapshot and synthesise an event for every remaining
+ * difference. A platform that submits nothing but state still gets correct
+ * edges; a platform that submits a tap gets the tap AND agrees with its own
+ * snapshot. Both paths converge on the same shadow, which is what the
+ * datagram then carries.
+ *
+ * The queue is read from index 0 until the first zero code (§6.20's "no
+ * event"), which is why apad_client.h tells callers to memset first.
+ *
+ * Out-of-range codes are NOT normalised here (§6.20: normalisation is
+ * receive-side, so a sender's bug stays visible to the sender's own tests) --
+ * but a code outside the range its HELD MASK can address is kept out of that
+ * mask, because APAD_MEDIA_BIT(33) would shift a uint32_t by 32 and that is
+ * undefined behaviour rather than a protocol question.
+ */
+/*
+ * The FIRST submission of a facility always produces a datagram, even when
+ * nothing at all is held and nothing changed. Two reasons, and the second is
+ * the one that would otherwise be found the hard way:
+ *
+ *   - The receiver creates its device on the first datagram of a type, so
+ *     until one arrives there is nothing for a user to watch, nothing for
+ *     INPUTCAPS.status to report ready, and the whole facility is invisible.
+ *   - §6.16 rule 1 and §6.20 step 1 both consume the FIRST accepted message
+ *     of a type as a BASELINE and apply no motion and no events from it. If
+ *     that first message were the user's first real movement, that movement
+ *     would be silently swallowed. Spending one all-clear datagram at
+ *     engagement puts the baseline where it costs nothing.
+ */
+static void kbm_engage(uint8_t *engaged, uint8_t *dirty)
+{
+    if (!*engaged) {
+        *engaged = 1u;
+        *dirty   = 1u;
+    }
+}
+
+static void kbm_ingest_keyboard(apad_client *c, const apad_keyboard *in)
+{
+    size_t   i;
+    unsigned byte_i, pass;
+
+    for (i = 0u; i < (size_t)APAD_KEYBOARD_RING_DEPTH; i++) {
+        uint8_t usage = in->events[i].usage;
+        uint8_t down  = (uint8_t)(in->events[i].flags & APAD_KBM_EVENT_DOWN);
+
+        if (usage == 0u) {
+            break;                         /* end of the submitted queue */
+        }
+        kbm_ring_push_key(c, usage, down);
+        if (down) {
+            c->kb_keys[APAD_KEY_BYTE(usage)] =
+                (uint8_t)(c->kb_keys[APAD_KEY_BYTE(usage)]
+                          | APAD_KEY_MASK(usage));
+        } else {
+            c->kb_keys[APAD_KEY_BYTE(usage)] =
+                (uint8_t)(c->kb_keys[APAD_KEY_BYTE(usage)]
+                          & (uint8_t)~APAD_KEY_MASK(usage));
+        }
+    }
+
+    /* Two passes: the modifier byte (usages 0xE0..0xE7, all in one bitmap
+     * byte) first, then everything else. The ring is replayed by the server
+     * in THIS order, before its own reconcile, so a letter and LEFTSHIFT
+     * that arrive in the same snapshot -- the 3DS's sticky Shift latch does
+     * exactly that -- must enter the ring Shift first, or the host presses
+     * the letter before the modifier and types it lowercase. A real HID
+     * keyboard report carries its modifier byte ahead of the key array for
+     * the same reason. (Found on a 3DS, 2026-09-15: latch armed, letter
+     * typed, lowercase.) */
+    for (pass = 0u; pass < 2u; pass++) {
+        for (byte_i = 0u; byte_i < APAD_KEY_BITMAP_BYTES; byte_i++) {
+            uint8_t diff = (uint8_t)(c->kb_keys[byte_i] ^ in->keys[byte_i]);
+            unsigned bit;
+            unsigned is_mod = (byte_i == APAD_KEY_BYTE(APAD_HID_KEY_LEFTCTRL)) ? 1u : 0u;
+
+            if (diff == 0u || is_mod != (pass == 0u ? 1u : 0u)) {
+                continue;
+            }
+            for (bit = 0u; bit < 8u; bit++) {
+                uint8_t mask = (uint8_t)(1u << bit);
+
+                if ((diff & mask) == 0u) {
+                    continue;
+                }
+                kbm_ring_push_key(c, (uint8_t)(byte_i * 8u + bit),
+                                  (uint8_t)((in->keys[byte_i] & mask)
+                                            ? APAD_KBM_EVENT_DOWN : 0u));
+            }
+            c->kb_keys[byte_i] = in->keys[byte_i];
+        }
+    }
+    kbm_engage(&c->kb_engaged, &c->kb_dirty);
+}
+
+static void kbm_ingest_mouse(apad_client *c, const apad_mouse *in)
+{
+    size_t   i;
+    unsigned b;
+
+    for (i = 0u; i < (size_t)APAD_MOUSE_RING_DEPTH; i++) {
+        uint8_t button = in->events[i].button;
+        uint8_t down   = (uint8_t)(in->events[i].flags & APAD_KBM_EVENT_DOWN);
+
+        if (button == 0u) {
+            break;
+        }
+        kbm_ring_push_mouse(c, button, down);
+        if (button <= (uint8_t)APAD_MOUSEBTN_MAX) {
+            uint16_t bit = APAD_MOUSEBTN_BIT(button);
+
+            c->mo_buttons = down ? (uint16_t)(c->mo_buttons | bit)
+                                 : (uint16_t)(c->mo_buttons & (uint16_t)~bit);
+        }
+    }
+
+    for (b = 1u; b <= APAD_MOUSEBTN_MAX; b++) {
+        uint16_t bit = APAD_MOUSEBTN_BIT(b);
+        int      was = (c->mo_buttons & bit) ? 1 : 0;
+        int      is  = (in->buttons   & bit) ? 1 : 0;
+
+        if (was != is) {
+            kbm_ring_push_mouse(c, (uint8_t)b,
+                                (uint8_t)(is ? APAD_KBM_EVENT_DOWN : 0u));
+        }
+    }
+    c->mo_buttons = (uint16_t)(in->buttons & APAD_MOUSEBTN_VALID_MASK);
+
+    /* §6.16: the accumulators are the caller's own free-running wrapping
+     * counters and go on the wire verbatim -- their absolute value carries
+     * no meaning and the receiver only ever diffs consecutive accepted
+     * samples. A CHANGE is what schedules a datagram; an unchanged
+     * accumulator already encodes "no motion" exactly, which is why §6.16
+     * exempts motion from the held-repeat obligation. */
+    if (in->dx_accum != c->mo_dx || in->dy_accum != c->mo_dy
+        || in->wheel_accum != c->mo_wheel || in->hwheel_accum != c->mo_hwheel) {
+        c->mo_dirty = 1u;
+    }
+    c->mo_dx     = in->dx_accum;
+    c->mo_dy     = in->dy_accum;
+    c->mo_wheel  = in->wheel_accum;
+    c->mo_hwheel = in->hwheel_accum;
+    kbm_engage(&c->mo_engaged, &c->mo_dirty);
+}
+
+static void kbm_ingest_media(apad_client *c, const apad_media *in)
+{
+    size_t   i;
+    unsigned ctl;
+    uint32_t want;
+
+    for (i = 0u; i < (size_t)APAD_MEDIA_RING_DEPTH; i++) {
+        uint8_t control = in->events[i].control;
+        uint8_t down    = (uint8_t)(in->events[i].flags & APAD_KBM_EVENT_DOWN);
+
+        if (control == 0u) {
+            break;
+        }
+        kbm_ring_push_media(c, control, down);
+        if (control <= (uint8_t)APAD_MEDIA_INDEX_MAX) {
+            uint32_t bit = APAD_MEDIA_BIT(control);
+
+            c->me_held = down ? (c->me_held | bit) : (c->me_held & ~bit);
+        }
+    }
+
+    want = in->held;
+    for (ctl = 1u; ctl <= APAD_MEDIA_INDEX_MAX; ctl++) {
+        uint32_t bit = APAD_MEDIA_BIT(ctl);
+        int      was = (c->me_held & bit) ? 1 : 0;
+        int      is  = (want       & bit) ? 1 : 0;
+
+        if (was != is) {
+            kbm_ring_push_media(c, (uint8_t)ctl,
+                                (uint8_t)(is ? APAD_KBM_EVENT_DOWN : 0u));
+        }
+    }
+    c->me_held = want;
+    kbm_engage(&c->me_engaged, &c->me_dirty);
+}
+
+/*
+ * §6.20's cadence, per facility. Three ways a datagram becomes due, and they
+ * are checked in the order they matter:
+ *
+ *   1. DIRTY -- something changed. Sent as soon as §11's ceiling allows.
+ *      Delaying a change by up to 8 ms is safe here and nowhere else in this
+ *      protocol: the ring carries both transitions of a tap that coalesced
+ *      into one datagram, so nothing is lost, only slightly deferred.
+ *   2. HELD -- anything held repeats at better than the 10 Hz floor. MUST.
+ *      For MOUSE the repeat covers BUTTONS ONLY, so the interval is the
+ *      faster of the two schedules: a server that asked for a 5 Hz pointer
+ *      would otherwise drag the button repeat under §6.20's floor and the
+ *      watchdog would release a button the user is still holding.
+ *   3. TRAILING -- three copies about 50 ms apart once the facility is idle,
+ *      armed only by a change (never by a trailing copy, which would repeat
+ *      forever). This is what carries a release, or a tap that exists only in
+ *      the ring, across packet loss.
+ *
+ * An idle facility with nothing held and nothing owed sends NOTHING. A client
+ * showing a keyboard nobody is typing on costs zero datagrams.
+ */
+static void kbm_pump_keyboard(apad_client *c, uint32_t now)
+{
+    int held = 0;
+    unsigned i;
+
+    for (i = 0u; i < APAD_KEY_BITMAP_BYTES; i++) {
+        if (c->kb_keys[i] != 0u) {
+            held = 1;
+            break;
+        }
+    }
+    if (c->kb_dirty) {
+        if (apad_time_since(now, c->kb_tx_ms) < APAD_KBM_MIN_TX_MS) {
+            return;
+        }
+        kbm_send_keyboard(c, now);
+        if (held) {
+            c->kb_trail = 0u;
+        } else {
+            c->kb_trail        = (uint8_t)APAD_KBM_TRAIL_COPIES;
+            c->kb_trail_due_ms = now + APAD_KBM_TRAIL_MS;
+        }
+        return;
+    }
+    if (held) {
+        if (apad_time_since(now, c->kb_tx_ms) >= APAD_KBM_REPEAT_MS) {
+            kbm_send_keyboard(c, now);
+        }
+        return;
+    }
+    if (c->kb_trail > 0u && apad_time_reached(now, c->kb_trail_due_ms)) {
+        kbm_send_keyboard(c, now);
+        c->kb_trail--;
+        c->kb_trail_due_ms = now + APAD_KBM_TRAIL_MS;
+    }
+}
+
+static void kbm_pump_mouse(apad_client *c, uint32_t now)
+{
+    uint32_t interval = kbm_mouse_interval_ms(c);
+    int      held     = (c->mo_buttons != 0u) ? 1 : 0;
+
+    if (c->mo_dirty) {
+        if (apad_time_since(now, c->mo_tx_ms) < interval) {
+            return;
+        }
+        kbm_send_mouse(c, now);
+        if (held) {
+            c->mo_trail = 0u;
+        } else {
+            c->mo_trail        = (uint8_t)APAD_KBM_TRAIL_COPIES;
+            c->mo_trail_due_ms = now + APAD_KBM_TRAIL_MS;
+        }
+        return;
+    }
+    if (held) {
+        uint32_t repeat = (interval < APAD_KBM_REPEAT_MS) ? interval
+                                                          : APAD_KBM_REPEAT_MS;
+        if (apad_time_since(now, c->mo_tx_ms) >= repeat) {
+            kbm_send_mouse(c, now);
+        }
+        return;
+    }
+    if (c->mo_trail > 0u && apad_time_reached(now, c->mo_trail_due_ms)) {
+        kbm_send_mouse(c, now);
+        c->mo_trail--;
+        c->mo_trail_due_ms = now + APAD_KBM_TRAIL_MS;
+    }
+}
+
+static void kbm_pump_media(apad_client *c, uint32_t now)
+{
+    int held = (c->me_held != 0u) ? 1 : 0;
+
+    if (c->me_dirty) {
+        if (apad_time_since(now, c->me_tx_ms) < APAD_KBM_MIN_TX_MS) {
+            return;
+        }
+        kbm_send_media(c, now);
+        if (held) {
+            c->me_trail = 0u;
+        } else {
+            c->me_trail        = (uint8_t)APAD_KBM_TRAIL_COPIES;
+            c->me_trail_due_ms = now + APAD_KBM_TRAIL_MS;
+        }
+        return;
+    }
+    if (held) {
+        if (apad_time_since(now, c->me_tx_ms) >= APAD_KBM_REPEAT_MS) {
+            kbm_send_media(c, now);
+        }
+        return;
+    }
+    if (c->me_trail > 0u && apad_time_reached(now, c->me_trail_due_ms)) {
+        kbm_send_media(c, now);
+        c->me_trail--;
+        c->me_trail_due_ms = now + APAD_KBM_TRAIL_MS;
+    }
+}
+
+/*
+ * One pump's worth of §6.15-§6.17, gated by §6.19.
+ *
+ * A facility is ingested only while its gate is open. Accumulating events
+ * into a ring nobody may transmit would run event_seq away from a server that
+ * has never seen one of these datagrams -- harmless (§6.20 step 1 discards a
+ * first message's ring) but pointless, and it would make the moment the gate
+ * opens look like a burst of history rather than a baseline.
+ *
+ * Called with kbm == NULL too, from apad_client_pump(): a caller that
+ * alternates between the two entry points still owes §6.20's repeats and
+ * trailing copies for whatever it left held, and this is where those are
+ * paid. A client that has never touched the facility holds nothing, is not
+ * engaged, and sends nothing at all -- which is why apad_client_pump()'s
+ * behaviour is unchanged by any of this.
+ */
+static void kbm_pump(apad_client *c, const apad_client_kbm_in *kbm, uint32_t now)
+{
+    int kb_on = kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_KEYBOARD);
+    int mo_on = kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_MOUSE);
+    int me_on = kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_MEDIA);
+
+    if (kbm != NULL) {
+        if (kb_on && (kbm->have & (uint8_t)APAD_KBM_FEATURE_KEYBOARD) != 0u) {
+            kbm_ingest_keyboard(c, &kbm->keyboard);
+        }
+        if (mo_on && (kbm->have & (uint8_t)APAD_KBM_FEATURE_MOUSE) != 0u) {
+            kbm_ingest_mouse(c, &kbm->mouse);
+        }
+        if (me_on && (kbm->have & (uint8_t)APAD_KBM_FEATURE_MEDIA) != 0u) {
+            kbm_ingest_media(c, &kbm->media);
+        }
+    }
+    if (kb_on && c->kb_engaged) {
+        kbm_pump_keyboard(c, now);
+    }
+    if (mo_on && c->mo_engaged) {
+        kbm_pump_mouse(c, now);
+    }
+    if (me_on && c->me_engaged) {
+        kbm_pump_media(c, now);
+    }
+}
+
+/* How long apad_client_pump_ex() may sleep before a §6.20 obligation comes
+ * due, or -1 when nothing is owed. Without this the pump would wait for the
+ * next INPUT_STATE and a 125 Hz pointer would go out at the 60 Hz session
+ * rate -- the schedule would be right and the clock would ignore it. */
+static int kbm_next_due_ms(const apad_client *c, uint32_t now)
+{
+    uint32_t best = 0xFFFFFFFFu;
+    uint32_t el;
+
+    if (kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_KEYBOARD) && c->kb_engaged) {
+        unsigned i;
+        int held = 0;
+        for (i = 0u; i < APAD_KEY_BITMAP_BYTES; i++) {
+            if (c->kb_keys[i] != 0u) { held = 1; break; }
+        }
+        if (c->kb_dirty) {
+            el = apad_time_since(now, c->kb_tx_ms);
+            best = (el >= APAD_KBM_MIN_TX_MS) ? 0u : (APAD_KBM_MIN_TX_MS - el);
+        } else if (held) {
+            el = apad_time_since(now, c->kb_tx_ms);
+            if (el >= APAD_KBM_REPEAT_MS) { best = 0u; }
+            else if (APAD_KBM_REPEAT_MS - el < best) { best = APAD_KBM_REPEAT_MS - el; }
+        } else if (c->kb_trail > 0u) {
+            el = apad_time_since(now, c->kb_tx_ms);
+            if (el >= APAD_KBM_TRAIL_MS) { best = 0u; }
+            else if (APAD_KBM_TRAIL_MS - el < best) { best = APAD_KBM_TRAIL_MS - el; }
+        }
+    }
+    if (kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_MOUSE) && c->mo_engaged) {
+        uint32_t interval = kbm_mouse_interval_ms(c);
+        uint32_t want = 0xFFFFFFFFu;
+
+        el = apad_time_since(now, c->mo_tx_ms);
+        if (c->mo_dirty) {
+            want = (el >= interval) ? 0u : (interval - el);
+        } else if (c->mo_buttons != 0u) {
+            uint32_t repeat = (interval < APAD_KBM_REPEAT_MS) ? interval
+                                                              : APAD_KBM_REPEAT_MS;
+            want = (el >= repeat) ? 0u : (repeat - el);
+        } else if (c->mo_trail > 0u) {
+            want = (el >= APAD_KBM_TRAIL_MS) ? 0u : (APAD_KBM_TRAIL_MS - el);
+        }
+        if (want < best) { best = want; }
+    }
+    if (kbm_gate(c, (uint32_t)APAD_KBM_FEATURE_MEDIA) && c->me_engaged) {
+        uint32_t want = 0xFFFFFFFFu;
+
+        el = apad_time_since(now, c->me_tx_ms);
+        if (c->me_dirty) {
+            want = (el >= APAD_KBM_MIN_TX_MS) ? 0u : (APAD_KBM_MIN_TX_MS - el);
+        } else if (c->me_held != 0u) {
+            want = (el >= APAD_KBM_REPEAT_MS) ? 0u : (APAD_KBM_REPEAT_MS - el);
+        } else if (c->me_trail > 0u) {
+            want = (el >= APAD_KBM_TRAIL_MS) ? 0u : (APAD_KBM_TRAIL_MS - el);
+        }
+        if (want < best) { best = want; }
+    }
+    return (best == 0xFFFFFFFFu) ? -1 : (int)best;
+}
+
 static void handle_packet(apad_client *c, const apad_packet *pkt)
 {
     c->rx_packets++;
@@ -231,7 +997,17 @@ static void handle_packet(apad_client *c, const apad_packet *pkt)
             c->auth_state = (int32_t)APAD_AUTH_NEED_SECRET;
             break;
         }
-        apad_derive_session_key(c->secret, w.server_nonce, key);
+        {
+            /* Timed, because on a 67-133 MHz ARM9 this is the single slowest
+             * thing the client ever does and the number is not academic: the
+             * server's §11 idle timer is already running from the ACK that
+             * just left, and if this takes longer than 3 s the pairing dies
+             * here, silently, every time. The UI shows it (stats.derive_ms). */
+            uint32_t t0 = apad_ticks_ms();
+            apad_derive_session_key(c->secret, w.server_nonce, key);
+            c->derive_ms = apad_time_since(apad_ticks_ms(), t0);
+            if (c->derive_ms == 0u) { c->derive_ms = 1u; }   /* "happened" vs "never" */
+        }
         apad_session_set_key(&c->sess, key);
         apad_secure_zero(key, sizeof key);
         c->auth_state = (int32_t)APAD_AUTH_KEYED;
@@ -326,7 +1102,7 @@ static void handle_packet(apad_client *c, const apad_packet *pkt)
         }
         break;
     }
-    /* v2 EXPERIMENT: store the server's touch layout for the UI. Never
+    /* §6.12: store the server's touch layout for the UI. Never
      * affects input handling -- this is a drawing hint and nothing else, so a
      * malformed one costs a redraw, not a session. */
     case APAD_MSG_TOUCHMAP: {
@@ -336,6 +1112,69 @@ static void handle_packet(apad_client *c, const apad_packet *pkt)
             c->touchmap = tm;
             c->touchmap_serial++;
         }
+        break;
+    }
+    /*
+     * §6.19 INPUTCAPS (0x44). Three things happen here and the ORDER IS
+     * NORMATIVE.
+     *
+     * 1. §6.20's per-type window, "before anything else in this section".
+     *    This is the fourth of §6.20's four windows and the only one on the
+     *    server->client side, so it is the client that has to run it; core
+     *    holds the slot (APAD_KBM_CLASS_INPUTCAPS) so the rule §6.20 states
+     *    once has one implementation rather than a private copy here.
+     *    Without it a reordered copy REVIVES STALE features/status, which
+     *    §6.19's "latest wins" forbids -- and the concrete cost is not
+     *    cosmetic: a feature bit the server has cleared comes back, and this
+     *    client resumes sending a type the server has stopped accepting,
+     *    holding keys the server is no longer listening to.
+     *
+     *    apad_session_on_recv() deliberately does NOT route this type (see
+     *    kbm_class_for_type in core/src/session.c); if it did, this call
+     *    would be the second application of the same window and would report
+     *    every INPUTCAPS after the first as stale.
+     *
+     * 2. Release before a cleared `features` bit takes effect. §6.19: "If a
+     *    features bit clears, the client MUST stop sending that type, and
+     *    MUST first release everything it holds for that facility -- otherwise
+     *    the last thing the server saw held stays held with nothing left able
+     *    to lift it." The release datagram has to go out while the OLD
+     *    capabilities still permit it, which is why this runs before the
+     *    store below and not after.
+     *
+     * 3. Store, and bump the serial -- touchmap_serial's convention, so a UI
+     *    redraws off a change rather than polling. A serial of 0 means none
+     *    has ever been accepted, which §6.19 makes the negotiation itself.
+     */
+    case APAD_MSG_INPUTCAPS: {
+        apad_inputcaps ic;
+        uint32_t       had;
+        uint32_t       now;
+
+        if (apad_session_accept_kbm(&c->sess, APAD_KBM_CLASS_INPUTCAPS,
+                                    pkt->header.sequence) != APAD_OK) {
+            break;                     /* §6.20: reordered or duplicate */
+        }
+        memset(&ic, 0, sizeof ic);
+        if (apad_decode_inputcaps(pkt->payload, pkt->payload_len, &ic) < 0) {
+            break;
+        }
+        had = (c->inputcaps_serial != 0u) ? c->inputcaps.features : 0u;
+        now = apad_ticks_ms();
+        if ((had & (uint32_t)APAD_KBM_FEATURE_KEYBOARD) != 0u
+            && (ic.features & (uint32_t)APAD_KBM_FEATURE_KEYBOARD) == 0u) {
+            kbm_release_keyboard(c, now);
+        }
+        if ((had & (uint32_t)APAD_KBM_FEATURE_MOUSE) != 0u
+            && (ic.features & (uint32_t)APAD_KBM_FEATURE_MOUSE) == 0u) {
+            kbm_release_mouse(c, now);
+        }
+        if ((had & (uint32_t)APAD_KBM_FEATURE_MEDIA) != 0u
+            && (ic.features & (uint32_t)APAD_KBM_FEATURE_MEDIA) == 0u) {
+            kbm_release_media(c, now);
+        }
+        c->inputcaps = ic;
+        c->inputcaps_serial++;
         break;
     }
     case APAD_MSG_ERROR: {
@@ -619,6 +1458,22 @@ int apad_client_probe(apad_client *c, const char *ip, uint16_t port,
         note_error(c, rc);
         return rc;
     }
+    /* The limited broadcast address is refused, not sent. This socket never
+     * has SO_BROADCAST set -- the probe is the §6.1 "unicast to a manually
+     * entered address" case -- and on DSWiFi's lwIP a sendto() to
+     * 255.255.255.255 without that option does not fail: it never returns,
+     * and the console keeps drawing at 60 fps around a thread that is wedged
+     * forever (found on the DS bring-up, 2026-09-09). A tier-2 broadcast
+     * DISCOVER is the platform's own job on its own socket, the way
+     * clients/3ds/source/main.c's app_discover() does it. */
+    {
+        apad_addr bcast;
+        apad_addr_broadcast(&bcast, c->target.port);
+        if (apad_addr_equal(&c->target, &bcast)) {
+            note_error(c, APAD_ERR_ARG);
+            return APAD_ERR_ARG;
+        }
+    }
 
     apad_session_init(&c->sess, 0, apad_ticks_ms());
     c->pairing_required = -1;
@@ -686,6 +1541,31 @@ int apad_client_connect(apad_client *c, const char *ip, uint16_t port,
     c->auth_required = 0;
     c->auth_state    = (int32_t)APAD_AUTH_NONE;
     c->error_code    = 0;
+
+    /* §6.19/§6.20 are per-SESSION, not per-client, and both halves matter on
+     * a reconnect. The capabilities belong to the session that advertised
+     * them, so they go back to "never received" -- the gate closes and this
+     * client sends nothing again until a new INPUTCAPS arrives, which is
+     * exactly right if the far end is a different server or the same one
+     * without uinput this time. And event_seq counts "every event ever
+     * generated ON THIS SESSION" (§6.20), so the counters, the rings and the
+     * shadows all start over; carrying the old event_seq into a new session
+     * would make the receiver's first-accepted baseline meaningless. */
+    c->inputcaps_serial = 0u;
+    memset(&c->inputcaps, 0, sizeof c->inputcaps);
+    memset(c->kb_keys, 0, sizeof c->kb_keys);
+    memset(c->kb_ring, 0, sizeof c->kb_ring);
+    c->kb_seq = 0u; c->kb_tx_ms = 0u; c->kb_trail_due_ms = 0u;
+    c->kb_trail = 0u; c->kb_dirty = 0u; c->kb_engaged = 0u;
+    memset(c->mo_ring, 0, sizeof c->mo_ring);
+    c->mo_dx = 0u; c->mo_dy = 0u; c->mo_wheel = 0u; c->mo_hwheel = 0u;
+    c->mo_buttons = 0u; c->mo_seq = 0u; c->mo_tx_ms = 0u;
+    c->mo_trail_due_ms = 0u; c->mo_trail = 0u; c->mo_dirty = 0u;
+    c->mo_engaged = 0u;
+    memset(c->me_ring, 0, sizeof c->me_ring);
+    c->me_held = 0u; c->me_seq = 0u; c->me_tx_ms = 0u;
+    c->me_trail_due_ms = 0u; c->me_trail = 0u; c->me_dirty = 0u;
+    c->me_engaged = 0u;
 
     memset(&hello, 0, sizeof hello);
     memcpy(hello.client_id, c->client_id, sizeof hello.client_id);
@@ -778,12 +1658,22 @@ int apad_client_connect(apad_client *c, const char *ip, uint16_t port,
     }
 }
 
-int apad_client_pump(apad_client *c, const apad_input_state *in, int max_wait_ms)
+/*
+ * apad_client_pump() is this function with kbm == NULL, and that is the whole
+ * relationship: one implementation, one set of §8/§9 timers, no second copy
+ * of the session loop that could drift from the first. Every existing caller
+ * (clients/3ds, clients/psp, clients/android, tools/engine-client) keeps
+ * working untouched, and a client that hands no keyboard, mouse or media puts
+ * not one extra byte on the wire.
+ */
+int apad_client_pump_ex(apad_client *c, const apad_input_state *in,
+                        const apad_client_kbm_in *kbm, int max_wait_ms)
 {
     uint32_t now;
     uint32_t elapsed;
     int wait;
     int action;
+    int kbm_wait;
 
     if (c == NULL) {
         return APAD_CLIENT_CLOSED;
@@ -800,6 +1690,14 @@ int apad_client_pump(apad_client *c, const apad_input_state *in, int max_wait_ms
     elapsed = apad_time_since(now, c->last_input_ms);
     wait    = (elapsed >= c->input_interval_ms)
                   ? 0 : (int)(c->input_interval_ms - elapsed);
+    /* §6.20's schedules are independent of the INPUT_STATE clock and can be
+     * faster than it (a 125 Hz pointer under a 60 Hz session, or a 50 ms
+     * trailing copy). Sleeping to the next INPUT_STATE regardless would leave
+     * the cadence correct on paper and wrong on the wire. */
+    kbm_wait = kbm_next_due_ms(c, now);
+    if (kbm_wait >= 0 && kbm_wait < wait) {
+        wait = kbm_wait;
+    }
     if (max_wait_ms >= 0 && wait > max_wait_ms) {
         wait = max_wait_ms;
     }
@@ -835,6 +1733,11 @@ int apad_client_pump(apad_client *c, const apad_input_state *in, int max_wait_ms
         c->last_input_ms = now;
     }
 
+    /* §6.15-§6.17, gated by §6.19. After INPUT_STATE, which is the session's
+     * obligation, and before PING, which is only diagnostics. Runs even when
+     * kbm is NULL: repeats and trailing copies already owed are still owed. */
+    kbm_pump(c, kbm, now);
+
     if (!c->awaiting_pong && apad_time_since(now, c->last_ping_ms) >= APAD_PING_INTERVAL_MS) {
         uint8_t payload[APAD_LEN_PING];
         apad_ping ping;
@@ -856,6 +1759,11 @@ int apad_client_pump(apad_client *c, const apad_input_state *in, int max_wait_ms
     }
 
     return APAD_CLIENT_ACTIVE;
+}
+
+int apad_client_pump(apad_client *c, const apad_input_state *in, int max_wait_ms)
+{
+    return apad_client_pump_ex(c, in, NULL, max_wait_ms);
 }
 
 void apad_client_get_stats(const apad_client *c, apad_client_stats *out)
@@ -895,6 +1803,9 @@ void apad_client_get_stats(const apad_client *c, apad_client_stats *out)
     out->status_code        = c->status_code;
     out->touchmap_serial    = c->touchmap_serial;
     out->touchmap           = c->touchmap;
+    out->inputcaps_serial   = c->inputcaps_serial;
+    out->derive_ms          = c->derive_ms;
+    out->inputcaps          = c->inputcaps;
     out->pairing_required   = c->pairing_required;
     out->auth_required      = c->auth_required;
     out->auth_state         = c->auth_state;
@@ -914,6 +1825,13 @@ void apad_client_disconnect(apad_client *c)
     if (c->sess.state == APAD_SESSION_ACTIVE) {
         uint8_t payload[APAD_LEN_BYE];
         apad_bye bye;
+
+        /* §6.20: "A sender MUST release before it stops sending ... and
+         * before BYE." Ordered before the BYE for the obvious reason -- the
+         * server tears the session down on the BYE, and a release arriving
+         * after it has nothing left to act on. Sends nothing at all unless
+         * this client actually holds something. */
+        kbm_release_all(c, apad_ticks_ms());
 
         memset(&bye, 0, sizeof bye);
         bye.reason = (uint8_t)APAD_BYE_NORMAL;

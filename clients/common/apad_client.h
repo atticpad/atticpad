@@ -20,10 +20,13 @@
  * reason for existing is that it has opinions about lifecycle (a foreground
  * Service) that a library must not preempt.
  *
- * malloc: used exactly once, in apad_client_create(). The no-malloc rule in
- * docs/CONVENTIONS.md scopes to core/ and shim/, which must run on a 4 MB ARM9 with no
- * MMU. This file is client code for a device with gigabytes, and it never
- * allocates again after create.
+ * malloc: used exactly once, in apad_client_create(), and never again. That
+ * is the "no malloc AFTER init" rule from docs/CONVENTIONS.md satisfied, not waived:
+ * create() is init. Since 2026-09 this file does run on the 4 MB, no-MMU
+ * ARM9 the rule exists for -- the DS client links it -- and the one calloc
+ * there is a few kilobytes taken once, after Wi-Fi association, before any
+ * session. Anything that would allocate per session or per packet does not
+ * belong in this file.
  */
 #ifndef ATTICPAD_COMMON_APAD_CLIENT_H
 #define ATTICPAD_COMMON_APAD_CLIENT_H
@@ -103,7 +106,7 @@ typedef struct {
     uint32_t status_serial;
     int32_t  status_code;
 
-    /* v2 EXPERIMENT (branch experiment/touchmap-v2) -- §6.12 TOUCHMAP 0x43.
+    /* §6.12 TOUCHMAP 0x43.
      * The layout the SERVER says this device's touchscreen maps to, so a
      * client can draw the truth instead of a compiled-in guess. Follows the
      * same serial convention as rumble/led/status: the serial changes when a
@@ -113,6 +116,25 @@ typedef struct {
     uint32_t      touchmap_serial;
     apad_touchmap touchmap;
 
+    /* §6.19 INPUTCAPS 0x44 — which of §6.15–§6.17 this server accepts, and
+     * what exists for the session right now. Same serial convention as
+     * touchmap above, and the zero case carries the same meaning it does
+     * everywhere else in this struct plus one more:
+     *
+     * inputcaps_serial == 0 means NO INPUTCAPS HAS EVER BEEN ACCEPTED, which
+     * §6.19 makes the whole negotiation — "a client that has not received an
+     * INPUTCAPS MUST NOT send KEYBOARD, MOUSE or MEDIA". A v1 server cannot
+     * send this message and would discard those three anyway, so absence is
+     * how it says no without knowing the question. HIDE THE KBM UI on zero;
+     * showing a keyboard the server will silently drop is worse than showing
+     * nothing. The engine enforces the send side of that gate on its own
+     * (apad_client_pump_ex) — this field is for the UI.
+     *
+     * A reordered copy cannot revive stale contents: §6.20's fourth per-type
+     * window is applied to every INPUTCAPS before it lands here. */
+    uint32_t       inputcaps_serial;
+    apad_inputcaps inputcaps;
+
     /* §10 pairing, all four for the UI and none of them for the protocol. */
     int32_t  pairing_required; /* §6.2 ANNOUNCE; -1 until one is seen        */
     int32_t  auth_required;    /* §6.4 WELCOME flags bit 0                   */
@@ -121,6 +143,12 @@ typedef struct {
                                 * into status_code: STATUS codes are 0..2 and
                                 * ERROR codes are 1..7, so one field cannot
                                 * tell "warning" from "no free pad slot".    */
+    uint32_t derive_ms;        /* wall time of the LAST §10 key derivation
+                                * (PBKDF2, 10,000 iterations), 0 if none yet.
+                                * A number the UI can show: on the DS's
+                                * ARM9 this is seconds, and whether it fits
+                                * inside the server's §11 3 s idle window is
+                                * exactly what decides if pairing works.    */
 } apad_client_stats;
 
 typedef struct apad_client apad_client;
@@ -158,6 +186,9 @@ int apad_client_set_secret(apad_client *c, const char *secret);
  * Unicast, not broadcast: §6.1 allows "unicast to a manually entered
  * address", which is the tier-3 case, and a broadcast DISCOVER is the tier-2
  * job of the host's own discovery UI (Android does tier 1 through NSD).
+ * 255.255.255.255 is therefore REFUSED with APAD_ERR_ARG rather than sent:
+ * this socket has no SO_BROADCAST, and on the DS's lwIP such a send never
+ * returns at all.
  *
  * RESETS the session, so call it before connect(), never during one. Returns
  * APAD_OK when an ANNOUNCE arrived (read the answer from
@@ -195,6 +226,117 @@ int apad_client_connect(apad_client *c, const char *ip, uint16_t port,
  * `while (apad_client_pump(...) == APAD_CLIENT_ACTIVE)`.
  */
 int apad_client_pump(apad_client *c, const apad_input_state *in, int max_wait_ms);
+
+/*
+ * §6.15–§6.17 — one pump's worth of keyboard, mouse and media, handed down
+ * from the platform layer. Read and not retained.
+ *
+ * `have` is a bitmask of APAD_KBM_FEATURE_KEYBOARD / _MOUSE / _MEDIA (kbm.h)
+ * naming which of the three sub-structs below are filled this call. The same
+ * bit positions as INPUTCAPS.features on purpose: "what I am driving" and
+ * "what the server accepts" are then one `&` apart. A facility absent from
+ * `have` is left exactly as it was — its held state keeps being repeated at
+ * §6.20's floor, which is what a receiver's watchdog needs; absence means
+ * "no news", never "release everything".
+ *
+ * WHAT THE CALLER OWNS AND WHAT THE ENGINE OWNS. Getting this split wrong is
+ * the one way to use this struct incorrectly, so it is spelled out:
+ *
+ *   Caller fills          Engine owns (whatever you put there is IGNORED)
+ *   ------------------    ---------------------------------------------
+ *   keyboard.keys[]       keyboard.event_seq, keyboard.client_ticks_ms
+ *   mouse.buttons         mouse.event_seq,    mouse.client_ticks_ms
+ *   mouse.*_accum         media.event_seq,    media.client_ticks_ms
+ *   media.held
+ *   *.events[]  (see below — a QUEUE here, a RING on the wire)
+ *
+ * `keys[]`, `buttons` and `held` are the CURRENT held state and are
+ * authoritative: §6.20 makes the snapshot the authority and reconciles the
+ * receiver against it on every single packet, so whatever you put here is
+ * what the host ends up holding. They must describe the state AFTER any
+ * events submitted in the same call.
+ *
+ * `mouse.dx_accum` and friends are FREE-RUNNING WRAPPING COUNTERS the caller
+ * keeps for the life of the session — add this frame's motion and never
+ * reset them. §6.16: the absolute value carries no meaning, a receiver only
+ * ever diffs consecutive accepted samples, and the wrap is the point. Do not
+ * put a per-frame delta here; a receiver would read it as a jump back to near
+ * zero. +X right, +Y DOWN (screen space, §6.16), wheels in DETENTS.
+ *
+ * `events[]` IS A SUBMISSION QUEUE, NOT THE WIRE RING. Fill it from index 0,
+ * oldest first, with the transitions that happened since the previous pump,
+ * and terminate it with a zero code (`usage`/`button`/`control` == 0) or by
+ * filling the array. It is read up to the first zero code, so memset the
+ * struct before filling it. The engine assigns each submitted event its
+ * §6.20 ordinal, places it in the RIGHT-ALIGNED ring it maintains itself,
+ * and rolls `event_seq` — none of which platform code should be reproducing
+ * (front-packing that ring is explicitly non-conformant, and it is a mistake
+ * that costs one keystroke in a way nothing local can see).
+ *
+ * THE SUB-FRAME TAP IS EXACTLY WHY THIS QUEUE EXISTS. A key, button or
+ * control that is pressed and released between two pumps leaves `keys[]` /
+ * `buttons` / `held` byte-identical, so a state snapshot cannot express it at
+ * all and the tap simply never happens on the host. Submit both transitions:
+ *
+ *     memset(&k, 0, sizeof k);
+ *     k.have = APAD_KBM_FEATURE_KEYBOARD;
+ *     k.keyboard.events[0].usage = APAD_HID_KEY_A;
+ *     k.keyboard.events[0].flags = APAD_KBM_EVENT_DOWN;
+ *     k.keyboard.events[1].usage = APAD_HID_KEY_A;
+ *     k.keyboard.events[1].flags = 0;              // release
+ *     // keyboard.keys[] stays all-zero: nothing is held afterwards
+ *
+ * Both reach the server in one datagram and it emits two events. A platform
+ * that only ever samples state (a key grid polled once a frame) can leave
+ * events[] empty: the engine diffs `keys[]` against its own shadow and
+ * synthesises the transitions, which is correct for everything except a tap
+ * shorter than the pump interval — the case the queue is for.
+ *
+ * A caller may submit at most one ring's worth per pump (8 keyboard, 4 mouse,
+ * 4 media). More than that in one call cannot be represented on the wire by
+ * anyone; pump more often.
+ *
+ * The engine does NOT normalise out-of-range event codes, deliberately —
+ * §6.20 makes that receive-side, so that a sender's bug stays visible to the
+ * one test suite positioned to catch it.
+ */
+typedef struct {
+    uint8_t       have;      /* APAD_KBM_FEATURE_* bits */
+    apad_keyboard keyboard;
+    apad_mouse    mouse;
+    apad_media    media;
+} apad_client_kbm_in;
+
+/*
+ * apad_client_pump() plus §6.15–§6.19. `kbm` may be NULL, which is exactly
+ * what apad_client_pump() passes — the two are one function and a client that
+ * drives no keyboard, mouse or media puts nothing extra on the wire.
+ *
+ * What the engine does with it, so no platform has to (§6.19, §6.20):
+ *
+ *   - THE GATE. Nothing is emitted for a type until an INPUTCAPS has been
+ *     accepted AND its `features` bit is set. This is §6.19's negotiation and
+ *     it lives here so that no client can forget it and start talking to a
+ *     v1 server that will only discard it.
+ *   - THE RELEASE. When a `features` bit CLEARS, everything held for that
+ *     facility is released — on the wire, before sending stops. Skipping it
+ *     leaves a key held on the user's desktop with nothing able to lift it,
+ *     which §6.20 calls the one failure the section exists to prevent. The
+ *     same release runs before the BYE in apad_client_disconnect().
+ *   - THE CADENCE. Keyboard and media on change; mouse at
+ *     INPUTCAPS.mouse_rate_hz (or the session rate when 0) and never above
+ *     §11's 125 Hz ceiling whatever that field asks for — it is a request,
+ *     not an authorisation. Anything held repeats at better than §6.20's
+ *     10 Hz floor, which is a MUST: a change-only sender is indistinguishable
+ *     from a dead one and the receiver's 1000 ms watchdog would release the
+ *     chord under the user's fingers. Three trailing copies about 50 ms apart
+ *     once a facility goes idle, so the last release survives packet loss.
+ *   - THE RING. Right-aligned, per §6.20, with ordinals assigned here.
+ *
+ * Returns the current enum apad_client_state, like apad_client_pump().
+ */
+int apad_client_pump_ex(apad_client *c, const apad_input_state *in,
+                        const apad_client_kbm_in *kbm, int max_wait_ms);
 
 void apad_client_get_stats(const apad_client *c, apad_client_stats *out);
 

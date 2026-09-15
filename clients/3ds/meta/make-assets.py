@@ -6,6 +6,8 @@
     python3 clients/3ds/meta/make-assets.py --windows          # Windows .ico
     python3 clients/3ds/meta/make-assets.py --brand            # README logo +
                                                                # org avatar
+    python3 clients/3ds/meta/make-assets.py --psp              # PSP XMB tile +
+                                                               # backdrop
     python3 clients/3ds/meta/make-assets.py --banner3d-mark    # 3D banner tex
     python3 clients/3ds/meta/make-assets.py --banner3d-glyph   # 3D banner
                                                                # particle outline
@@ -56,6 +58,7 @@ TRANSPARENT = "--transparent" in sys.argv
 ANDROID     = "--android" in sys.argv
 WINDOWS     = "--windows" in sys.argv
 BRAND       = "--brand" in sys.argv
+PSP         = "--psp" in sys.argv
 BANNER3D    = "--banner3d-mark" in sys.argv
 GLYPH       = "--banner3d-glyph" in sys.argv
 
@@ -800,6 +803,56 @@ def make_brand_assets():
     print(f"  wrote docs/img/logo.png ({Ws//SSB}x{H}), docs/img/avatar.png ({A}x{A}),"
           f" docs/img/favicon.png ({F}x{F}) and server/host/common/favicon_png.h"
           f" ({len(png)} bytes embedded)")
+
+# ---- PSP XMB tile and backdrop -----------------------------------------
+#
+# The XMB game list shows ICON0.PNG (144x80) and, behind the selected
+# entry, PIC1.PNG (480x272). The first tile was the README logo scaled
+# down: a rounded card with transparent corners, smaller than the tile,
+# which the XMB's own highlight frame turned into an odd inset. So: the
+# same lockup as the README logo (mark + wordmark, same render_mark()),
+# but drawn edge to edge on an OPAQUE slate tile of exactly the XMB's size,
+# and sized by whichever of width and height binds. Both files are read by
+# clients/psp/Makefile (PSP_EBOOT_ICON / PSP_EBOOT_PIC1) at pack time.
+
+def _lockup(Hs):
+    """Mark + wordmark on a transparent canvas Hs tall, cropped to its ink.
+    The geometry is make_brand_assets()' README lockup without the card."""
+    f  = ImageFont.truetype(BRAND_FONT, int(Hs*0.34))
+    tw = int(ImageDraw.Draw(Image.new("RGBA", (8, 8))).textlength(BRAND_WORD, font=f))
+    m, gap = int(Hs*0.76), int(Hs*0.10)
+    im = Image.new("RGBA", (m + gap + tw, Hs), (0, 0, 0, 0))
+    tile, pad_cy = fit_mark(m, 0.92)
+    my = int(Hs/2 - m/2)
+    im.alpha_composite(tile, (0, my))
+    ImageDraw.Draw(im).text((m + gap, my + pad_cy), BRAND_WORD, font=f,
+                            fill=CREAM + (255,), anchor="lm")
+    return im.crop(_brand_ink_bbox(im))
+
+def _plate(w, h, margin, ssb, fill):
+    """Opaque w x h plate with the lockup fitted inside a `margin` border."""
+    Ws, Hs = w*ssb, h*ssb
+    lock = _lockup(Hs)
+    box_w, box_h = Ws - 2*int(Ws*margin), Hs - 2*int(Hs*margin)
+    k = min(box_w / lock.width, box_h / lock.height)
+    lock = lock.resize((max(1, int(lock.width*k)), max(1, int(lock.height*k))),
+                       Image.LANCZOS)
+    im = Image.new("RGBA", (Ws, Hs), fill + (255,))
+    im.alpha_composite(lock, ((Ws - lock.width)//2, (Hs - lock.height)//2))
+    return im.resize((w, h), Image.LANCZOS).convert("RGB")
+
+def make_psp_assets():
+    SSB = 4
+    out = "clients/psp/meta"
+    os.makedirs(out, exist_ok=True)
+    _plate(144, 80, 0.09, SSB, SLATE).save(f"{out}/ICON0.PNG", optimize=True)
+    _plate(480, 272, 0.20, SSB, SLATE).save(f"{out}/PIC1.PNG", optimize=True)
+    print(f"  wrote {out}/ICON0.PNG (144x80) and {out}/PIC1.PNG (480x272), both opaque")
+
+if PSP:
+    print("AtticPad: PSP XMB tile + backdrop")
+    make_psp_assets()
+    sys.exit(0)
 
 if BRAND:
     # Mutually exclusive with the other modes, same as --windows: writes only

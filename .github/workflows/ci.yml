@@ -1,15 +1,23 @@
 name: CI
 
 # docs/DESIGN.md §8: CI is the gate, local is the loop. This workflow covers what
-# exists as of M2 -- core/, server/, tools/, clients/3ds/. The other console
-# clients (psp, vita, nds, switch) have no code yet (docs/DESIGN.md §11 roadmap: M5,
+# exists as of the keyboard/mouse/media pass -- core/, server/, tools/,
+# clients/3ds/, clients/psp/, clients/nds/, clients/android/. The remaining
+# console clients (vita, switch) have no code yet (docs/DESIGN.md §11 roadmap: M5,
 # and vita is SHELVED, not just unscheduled -- see the vita_shelved()
 # function in scripts/build.sh and docs/DESIGN.md §11), so there are deliberately
-# no client-{psp,vita,nds,switch} jobs here yet; adding one before there is
-# anything to build would just be a job that always fails on a missing
-# directory. See scripts/build.sh's console-target stubs for the same
-# reasoning, and .github/workflows/canary.yml for how the *toolchains* those
-# future jobs will use are watched for drift starting now.
+# no client-{vita,switch} jobs here yet; adding one before there is anything
+# to build would just be a job that always fails on a missing directory.
+# See scripts/build.sh's console-target stubs for the same reasoning, and
+# .github/workflows/canary.yml for how the *toolchains* those future jobs
+# will use are watched for drift starting now.
+#
+# client-nds is wired against the SAME contract client-psp uses (host-run
+# ./clients/nds/build.sh, which sources scripts/toolchains.env and drives the
+# pinned BLOCKSDS digest itself) even on a run where clients/nds/ has not
+# landed yet -- that script does not exist in every worktree this workflow
+# runs against, and this job fails loudly on that (same as
+# scripts/build.sh nds does locally), not silently.
 #
 # client-3ds produces .3dsx on every run. client-3ds-cia, a SEPARATE job
 # that needs: client-3ds, produces the .cia (docs/DESIGN.md §8.3) on tag pushes
@@ -260,6 +268,50 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------
+  # tools — ./scripts/build.sh tools, unmodified. Not required (top-of-file
+  # note): a regression here means a self-checking regression test caught
+  # something, which core-test or server-linux will usually also be failing
+  # on; this job's value is running the checks that ONLY live here.
+  #
+  # This is a real gap this job closes, not belt-and-suspenders: before this
+  # job existed, nothing in CI ever ran tools/server-harness (libapadserver
+  # driven with a fake clock and no sockets -- S9's retransmit schedule
+  # observed at exact millisecond boundaries, a spoofed source address, a
+  # send that fails on demand -- see that tool's own header for what it
+  # reaches that loopback-client structurally cannot) or engine-client's two
+  # serverless self-checking modes, --inputcaps-reorder (S6.20's fourth
+  # staleness window: a reordered INPUTCAPS must not revive a cleared
+  # feature bit) and --release-on-clear (S6.19's release-before-stop, and
+  # S6.20's 10 Hz held-repeat floor measured at the receiver). The
+  # integration job below builds loopback-client and engine-client too, but
+  # only their --target mode against a live server -- it never reaches these
+  # two modes, and it needs /dev/uinput to run at all (an open question on
+  # hosted runners, see that job's own comment). None of the four things
+  # this job runs need a socket to another process, a device, or root, so
+  # this job needs none either.
+  #
+  # tools/fuzz is built here too (build-only, ~a few seconds) because
+  # ./scripts/build.sh tools always does that as part of the same target --
+  # not new coverage, core-fuzz above already owns fuzzing this codec, on
+  # its own schedule (docs/DESIGN.md §8.1) and with its own artifact-on-failure.
+  # ---------------------------------------------------------------------
+  tools:
+    name: tools (server-harness, loopback-client, engine-client self-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ./scripts/build.sh tools
+        # Exactly the local dev-loop command (docs/CONVENTIONS.md "Build and test"):
+        # fuzz harness (build-only), server-harness (build + run every
+        # scenario, no sockets), loopback-client (build + run its own
+        # self-loopback smoke test on 127.0.0.1), engine-client (build + run
+        # --inputcaps-reorder and --release-on-clear, each bringing up its
+        # own fake peer on a scratch port). See scripts/build.sh's
+        # build_tools() for exactly what each of those means and why.
+        run: ./scripts/build.sh tools
+
+  # ---------------------------------------------------------------------
   # toolchains — reads scripts/toolchains.env and exposes each pinned
   # digest as a job output, so downstream jobs' `container: image:` (which
   # GitHub Actions evaluates before any step in that job runs, so it can't
@@ -274,6 +326,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       devkitarm: ${{ steps.read.outputs.devkitarm }}
+      pspdev: ${{ steps.read.outputs.pspdev }}
     steps:
       - uses: actions/checkout@v4
 
@@ -288,6 +341,22 @@ jobs:
             exit 1
           fi
           echo "devkitarm=${DEVKITARM}" >> "$GITHUB_OUTPUT"
+          if [ -z "${PSPDEV:-}" ]; then
+            echo "::error::PSPDEV is not set in scripts/toolchains.env"
+            exit 1
+          fi
+          echo "pspdev=${PSPDEV}" >> "$GITHUB_OUTPUT"
+          # No `blocksds` output: client-nds below is host-run, like
+          # client-psp, and reads scripts/toolchains.env itself via
+          # clients/nds/build.sh -- an output here would only be needed by a
+          # `container: image:` field, which nothing in this file has for
+          # BlocksDS. Still validated here, same as DEVKITARM/PSPDEV above,
+          # so a missing key fails fast with a clear message instead of
+          # inside a Docker pull three steps into client-nds.
+          if [ -z "${BLOCKSDS:-}" ]; then
+            echo "::error::BLOCKSDS is not set in scripts/toolchains.env"
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------
   # client-3ds — builds clients/3ds/ (landed M2, commit 453b8e3) inside the
@@ -311,6 +380,76 @@ jobs:
   # path -- it is that same command with the toolchain-selection layer
   # that only makes sense on a developer's host removed.
   # ---------------------------------------------------------------------
+  client-psp:
+    name: client-psp
+    needs: toolchains
+    runs-on: ubuntu-latest
+    # NOT a `container:` job, unlike client-3ds.
+    #
+    # The pinned PSPDEV image is Alpine/musl with no node and no zip, and
+    # every JS action the runner injects into a container job (checkout,
+    # upload-artifact) is glibc-linked -- whether it works depends on the
+    # runner supplying a musl node, which is not something to bet a job on
+    # for a platform nobody can test by hand. devkitARM is Debian-based,
+    # which is why client-3ds gets away with it.
+    #
+    # Running the container from the host also makes this the SAME
+    # clients/psp/build.sh a developer runs: one build path, not two.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build EBOOT.PBP in the pinned pspdev container
+        run: ./clients/psp/build.sh
+
+      - name: pack the memory-stick layout
+        # A bare EBOOT.PBP is not installable: a PSP needs it at
+        # PSP/GAME/<name>/EBOOT.PBP on the memory stick.
+        run: ./clients/psp/build.sh zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-psp
+          path: clients/psp/atticpad-psp.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # client-nds — builds clients/nds/ inside the SAME pinned BLOCKSDS digest
+  # scripts/build.sh nds uses locally (docs/DESIGN.md §8.5: "local console builds
+  # use the same pinned image digest CI does"). Not required (see the
+  # top-of-file note): a DS build failure should not block merges unrelated
+  # to clients/nds/ or core/; core-test already gates codec correctness for
+  # every platform.
+  #
+  # Host-run, like client-psp, NOT a `container:` job like client-3ds --
+  # deliberately, for the same reason client-psp is host-run rather than
+  # containerized: this makes ./clients/nds/build.sh the ONE build path a
+  # developer and CI both take (source scripts/toolchains.env, run the
+  # pinned digest via Docker/Podman with --user "$(id -u):$(id -g)"), not a
+  # second, divergent one. client-3ds gets away with `container:` because
+  # that job runs `make -C clients/3ds` directly -- there is no host-side
+  # devkitPro-vs-container choice to make inside an Actions container, so
+  # nothing is lost by not going through clients/3ds/build.sh there. The
+  # BlocksDS image's own userland (Ubuntu 24.04/glibc) would likely tolerate a
+  # `container:` job the way devkitARM's does, but host-run keeps one path
+  # for developers instead of introducing a second untested one, and this
+  # is the shape the psp precedent already established.
+  # ---------------------------------------------------------------------
+  client-nds:
+    name: client-nds
+    needs: toolchains
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build atticpad-nds.nds in the pinned BlocksDS container
+        run: ./clients/nds/build.sh build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atticpad-nds
+          path: clients/nds/atticpad-nds.nds
+          if-no-files-found: error
+
   client-3ds:
     name: client-3ds
     needs: toolchains
@@ -462,6 +601,26 @@ jobs:
         # unregenerated header degrades only what users download.
         run: ./scripts/support/check_profiles_builtin.sh
 
+      - name: server/backends — keyboard/media keycode-table guard (scripts/support/check_kbm_tables.c — must match references/hid/ exactly)
+        # Same attributability reasoning as the embedded-profiles guard right
+        # above: ./scripts/build.sh server (next step) already runs this, so
+        # this is not new coverage, only a failure that reads as "the KBM
+        # keycode-table guard fired" on its own line instead of being buried
+        # in that step's combined build+selftest+guard output. Checks BOTH
+        # uinput_keymap.h (this job's own backend) and sendinput_scancodes.h
+        # (the Windows backend, server-windows's table) in one pass -- see
+        # check_kbm_tables.c's header. The mingw/Windows path gets the same
+        # guard too, inside server-windows's single build step (it needs no
+        # cross-compiler -- see scripts/build.sh's build_windows()).
+        run: |
+          set -euo pipefail
+          mkdir -p build/server
+          cc -std=c11 -Wall -Wextra -Werror -g -O1 \
+             -Icore/include -Iserver/backends \
+             scripts/support/check_kbm_tables.c \
+             -o build/server/check-kbm-tables
+          ./build/server/check-kbm-tables "$(pwd)"
+
       - name: server — build (+ smoke run if /dev/uinput is usable on this runner)
         run: ./scripts/build.sh server
 
@@ -511,6 +670,16 @@ jobs:
   # claim as verified running -- this job proves the cross-build stays
   # sound, nothing more; see server/backends/vigem.c's header comment for
   # what has and has not been confirmed on real Windows hardware.
+  #
+  # scripts/build.sh's build_windows() also runs the keyboard/media
+  # keycode-table guard (scripts/support/check_kbm_tables.c) as its first
+  # real step, checking server/backends/sendinput_scancodes.h -- the table
+  # THIS backend uses -- against references/hid/usage-to-scancode-set1.txt.
+  # It runs with the native host cc, not the mingw cross-compiler (it is
+  # host-side data validation, not part of the shipped .exe), and is not
+  # broken out as a separate step here the way it is on server-linux: this
+  # job already runs everything build_windows() does as one step, matching
+  # how the embedded-profiles guard is handled for this job too.
   # ---------------------------------------------------------------------
   server-windows:
     name: server-windows
@@ -603,7 +772,14 @@ jobs:
           distribution: temurin
           java-version: ${{ steps.pins.outputs.jdk }}
 
+      # packages: the action's default is "tools platform-tools", and Google
+      # dropped the legacy "tools" package from the repository; sdkmanager
+      # then exits 1 and the job dies before any of our code runs (first seen
+      # 2026-09-15 on v0.6.0-rc4, green two days earlier). Everything we
+      # actually need is pinned and installed by the step below.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: install the pinned SDK packages
         run: |

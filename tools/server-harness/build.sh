@@ -37,7 +37,7 @@ echo "== tools/server-harness/build.sh: compiling ${OUT} =="
     "${CORE_SRC}/seq.c" "${CORE_SRC}/session.c" \
     "${SERVER_SRC}/server.c" "${SERVER_SRC}/mapping.c" \
     "${SERVER_SRC}/jsonc.c" "${SERVER_SRC}/profiles.c" \
-    "${SERVER_SRC}/pairing.c" \
+    "${SERVER_SRC}/pairing.c" "${SERVER_SRC}/kbm.c" \
     -lm \
     -o "${OUT}"
 echo "built ${OUT}"
