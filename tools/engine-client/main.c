@@ -369,6 +369,28 @@ static int run_kbm(apad_client *c, unsigned attach_wait_ms)
         return 1;
     }
 
+    /* ---- 7. A CHORD IN ONE SNAPSHOT: LEFTSHIFT and A appear together, as
+     * the 3DS's sticky Shift latch submits them. The engine must ring them
+     * modifier first, and evtest on the server's keyboard node must show
+     * KEY_LEFTSHIFT 1 before KEY_A 1 in the same SYN frame -- the other
+     * order types a lowercase letter (seen on a 3DS, 2026-09-15). */
+    printf("kbm: [7] LEFTSHIFT+A in ONE snapshot (held 300 ms) then both up\n");
+    fflush(stdout);
+    memset(&k, 0, sizeof k);
+    k.have = APAD_KBM_FEATURE_KEYBOARD;
+    k.keyboard.keys[APAD_KEY_BYTE(APAD_HID_KEY_LEFTSHIFT)] =
+        APAD_KEY_MASK(APAD_HID_KEY_LEFTSHIFT);
+    k.keyboard.keys[APAD_KEY_BYTE(APAD_HID_KEY_A)] =
+        APAD_KEY_MASK(APAD_HID_KEY_A);
+    if (pump_for(c, 300u, &k) != 0) {
+        return 1;
+    }
+    memset(&k, 0, sizeof k);
+    k.have = APAD_KBM_FEATURE_KEYBOARD;
+    if (pump_for(c, 300u, &k) != 0) {
+        return 1;
+    }
+
     apad_client_get_stats(c, &st);
     printf("kbm: done. tx=%u rx=%u\n", st.tx_packets, st.rx_packets);
     return 0;

@@ -71,6 +71,14 @@ struct app_ctx {
     /* -- the engine ------------------------------------------------------- */
     int                connected;     /* 0->1 edge: first ACTIVE frame this
                                        * connect; gates the config save     */
+    /* One-shot: connect to the remembered address as soon as the radio is
+     * back, without waiting for a button. Set only by the suspend/resume
+     * path in main.c, and only when a session was actually live when the
+     * console went away -- somebody who suspends mid-game expects to come
+     * back to the game, not to an address field. Cleared by the connect
+     * screen the moment it acts on it, so a server that has gone away in the
+     * meantime produces one failed attempt and not a loop. */
+    int                want_reconnect;
     apad_client       *client;
     apad_client_stats  stats;
     apad_input_state   st;     /* this frame's input, as the wire sees it   */

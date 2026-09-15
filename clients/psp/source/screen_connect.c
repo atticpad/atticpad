@@ -341,6 +341,16 @@ static apad_screen_id connect_update(app_ctx *ctx)
                 }
             }
             s_sub = CS_IDLE;
+            if (ctx->want_reconnect && ctx->ip_text[0] != '\0') {
+                /* The radio is back after a suspend and a session was live
+                 * when the console went away: go straight back to it. Same
+                 * path a button press takes, once (app.h). */
+                ctx->want_reconnect = 0;
+                s_attempt = 0;
+                s_sub = CS_CONNECT_ARM;
+                apad_devlog("resume: radio back -- reconnecting to %s:%s",
+                            ctx->ip_text, ctx->port_text);
+            }
 #ifdef APAD_AUTO_HOST
             {   /* dev only: connect without waiting for a button nobody can
                  * press in a headless run. Once, so a failure does not spin. */

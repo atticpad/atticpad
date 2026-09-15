@@ -33,6 +33,22 @@ int  apad_psp_net_modules(void);
 int  apad_psp_net_start(int slot);
 void apad_psp_net_get(apad_psp_net_status *out);
 
+/* Tear the whole network stack down and bring it up again from the
+ * beginning, on the slot last used. This is the suspend/resume path: a PSP
+ * suspend takes the WLAN and the network libraries' state with it, so
+ * sceNetApctlConnect() against the pre-suspend state is not enough -- the
+ * libraries have to be terminated (pspsdk's own pspSdkInetTerm() order) and
+ * re-initialised from sceNetInit() onward.
+ *
+ * Blocks the caller for as long as it takes an in-flight bring-up thread to
+ * notice it has been asked to stop (~50 ms) plus the apctl's own disconnect
+ * (up to ~1 s); it is called once per resume, not per frame. Returns the
+ * value of the apad_psp_net_start() that follows, or negative if a running
+ * bring-up thread could not be stopped (in which case NOTHING is torn down:
+ * terminating the libraries under a thread still polling them would be
+ * worse than a stale association). */
+int  apad_psp_net_restart(void);
+
 /* Live association state, queried straight from the radio (no thread, no
  * network traffic): 1 while the link holds an IP, 0 the moment it drops.
  * A session that dies on the idle timeout and a reconnect that gets no

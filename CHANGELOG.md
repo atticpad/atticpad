@@ -73,6 +73,18 @@ wire format is AtticPad protocol **v1, frozen** — see `docs/PROTOCOL.md`.
   Nothing is hardcoded: a fresh unit still starts empty. The Android
   address field's placeholder no longer looks like a real address.
 
+### Fixed
+
+- **A sticky Shift on the 3DS typed a lowercase letter.** The server applied
+  a report's keys in usage order, so a letter arriving in the same report as
+  Shift was pressed before it. Modifiers now go first, as a host treats a
+  real HID keyboard report.
+- **The 3DS never updated its remembered server after the first save.** The
+  console's filesystem refuses a rename onto an existing file; the old file
+  is removed first now.
+- **The PSP rejoins the network after a suspend.** A power callback re-runs
+  the network bring-up on resume.
+
 ## [0.5.0] — 2026-08-17
 
 **First public release.** AtticPad was built over several months before this

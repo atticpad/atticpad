@@ -40,9 +40,16 @@
 
 #include <string.h>
 
+#include "devlog.h"
 #include "net_psp.h"
 
 #define JOIN_TIMEOUT_MS 30000
+/* How long apad_psp_net_restart() waits for an in-flight bring-up thread to
+ * notice g_abort. The poll loop sleeps 50 ms, so this is 40 chances. */
+#define ABORT_WAIT_MS   2000
+/* How long it waits for the apctl to reach DISCONNECTED before terminating
+ * it. Bounded because nothing here may block the frame loop forever. */
+#define DISCONNECT_WAIT_MS 1000
 
 static volatile struct {
     int  state;
@@ -58,7 +65,8 @@ static volatile struct {
 } g_st = { -1, 0, 0, 0, 0, "", { 0 }, 0, { 0 }, 0 };
 
 static int g_stack_inited;      /* sceNetInit & co. run once per process   */
-static int g_thread_busy;       /* a bring-up thread is in its poll loop   */
+static volatile int g_thread_busy;  /* a bring-up thread is in its poll loop */
+static volatile int g_abort;    /* ask that thread to give up and exit     */
 
 static void fail(const char *stage, int err, int joinfail)
 {
@@ -137,6 +145,15 @@ static void net_run(void)
     if (rc < 0) { fail("sceNetApctlConnect", rc, 1); return; }
 
     for (;;) {
+        if (g_abort) {
+            /* apad_psp_net_restart() is waiting to terminate the libraries
+             * this loop is polling. Leave promptly and leave the apctl
+             * disconnected; `joinfail` (not a hard failure) because nothing
+             * is actually broken -- the console just suspended. */
+            (void)sceNetApctlDisconnect();
+            fail("aborted", 0, 1);
+            return;
+        }
         rc = sceNetApctlGetState(&state);
         if (rc < 0) { fail("sceNetApctlGetState", rc, 0); return; }
         if (state != last) {
@@ -225,6 +242,116 @@ int apad_psp_net_start(int slot)
         return th;
     }
     return sceKernelStartThread(th, 0, NULL);
+}
+
+/*
+ * SUSPEND / RESUME. A PSP suspend takes the radio and the network libraries'
+ * state with it, so after a resume the stack has to come down and go up
+ * again -- re-running sceNetApctlConnect() alone leaves the console off the
+ * network, which is exactly the hardware report this exists for.
+ *
+ * THE TEARDOWN ORDER IS THE SDK'S OWN, not a recollection: pspsdk's
+ * src/sdk/inethelper.c (the implementation behind the pspSdkInetTerm()
+ * declared in pspsdk.h, read from pspdev/pspsdk at the pinned SDK's own
+ * source) is
+ *
+ *     sceNetApctlTerm(); sceNetResolverTerm(); sceNetInetTerm(); sceNetTerm();
+ *
+ * -- i.e. the exact reverse of pspSdkInetInit()'s order, which in turn is
+ * the order net_run() above brings the stack up in. sceNetResolverTerm() is
+ * the one call omitted here, because net_run() never calls
+ * sceNetResolverInit(): this client dials a numeric address and has no use
+ * for DNS. The sceNetApctlDisconnect() in front is ours -- the helper
+ * terminates an apctl that was never connected, and this one is.
+ *
+ * WHAT IS NOT DONE HERE: the net modules are not unloaded and reloaded.
+ * sceNetTerm() does not unload them, nothing in the SDK's samples or the
+ * helper touches sceUtilityUnloadNetModule(), and unloading a module that a
+ * torn-down-but-not-quite library still references is a good way to invent a
+ * new failure. sceUtilityLoadNetModule() IS called again (return code
+ * ignored and logged) purely as a hedge: if a suspend does drop the modules,
+ * this reloads them; if it does not, the call fails harmlessly because they
+ * are already loaded. Whether a real console keeps them across a suspend was
+ * not verifiable here.
+ */
+int apad_psp_net_restart(void)
+{
+    int waited, rc, slot;
+
+    slot = (g_st.slot > 0) ? g_st.slot : 1;
+    apad_devlog("net restart: begin (slot %d, thread_busy=%d, inited=%d)",
+                slot, g_thread_busy, g_stack_inited);
+
+    /* 1. Stop any bring-up thread first. Terminating the libraries under a
+     *    thread that is still calling sceNetApctlGetState() on them is the
+     *    one way this can crash rather than merely fail. */
+    if (g_thread_busy) {
+        g_abort = 1;
+        for (waited = 0; g_thread_busy && waited < ABORT_WAIT_MS; waited += 20) {
+            sceKernelDelayThread(20 * 1000);
+        }
+        g_abort = 0;
+        if (g_thread_busy) {
+            /* Give up rather than tear down underneath it. The connect
+             * screen keeps its existing "could not join / try again"
+             * handling, which is a survivable place to be. */
+            apad_devlog("net restart: ABANDONED -- bring-up thread still"
+                        " running after %d ms", ABORT_WAIT_MS);
+            return -1;
+        }
+        apad_devlog("net restart: bring-up thread stopped after %d ms", waited);
+    }
+
+    /* 2. Down, in the SDK helper's order. Every return code is logged: on a
+     *    console with no debugger this log is the only account of which half
+     *    of the resume failed. */
+    if (g_stack_inited) {
+        rc = sceNetApctlDisconnect();
+        apad_devlog("net restart: sceNetApctlDisconnect -> 0x%08X", (unsigned)rc);
+        for (waited = 0; waited < DISCONNECT_WAIT_MS; waited += 50) {
+            int state = 0;
+            if (sceNetApctlGetState(&state) < 0
+                || state == PSP_NET_APCTL_STATE_DISCONNECTED) {
+                break;
+            }
+            sceKernelDelayThread(50 * 1000);
+        }
+        rc = sceNetApctlTerm();
+        apad_devlog("net restart: sceNetApctlTerm -> 0x%08X", (unsigned)rc);
+        rc = sceNetInetTerm();
+        apad_devlog("net restart: sceNetInetTerm -> 0x%08X", (unsigned)rc);
+        rc = sceNetTerm();
+        apad_devlog("net restart: sceNetTerm -> 0x%08X", (unsigned)rc);
+        g_stack_inited = 0;
+    }
+
+    /* 3. Forget everything the old association published. `ready` is cleared
+     *    FIRST here (it is written last on the way up), so no reader can see
+     *    a stale "ready" with a dead socket behind it. */
+    g_st.ready      = 0;
+    g_st.failed     = 0;
+    g_st.joinfail   = 0;
+    g_st.err        = 0;
+    g_st.stage      = "";
+    g_st.state      = -1;
+    g_st.power_save = 0;
+    g_st.ip[0]      = '\0';
+
+    /* 4. The module hedge -- see the comment above. */
+    rc = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
+    apad_devlog("net restart: LoadNetModule(COMMON) -> 0x%08X (ignored)", (unsigned)rc);
+    rc = sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
+    apad_devlog("net restart: LoadNetModule(INET) -> 0x%08X (ignored)", (unsigned)rc);
+
+    /* 5. Up again from the very beginning: the thread runs net_run(), which
+     *    with g_stack_inited cleared redoes sceNetInit / sceNetInetInit /
+     *    sceNetApctlInit before connecting. Same thread rule as every other
+     *    bring-up here: it exits-and-deletes, so repeated resumes cannot
+     *    accumulate 256 KB stacks and hit 0x80020190. */
+    rc = apad_psp_net_start(slot);
+    apad_devlog("net restart: apad_psp_net_start(%d) -> 0x%08X",
+                slot, (unsigned)rc);
+    return rc;
 }
 
 int apad_psp_net_associated(void)

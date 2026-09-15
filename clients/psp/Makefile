@@ -14,7 +14,7 @@ vpath %.c source:../../core/src:../../shim:../../clients/common
 
 OBJS = main.o ui.o time_psp.o net_psp.o \
        screen_connect.o screen_session.o screen_selftest.o screen_fatal.o \
-       numpad.o devlog.o config_psp.o \
+       numpad.o devlog.o config_psp.o power_psp.o \
        codec.o seq.o session.o hmac_sha256.o selftest.o \
        net_bsd.o \
        apad_client.o
@@ -43,6 +43,14 @@ endif
 # Dev hook: `make APAD_PSP_DEVLOG=1` writes ms0:/atticpad.log.
 ifneq ($(APAD_PSP_DEVLOG),)
 CFLAGS  += -DAPAD_PSP_DEVLOG=1
+endif
+# Dev hook: `make APAD_PSP_FAKE_RESUME=20` injects one synthetic
+# suspend+resume 20 s after boot, so the power-callback path can be RUN in an
+# emulator that cannot suspend a PSP (PPSSPP cannot). It fakes only the two
+# event counters; everything downstream is the shipping path. Never in a
+# shipped build.
+ifneq ($(APAD_PSP_FAKE_RESUME),)
+CFLAGS  += -DAPAD_PSP_FAKE_RESUME=$(APAD_PSP_FAKE_RESUME)
 endif
 # Dev hook: `make APAD_PSP_STDOUT=1` mirrors apad_devlog to stdout, which
 # PSPLINK relays to pspsh over USB -- live diagnostics on a transport that

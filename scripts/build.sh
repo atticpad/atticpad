@@ -245,6 +245,21 @@ build_server() {
       -lm -o "${BUILD_DIR}/server/trigger-button-test"
   "${BUILD_DIR}/server/trigger-button-test"
 
+  # A report that carries a modifier and a letter TOGETHER (the 3DS on-screen
+  # keyboard's sticky Shift latch does exactly this) must inject the modifier
+  # first: the whole batch goes out under one SYN_REPORT, consumers apply it
+  # in order, and ascending usage order would put A (0x04) before LEFTSHIFT
+  # (0xE1) -- a lowercase letter on the host. Silent, and invisible to anyone
+  # testing with a physically held modifier, which lands in an earlier report.
+  log "server: keyboard report-ordering guard (scripts/support/kbm_order_test.c — a report's modifiers must precede its keys)"
+  "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \
+      -I"${CORE_INC}" -I"${REPO_ROOT}/server/backends" \
+      -I"${REPO_ROOT}/server/include" -I"${REPO_ROOT}/server/src" \
+      "${HERE}/support/kbm_order_test.c" \
+      "${CORE_SRC}/seq.c" "${REPO_ROOT}/server/src/kbm.c" \
+      -o "${BUILD_DIR}/server/kbm-order-test"
+  "${BUILD_DIR}/server/kbm-order-test"
+
   log "server: compiling libapadserver + linux host -> atticpad-server (-std=c11 -Wall -Wextra -Werror, uinput backend)"
   mkdir -p "${BUILD_DIR}/server"
   "${CC_NATIVE}" -std=c11 -Wall -Wextra -Werror -g -O1 \

@@ -242,7 +242,16 @@ typedef struct {
      * distinct device touched, at the end of the batch) may reorder within
      * a call but MUST preserve each event's own device's press/release
      * order -- the caller has already reduced the datagram's ring + snapshot
-     * to the minimal ordered sequence that reaches the same held state. */
+     * to the minimal ordered sequence that reaches the same held state.
+     *
+     * "Preserve the order for one device" is load-bearing, not a formality:
+     * within one keyboard batch the caller emits a report's MODIFIER
+     * transitions (HID usages 0xE0-0xE7) before its other keys, so that a
+     * Shift arriving in the same report as a letter still applies to that
+     * letter -- the order a real USB HID report gets by putting its
+     * modifier byte first. A backend that sorted a keyboard batch by code
+     * would type the lowercase letter. See server/src/kbm.c's comment on
+     * §6.20 step 3. */
     int      (*kbm_events)(int slot, const apad_kbm_event_out *ev, size_t n);
 
     /* Apply one MOUSE datagram's relative motion for `slot` -- create_kbm

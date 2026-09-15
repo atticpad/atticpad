@@ -11,9 +11,11 @@
  * and Anemone3DS (camera_3ds.c's header cites the first and third directly)
  * all keep their own config/data under sdmc:/3ds/<name>/. Following that
  * convention, rather than inventing a new one, is what "mirror, don't
- * invent" means when there is no in-repo sample to mirror. UNVERIFIED ON
- * HARDWARE: this exact mkdir()+fopen()+rename() sequence against sdmc:/3ds/
- * has not been run on physical hardware yet. See docs/PORTING.md.
+ * invent" means when there is no in-repo sample to mirror. The mkdir() and
+ * fopen() halves are no longer unverified: the 2026-09-15 hardware report
+ * below is itself proof that a first save reached the SD card and was read
+ * back on a later launch. The rename() half is the half that was wrong --
+ * see ATOMICITY. See docs/PORTING.md.
  *
  * FORMAT: two `key=value` lines, ip= then port=, nothing else. Trivially
  * parseable (one strncmp per line, no tokenizer), naturally
@@ -34,12 +36,60 @@
  * done by the time any teardown path could run -- there is no background
  * writer here to race in the first place.
  *
- * ATOMICITY: write to a .tmp file, fclose(), then rename() over the real
- * path. rename() on a POSIX-shaped filesystem replaces the destination in
- * one directory-entry update, so a reader (or a power loss) never observes
- * a file that is half this save and half the previous one. Every failure
- * path removes the .tmp file rather than leaving it behind for the next
- * save to find in an unknown state.
+ * ATOMICITY, AND THE CLAIM THAT DID NOT HOLD: this file used to say that
+ * rename() "replaces the destination in one directory-entry update", the
+ * POSIX guarantee, and to rely on that alone. ON A REAL 3DS IT DID NOT
+ * REPLACE ANYTHING. Reported 2026-09-15 from hardware: a console whose
+ * config was first written in August still prefilled that August address
+ * after connecting to a different server since. That is precisely the
+ * fingerprint of a rename that fails when the destination exists -- the
+ * first save of a console's life creates the file and works, and every
+ * later one writes the .tmp, fails the rename, tidily deletes the .tmp, and
+ * leaves the ORIGINAL file in place, silently, because a save failure here
+ * is deliberately not reported anywhere.
+ *
+ * That the 3DS FS service rejects a rename onto an existing path rather
+ * than replacing it is not this agent's guess: libctru's own devoptab
+ * (archive_dev.c, archive_rename()) carries a DeleteFile-then-RenameFile
+ * workaround for exactly that case, which a library does not write unless
+ * the service refuses. The same rule on FatFs is why the DS client hit the
+ * identical bug, where it was MEASURED under melonDS -- config_nds.c's
+ * write_record() carries the same fix and the f_rename() citation, and this
+ * code is that shape ported back.
+ *
+ * WHAT IS NOT KNOWN IS WHY THE LIBRARY'S OWN WORKAROUND DID NOT COVER IT.
+ * libctru 2.7.0 -- the version in the pinned devkitARM image, checked in
+ * the shipped libctru.a's archive_dev.o, not merely in upstream source --
+ * already retries a failed rename as DeleteFile-then-RenameFile, but ONLY
+ * when the FS error's description field is exactly RD_ALREADY_EXISTS. On
+ * the console that reported this, something about that path did not fire
+ * (a description this code cannot read from here, or a DeleteFile that
+ * itself failed). Rather than guess at an error code that can only be
+ * observed on hardware, this file no longer depends on the library
+ * recognising the condition at all.
+ *
+ * So: write to a .tmp file, fclose(), then try the plain rename() FIRST (it
+ * is still the atomic path wherever the filesystem does replace, and this
+ * file needs no further change if that becomes reliable), and only if that
+ * fails remove() the destination and rename() again.
+ *
+ * AN EMULATOR CANNOT CATCH THIS, which is why it survived to hardware:
+ * Azahar backs sdmc:/ with a host directory, so the rename lands on Linux's
+ * POSIX rename() and quietly overwrites. Re-run 2026-09-15 to be sure --
+ * the BROKEN build updated the file correctly on every save under Azahar.
+ *
+ * THE WINDOW OF NON-ATOMICITY IS BETWEEN THAT remove() AND THAT rename():
+ * for that instant the console has no config file at all, so a power cut
+ * (or a battery pull, or an APTHOOK teardown -- though see WRITE TIME
+ * above) landing exactly there loses the remembered address and the next
+ * launch behaves like a fresh unit, empty field and no auto-dial. That is
+ * accepted deliberately: the cost is re-typing an address on a numpad once,
+ * against the measured alternative of a file that can never be updated
+ * again. A half-written record is still impossible -- the record is only
+ * ever built in the .tmp file, never in the destination.
+ *
+ * Every failure path removes the .tmp file rather than leaving it behind
+ * for the next save to find in an unknown state.
  */
 
 #include <stdio.h>
@@ -159,11 +209,20 @@ void apad3ds_config_save(const char *ip, const char *port)
     }
 
     if (rename(APAD3DS_CFG_TMP, APAD3DS_CFG_PATH) != 0) {
-        /* The temp file is now either a leftover from a failed rename or
-         * nothing at all; either way nothing should be left behind for the
-         * next save to trip over. Failure here is silent by design (see
-         * config_3ds.h) -- there is nowhere on this client to report it and
-         * nothing about a controller session that should hinge on it. */
-        remove(APAD3DS_CFG_TMP);
+        /* THE DESTINATION EXISTS AND THIS FILESYSTEM WILL NOT REPLACE IT --
+         * see the ATOMICITY note at the top of this file. Clear the way and
+         * retry; the gap between these two calls is the one moment the
+         * address can be lost, and it is the price of a save that works at
+         * all after the first one. */
+        (void)remove(APAD3DS_CFG_PATH);
+        if (rename(APAD3DS_CFG_TMP, APAD3DS_CFG_PATH) != 0) {
+            /* The temp file is now either a leftover from a failed rename or
+             * nothing at all; either way nothing should be left behind for
+             * the next save to trip over. Failure here is silent by design
+             * (see config_3ds.h) -- there is nowhere on this client to report
+             * it and nothing about a controller session that should hinge on
+             * it. */
+            remove(APAD3DS_CFG_TMP);
+        }
     }
 }

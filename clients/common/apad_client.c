@@ -582,7 +582,7 @@ static void kbm_engage(uint8_t *engaged, uint8_t *dirty)
 static void kbm_ingest_keyboard(apad_client *c, const apad_keyboard *in)
 {
     size_t   i;
-    unsigned byte_i;
+    unsigned byte_i, pass;
 
     for (i = 0u; i < (size_t)APAD_KEYBOARD_RING_DEPTH; i++) {
         uint8_t usage = in->events[i].usage;
@@ -603,24 +603,36 @@ static void kbm_ingest_keyboard(apad_client *c, const apad_keyboard *in)
         }
     }
 
-    for (byte_i = 0u; byte_i < APAD_KEY_BITMAP_BYTES; byte_i++) {
-        uint8_t diff = (uint8_t)(c->kb_keys[byte_i] ^ in->keys[byte_i]);
-        unsigned bit;
+    /* Two passes: the modifier byte (usages 0xE0..0xE7, all in one bitmap
+     * byte) first, then everything else. The ring is replayed by the server
+     * in THIS order, before its own reconcile, so a letter and LEFTSHIFT
+     * that arrive in the same snapshot -- the 3DS's sticky Shift latch does
+     * exactly that -- must enter the ring Shift first, or the host presses
+     * the letter before the modifier and types it lowercase. A real HID
+     * keyboard report carries its modifier byte ahead of the key array for
+     * the same reason. (Found on a 3DS, 2026-09-15: latch armed, letter
+     * typed, lowercase.) */
+    for (pass = 0u; pass < 2u; pass++) {
+        for (byte_i = 0u; byte_i < APAD_KEY_BITMAP_BYTES; byte_i++) {
+            uint8_t diff = (uint8_t)(c->kb_keys[byte_i] ^ in->keys[byte_i]);
+            unsigned bit;
+            unsigned is_mod = (byte_i == APAD_KEY_BYTE(APAD_HID_KEY_LEFTCTRL)) ? 1u : 0u;
 
-        if (diff == 0u) {
-            continue;
-        }
-        for (bit = 0u; bit < 8u; bit++) {
-            uint8_t mask = (uint8_t)(1u << bit);
-
-            if ((diff & mask) == 0u) {
+            if (diff == 0u || is_mod != (pass == 0u ? 1u : 0u)) {
                 continue;
             }
-            kbm_ring_push_key(c, (uint8_t)(byte_i * 8u + bit),
-                              (uint8_t)((in->keys[byte_i] & mask)
-                                        ? APAD_KBM_EVENT_DOWN : 0u));
+            for (bit = 0u; bit < 8u; bit++) {
+                uint8_t mask = (uint8_t)(1u << bit);
+
+                if ((diff & mask) == 0u) {
+                    continue;
+                }
+                kbm_ring_push_key(c, (uint8_t)(byte_i * 8u + bit),
+                                  (uint8_t)((in->keys[byte_i] & mask)
+                                            ? APAD_KBM_EVENT_DOWN : 0u));
+            }
+            c->kb_keys[byte_i] = in->keys[byte_i];
         }
-        c->kb_keys[byte_i] = in->keys[byte_i];
     }
     kbm_engage(&c->kb_engaged, &c->kb_dirty);
 }

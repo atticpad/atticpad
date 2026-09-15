@@ -58,6 +58,7 @@ void apad_kbm_apply_keyboard(const apad_backend *backend, int slot,
                              + APAD_KEY_BITMAP_BYTES * 8u];
     size_t   n = 0;
     unsigned byte_i;
+    unsigned pass;
 
     if (out_lost != NULL) {
         *out_lost = 0u;
@@ -124,29 +125,63 @@ void apad_kbm_apply_keyboard(const apad_backend *backend, int slot,
 
     /* §6.20 step 3: unconditional reconcile against the snapshot, every
      * time, including a gap of zero. This is the whole convergence
-     * argument -- never skip it. */
-    for (byte_i = 0; byte_i < APAD_KEY_BITMAP_BYTES; byte_i++) {
-        uint8_t diff = (uint8_t)(st->kb_shadow[byte_i] ^ in->keys[byte_i]);
-        unsigned bit;
+     * argument -- never skip it.
+     *
+     * Ordering rule, and it is not cosmetic. Within THIS snapshot's batch,
+     * emit every modifier transition (usages 0xE0-0xE7) first, then every
+     * other transition -- each group in ascending usage order. That mirrors
+     * how a host processes a real USB HID keyboard report, whose modifier
+     * byte precedes its key array: Shift in the same report as the letter
+     * still applies to that letter. The batch this builds is flushed under
+     * ONE evdev SYN_REPORT (and one SendInput call on Windows), and
+     * consumers apply a batch in the order it arrives, so plain ascending
+     * usage order would put A (0x04) before LEFTSHIFT (0xE1) and the host
+     * would type a lowercase letter.
+     *
+     * Found on real 3DS hardware (2026-09-15): the on-screen KEYS mode has
+     * a sticky Shift latch, so tapping SHIFT then a letter puts both into
+     * the SAME report. A physically held modifier never showed this because
+     * it lands in an earlier report, where ordering within the batch cannot
+     * matter.
+     *
+     * This applies to the reconcile only. The ring replay above is a
+     * client-ordered sequence of EDGES (down, up, down...) whose order is
+     * the information it carries; reordering that would corrupt it.
+     *
+     * pass 0 = the modifier byte, pass 1 = everything else. All eight
+     * modifiers are exactly one byte of the bitmap (0xE0 >> 3 == 0xE7 >> 3),
+     * so the split is per-byte rather than per-bit.
+     */
+    for (pass = 0u; pass < 2u; pass++) {
+        for (byte_i = 0; byte_i < APAD_KEY_BITMAP_BYTES; byte_i++) {
+            uint8_t  diff;
+            unsigned bit;
+            unsigned is_mod = (byte_i == APAD_KEY_BYTE(APAD_HID_KEY_LEFTCTRL))
+                                  ? 1u : 0u;
 
-        if (diff == 0u) {
-            continue;
-        }
-        for (bit = 0; bit < 8u; bit++) {
-            uint8_t mask = (uint8_t)(1u << bit);
-            unsigned usage;
-
-            if (!(diff & mask)) {
+            if (is_mod != ((pass == 0u) ? 1u : 0u)) {
                 continue;
             }
-            usage = byte_i * 8u + bit;
-            if (backend->kbm_events != NULL
-                && n < (sizeof evbuf / sizeof evbuf[0])) {
-                evbuf[n].device = (uint8_t)APAD_KBM_DEV_KEYBOARD;
-                evbuf[n].code   = (uint16_t)usage;
-                evbuf[n].down   =
-                    (uint8_t)((in->keys[byte_i] & mask) ? 1u : 0u);
-                n++;
+            diff = (uint8_t)(st->kb_shadow[byte_i] ^ in->keys[byte_i]);
+            if (diff == 0u) {
+                continue;
+            }
+            for (bit = 0; bit < 8u; bit++) {
+                uint8_t mask = (uint8_t)(1u << bit);
+                unsigned usage;
+
+                if (!(diff & mask)) {
+                    continue;
+                }
+                usage = byte_i * 8u + bit;
+                if (backend->kbm_events != NULL
+                    && n < (sizeof evbuf / sizeof evbuf[0])) {
+                    evbuf[n].device = (uint8_t)APAD_KBM_DEV_KEYBOARD;
+                    evbuf[n].code   = (uint16_t)usage;
+                    evbuf[n].down   =
+                        (uint8_t)((in->keys[byte_i] & mask) ? 1u : 0u);
+                    n++;
+                }
             }
         }
     }

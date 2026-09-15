@@ -20,6 +20,7 @@
 #include "app.h"
 #include "config_psp.h"
 #include "devlog.h"
+#include "power_psp.h"
 #include "ui.h"
 
 PSP_MODULE_INFO("AtticPad", 0, 1, 0);
@@ -306,8 +307,42 @@ static int cb_thread(SceSize args, void *argp)
 {
     (void)args; (void)argp;
     sceKernelRegisterExitCallback(sceKernelCreateCallback("exit", exit_cb, NULL));
+    /* The power callback goes on this same thread, as pspsdk's power sample
+     * registers both of its callbacks on one CallbackThread. Everything it
+     * does is count events; the frame loop below acts on them. */
+    apad_psp_power_register();
     sceKernelSleepThreadCB();
     return 0;
+}
+
+/*
+ * The console settings this client depends on, in one place because they are
+ * applied TWICE: once at startup and once more after a resume. All three are
+ * idempotent and none costs anything measurable, which is the whole argument
+ * for re-applying them blind -- nothing available here could establish
+ * whether a real PSP keeps the CPU clock or the analog sampling mode across a
+ * suspend, and getting either wrong is a silent failure (a 222 MHz derive
+ * that misses the pairing window; a nub stuck at 128 while every button
+ * still works).
+ */
+static void console_settings_apply(void)
+{
+    /* Full clock, from the first instruction. The PSP boots apps at 222 MHz;
+     * the paired handshake derives a key with 10,000 PBKDF2 iterations, and
+     * the engine's own note (apad_client.c) is that a derive over 3 s makes
+     * the server's idle timer fire and the pairing "dies here, silently,
+     * every time." At 222 MHz that derive sat on the 3 s edge -- pairing
+     * that worked one time in three -- so 333 MHz is not a nicety here, it
+     * is what keeps the handshake inside the window. -lpsppower is already
+     * linked for the battery reading. (333, 333, 166) is the SDK power
+     * sample's own full-speed triple. */
+    scePowerSetClockFrequency(333, 333, 166);
+
+    /* WITHOUT THE SECOND CALL Lx/Ly READ 128 FOREVER, and the digital
+     * buttons work regardless -- so the nub looks dead for a reason nothing
+     * reports. Both calls are in the SDK's controller sample. */
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 }
 
 static void setup_callbacks(void)
@@ -319,25 +354,105 @@ static void setup_callbacks(void)
     }
 }
 
+/*
+ * SUSPEND AND RESUME.
+ *
+ * A PSP suspend tears the WLAN and the network libraries down underneath a
+ * running app. Everything this client holds across one is therefore stale:
+ * the engine's socket, the association, and the session the server still
+ * thinks is live. Reported from hardware 2026-09-15 as "rejoining wifi
+ * doesn't work after a power switch" -- the client had no power callback at
+ * all, so it never even learned the console had been away.
+ *
+ * What happens here, in order, and why that order:
+ *
+ *   1. The session goes first, while the socket still exists as far as the
+ *      shim is concerned. apad_client_destroy() sends its BYE (harmless if
+ *      it goes nowhere), closes the shim socket and returns its slot to the
+ *      fixed pool -- the pool being fixed is what makes a create/destroy
+ *      cycle per resume safe rather than a leak. Doing this AFTER
+ *      sceNetInetTerm() would be calling into a library that no longer
+ *      exists.
+ *   2. The console settings that a suspend may or may not have kept.
+ *   3. The network stack, down and up from sceNetInit() onward
+ *      (apad_psp_net_restart(), which mirrors pspSdkInetTerm()'s order).
+ *   4. Back to the connect screen, which already knows how to wait for a
+ *      radio and then re-create the engine -- the same path a fresh boot
+ *      takes. Nothing about the reconnect is new code.
+ *
+ * apad_client_create() mallocs, and this is the one thing in this client
+ * that calls it more than once. That is still inside docs/CONVENTIONS.md's "no malloc
+ * after init" as apad_client.h reads it (create() IS init): the block is
+ * freed by the destroy above before the next create, it is the same size
+ * every time, and it happens at most once per suspend -- not per session,
+ * not per packet.
+ *
+ * Returns the screen to be on afterwards.
+ */
+static apad_screen_id power_apply(app_ctx *ctx, const apad_psp_power_event *ev,
+                                  apad_screen_id cur)
+{
+    apad_devlog("power: event suspended=%d resumed=%d (screen %d)",
+                ev->suspended, ev->resumed, (int)cur);
+
+    /* Was a session live when the console went away? Then the reconnect
+     * should not wait for a button (app.h). Read before the teardown below
+     * clears it. */
+    if (ctx->connected) {
+        ctx->want_reconnect = 1;
+    }
+
+    /* 1. The session and its socket, on either edge: a resume seen without
+     *    its suspend (the flags are documented as unreliable) leaves exactly
+     *    the same dead socket behind. */
+    if (ctx->client != NULL) {
+        apad_client_destroy(ctx->client);
+        ctx->client = NULL;
+        apad_devlog("power: session closed and socket released");
+    }
+    ctx->connected = 0;
+    memset(&ctx->stats, 0, sizeof ctx->stats);
+    ctx->have_secret = 0;
+    memset(ctx->pin_text, 0, sizeof ctx->pin_text);
+
+    if (ev->resumed) {
+        console_settings_apply();
+        apad_devlog("power: resume -- cpu %d MHz, analog sampling re-applied",
+                    scePowerGetCpuClockFrequency());
+        if (apad_psp_net_restart() < 0) {
+            apad_devlog("power: net restart refused (bring-up still running)");
+        }
+        /* Refresh the copy the screens read BEFORE re-entering one, so the
+         * connect screen sees ready == 0 and waits for the radio instead of
+         * offering to dial out over a stack that is being rebuilt. */
+        apad_psp_net_get(&ctx->net);
+    }
+
+    /* The self-test needs no network and blocks the loop anyway; let it
+     * finish rather than yanking the screen out from under it. The fatal
+     * screen is left alone too -- whatever put it there has not changed. */
+    if (cur == APAD_SCREEN_SELFTEST || cur == APAD_SCREEN_FATAL) {
+        return cur;
+    }
+    return APAD_SCREEN_CONNECT;
+}
+
 int main(void)
 {
     static app_ctx ctx;
     apad_screen_id cur = APAD_SCREEN_CONNECT, next;
+    apad_psp_power_event pev;
 
-    setup_callbacks();
+    /* The log is opened BEFORE the callback thread, not after: opening it
+     * truncates the file, and the callback thread logs whether the power
+     * callback registered. With the old order that line was written and then
+     * erased (or raced), which is exactly the line a console owner needs
+     * when a resume does nothing. */
     apad_devlog_open("ms0:/atticpad.log");
     apad_devlog("AtticPad PSP %s starting", APAD_VERSION_STR);
+    setup_callbacks();
 
-    /* Full clock, from the first instruction. The PSP boots apps at 222 MHz;
-     * the paired handshake derives a key with 10,000 PBKDF2 iterations, and
-     * the engine's own note (apad_client.c) is that a derive over 3 s makes
-     * the server's idle timer fire and the pairing "dies here, silently,
-     * every time." At 222 MHz that derive sat on the 3 s edge -- pairing
-     * that worked one time in three -- so 333 MHz is not a nicety here, it
-     * is what keeps the handshake inside the window. -lpsppower is already
-     * linked for the battery reading. (333, 333, 166) is the SDK power
-     * sample's own full-speed triple. */
-    scePowerSetClockFrequency(333, 333, 166);
+    console_settings_apply();
     apad_devlog("cpu clock set to %d MHz", scePowerGetCpuClockFrequency());
 
     /* Drop the main thread BELOW the network stack. sceNetInit() creates its
@@ -355,12 +470,6 @@ int main(void)
      * background. Nothing else here is latency-sensitive at 60 Hz. */
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 0x30);
     apad_devlog("main thread priority lowered to 0x30 (below the net stack)");
-
-    /* WITHOUT THE SECOND CALL Lx/Ly READ 128 FOREVER, and the digital
-     * buttons work regardless -- so the nub looks dead for a reason nothing
-     * reports. Both calls are in the SDK's controller sample. */
-    sceCtrlSetSamplingCycle(0);
-    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
     memset(&ctx, 0, sizeof ctx);
     ctx.keys_armed = 1;
@@ -435,6 +544,52 @@ int main(void)
     apad_devlog("entering the frame loop");
     for (;;) {
         sample_input(&ctx);
+
+#ifdef APAD_PSP_FAKE_RESUME
+        /* DEV ONLY. PPSSPP cannot suspend a PSP, so this is the only way the
+         * resume path gets RUN rather than merely reviewed: N seconds after
+         * boot, raise the same counters the kernel callback raises, once.
+         * Never in a shipped build. */
+        {
+            static int frames;
+            static int fired;
+            if (!fired && ++frames >= (APAD_PSP_FAKE_RESUME) * 60) {
+                fired = 1;
+                apad_devlog("DEV: injecting a synthetic suspend + resume"
+                            " (APAD_PSP_FAKE_RESUME=%d)", (APAD_PSP_FAKE_RESUME));
+                apad_psp_power_inject();
+            }
+        }
+#endif
+        /* Every frame, not only when something is expected: the poll also
+         * runs the RESUME_COMPLETE fallback timer (power_psp.c). */
+        if (apad_psp_power_poll(&pev)) {
+            apad_screen_id forced = power_apply(&ctx, &pev, cur);
+
+            if (forced != cur) {
+                cur = forced;
+            }
+            if (cur == APAD_SCREEN_CONNECT) {
+                /* Re-enter even when already there: connect_enter() is what
+                 * decides between "edit the address" and "wait for the
+                 * radio", and after a resume the answer has changed. */
+                ctx.keys_armed = 0;
+                ctx.keys_prev  = 0xFFFFFFFFu;
+                kScreens[cur]->enter(&ctx);
+                /* After enter(), so it is not overwritten by its own
+                 * rejoin note. The existing banner vocabulary, one line,
+                 * no instructions. */
+                if (pev.resumed) {
+                    app_note(&ctx, 1, "resumed -- rejoining");
+                } else {
+                    /* Suspend seen but the resume has not been signalled
+                     * yet: the session is gone, the radio is not (yet).
+                     * Saying "rejoining" here would be a claim about work
+                     * that has not started. */
+                    app_note(&ctx, 1, "suspended -- session closed");
+                }
+            }
+        }
 
         next = kScreens[cur]->update(&ctx);
 

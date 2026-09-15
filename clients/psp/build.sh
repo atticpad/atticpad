@@ -39,7 +39,7 @@ esac
 # recompile than to debug.
 make_args=()
 hook_stamp="${HERE}/.hooks"
-hooks="${APAD_SMOKE_HOST:-}|${APAD_PSP_SHOTS:-}|${APAD_AUTO_HOST:-}|${APAD_AUTO_PORT:-}|${APAD_PSP_DEVLOG:-}|${APAD_PSP_STDOUT:-}"
+hooks="${APAD_SMOKE_HOST:-}|${APAD_PSP_SHOTS:-}|${APAD_AUTO_HOST:-}|${APAD_AUTO_PORT:-}|${APAD_PSP_DEVLOG:-}|${APAD_PSP_STDOUT:-}|${APAD_PSP_FAKE_RESUME:-}"
 if [[ -n "${APAD_SMOKE_HOST:-}" ]]; then
   make_args+=("APAD_SMOKE_HOST=${APAD_SMOKE_HOST}")
 fi
@@ -57,6 +57,9 @@ if [[ -n "${APAD_PSP_DEVLOG:-}" ]]; then
 fi
 if [[ -n "${APAD_PSP_STDOUT:-}" ]]; then
   make_args+=("APAD_PSP_STDOUT=${APAD_PSP_STDOUT}")
+fi
+if [[ -n "${APAD_PSP_FAKE_RESUME:-}" ]]; then
+  make_args+=("APAD_PSP_FAKE_RESUME=${APAD_PSP_FAKE_RESUME}")
 fi
 if [[ ! -f "${hook_stamp}" ]] || [[ "$(cat "${hook_stamp}" 2>/dev/null)" != "${hooks}" ]]; then
   force_clean=1
