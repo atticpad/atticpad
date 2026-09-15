@@ -772,7 +772,14 @@ jobs:
           distribution: temurin
           java-version: ${{ steps.pins.outputs.jdk }}
 
+      # packages: the action's default is "tools platform-tools", and Google
+      # dropped the legacy "tools" package from the repository; sdkmanager
+      # then exits 1 and the job dies before any of our code runs (first seen
+      # 2026-09-15 on v0.6.0-rc4, green two days earlier). Everything we
+      # actually need is pinned and installed by the step below.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: install the pinned SDK packages
         run: |
